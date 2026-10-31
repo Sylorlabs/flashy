@@ -1,0 +1,6 @@
+# flash coordinate manifest
+name = "app"
+version = "0.1.0"
+peak_power_mw = 0m
+dominant_pol = 0
+[paths]

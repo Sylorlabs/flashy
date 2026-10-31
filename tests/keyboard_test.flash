@@ -1,0 +1,210 @@
+@import("../src/core.flash")
+@import("../src/keyboard.flash")
+
+fn keyboard_expect(ok: i32, message: []u8) i32 {
+    if (ok == 0) { _zag_print("FAIL "); _zag_println(message); return 1; }
+    return 0;
+}
+
+fn keyboard_test_raw(code: t27, state: t27) KeyboardRawKey {
+    return KeyboardRawKey{ .code = code, .state = state, .serial = 81, .time = 243 };
+}
+
+fn keyboard_test_oversized_input() ArrayList[u8] {
+    let bytes: ArrayList[u8] = make[u8](16385);
+    let i: i32 = 0;
+    while (i < 16385) { push[u8](&bytes, 32 as u8); i = i + 1; }
+    return bytes;
+}
+
+fn main() i32 {
+    let failures: i32 = 0;
+    let source: []u8 = "<AD01> = 24; <LFSH> = 50; <LEFT> = 113; <RGHT> = 114; <UP__> = 115; <DOWN> = 116; <BKSP> = 22; <TAB> = 23; <UNIC> = 40; <EMJI> = 41; <PUNC> = 42; key <AD01> { [ q, Q ] }; key <LFSH> { [ Shift_L, Shift_L ] }; key <LEFT> { [ Left, Left ] }; key <RGHT> { [ Right, Right ] }; key <UP__> { [ Up, Up ] }; key <DOWN> { [ Down, Down ] }; key <BKSP> { [ BackSpace, BackSpace ] }; key <TAB> { [ Tab, Tab ] }; key <UNIC> { [ U03A9, U03A9 ] }; key <EMJI> { [ U1F642, U1F642 ] }; key <PUNC> { [ minus, underscore ] };";
+    let map: KeyboardMap = keyboard_map_parse_xkb_subset(source, 16);
+    failures = failures + keyboard_expect(map.valid == 1 && map.status == KeyboardStatus.Ok
+        && len[KeyboardBinding](map.entries) == 11,
+        "bounded XKB subset produces exactly eleven owned bindings");
+
+    let none: KeyModifiers = key_modifiers_none();
+    let lower: KeyboardTranslation = keyboard_map_translate(&map, keyboard_test_raw(24, 1), none);
+    failures = failures + keyboard_expect(lower.valid == 1 && lower.symbol.codepoint == 113
+        && lower.symbol.key == Key.Unknown && @strEq(text_buffer_view(&lower.text), "q") == 1
+        && lower.raw.serial == 81 && lower.raw.time == 243,
+        "base level translates to owned lowercase text and preserves raw t27 metadata");
+
+    let shifted_modifiers: KeyModifiers = KeyModifiers{
+        .shift = 1, .control = 0, .alt = 0, .meta = 0 };
+    let shifted: KeyboardTranslation = keyboard_map_translate_press(&map, 24, shifted_modifiers);
+    failures = failures + keyboard_expect(shifted.valid == 1 && shifted.symbol.codepoint == 81
+        && @strEq(text_buffer_view(&shifted.text), "Q") == 1,
+        "shift selects the explicit shifted symbol without a guessed layout");
+
+    let control: KeyModifiers = KeyModifiers{
+        .shift = 0, .control = 1, .alt = 0, .meta = 0 };
+    let controlled: KeyboardTranslation = keyboard_map_translate_press(&map, 24, control);
+    failures = failures + keyboard_expect(controlled.valid == 1 && controlled.symbol.codepoint == 113
+        && controlled.text.bytes.len == 0,
+        "control suppresses printable text while retaining the resolved symbol");
+    let alt: KeyModifiers = KeyModifiers{ .shift = 0, .control = 0, .alt = 1, .meta = 0 };
+    let meta: KeyModifiers = KeyModifiers{ .shift = 0, .control = 0, .alt = 0, .meta = 1 };
+    let alt_translation: KeyboardTranslation = keyboard_map_translate_press(&map, 24, alt);
+    let meta_translation: KeyboardTranslation = keyboard_map_translate_press(&map, 24, meta);
+    failures = failures + keyboard_expect(alt_translation.valid == 1 && alt_translation.text.bytes.len == 0
+        && meta_translation.valid == 1 && meta_translation.text.bytes.len == 0,
+        "alt and meta suppress printable text deterministically");
+
+    let left: KeyboardTranslation = keyboard_map_translate_press(&map, 113, none);
+    let right: KeyboardTranslation = keyboard_map_translate_press(&map, 114, none);
+    let up: KeyboardTranslation = keyboard_map_translate_press(&map, 115, none);
+    let down: KeyboardTranslation = keyboard_map_translate_press(&map, 116, none);
+    let backspace: KeyboardTranslation = keyboard_map_translate_press(&map, 22, none);
+    let tab: KeyboardTranslation = keyboard_map_translate_press(&map, 23, none);
+    failures = failures + keyboard_expect(left.valid == 1 && left.symbol.key == Key.ArrowLeft
+        && right.valid == 1 && right.symbol.key == Key.ArrowRight
+        && up.valid == 1 && up.symbol.key == Key.ArrowUp
+        && down.valid == 1 && down.symbol.key == Key.ArrowDown
+        && backspace.valid == 1 && backspace.symbol.key == Key.Backspace
+        && tab.valid == 1 && tab.symbol.key == Key.Tab
+        && left.text.bytes.len == 0 && right.text.bytes.len == 0
+        && up.text.bytes.len == 0 && down.text.bytes.len == 0
+        && backspace.text.bytes.len == 0 && tab.text.bytes.len == 0,
+        "arrows, backspace, and tab retain semantic keys without text");
+
+    let shift_binding: KeyboardBinding = keyboard_map_lookup(&map, 50);
+    failures = failures + keyboard_expect(shift_binding.modifier == KeyboardModifier.Shift
+        && shift_binding.base.modifier == KeyboardModifier.Shift
+        && shift_binding.base.raw == 65505,
+        "modifier identity is retained independently of UI modifier state");
+
+    let omega: KeyboardTranslation = keyboard_map_translate_press(&map, 40, none);
+    let emoji: KeyboardTranslation = keyboard_map_translate_press(&map, 41, none);
+    failures = failures + keyboard_expect(omega.valid == 1 && omega.symbol.codepoint == 937
+        && omega.text.bytes.len == 2 && omega.text.bytes.data[0] as t27 == 206
+        && omega.text.bytes.data[1] as t27 == 169,
+        "Uxxxx encodes a validated BMP scalar as owned UTF-8");
+    failures = failures + keyboard_expect(emoji.valid == 1 && emoji.symbol.codepoint == 128578
+        && emoji.text.bytes.len == 4 && emoji.text.bytes.data[0] as t27 == 240
+        && emoji.text.bytes.data[1] as t27 == 159 && emoji.text.bytes.data[2] as t27 == 153
+        && emoji.text.bytes.data[3] as t27 == 130,
+        "Uxxxxx encodes a validated supplementary scalar as owned UTF-8");
+
+    let punctuation: KeyboardTranslation = keyboard_map_translate_press(&map, 42, none);
+    let shifted_punctuation: KeyboardTranslation = keyboard_map_translate_press(&map, 42, shifted_modifiers);
+    failures = failures + keyboard_expect(@strEq(text_buffer_view(&punctuation.text), "-") == 1
+        && @strEq(text_buffer_view(&shifted_punctuation.text), "_") == 1,
+        "named ASCII punctuation has explicit base and shift levels");
+
+    let released: KeyboardTranslation = keyboard_map_translate(&map, keyboard_test_raw(24, 0), none);
+    failures = failures + keyboard_expect(released.valid == 1 && released.text.bytes.len == 0,
+        "release records never synthesize printable text");
+    let invalid_state: KeyboardTranslation = keyboard_map_translate(&map, keyboard_test_raw(24, 2), none);
+    failures = failures + keyboard_expect(invalid_state.valid == 0
+        && invalid_state.status == KeyboardStatus.InvalidState,
+        "protocol state outside release or press is rejected");
+
+    let missing: KeyboardTranslation = keyboard_map_translate_press(&map, 38, none);
+    failures = failures + keyboard_expect(missing.valid == 0
+        && missing.status == KeyboardStatus.UnknownCode && missing.text.bytes.len == 0,
+        "unmapped codes fail instead of receiving a guessed US fallback");
+
+    let direct_a: KeyboardSymbol = keyboard_symbol_from_x11(97);
+    let direct_left: KeyboardSymbol = keyboard_symbol_from_x11(65361);
+    let direct_up: KeyboardSymbol = keyboard_symbol_from_x11(65362);
+    let direct_down: KeyboardSymbol = keyboard_symbol_from_x11(65364);
+    let direct_unknown: KeyboardSymbol = keyboard_symbol_from_x11(268435455);
+    failures = failures + keyboard_expect(direct_a.valid == 1 && direct_a.codepoint == 97
+        && direct_a.key == Key.A && direct_left.key == Key.ArrowLeft
+        && direct_up.key == Key.ArrowUp && direct_down.key == Key.ArrowDown
+        && direct_unknown.valid == 0 && direct_unknown.status == KeyboardStatus.UnknownSymbol,
+        "X11 keysyms use complete arrow, printable, and semantic symbol records");
+
+    let encoded_zero: KeyboardUtf8Result = keyboard_utf8_encode(0);
+    let encoded_max: KeyboardUtf8Result = keyboard_utf8_encode(1114111);
+    let encoded_surrogate: KeyboardUtf8Result = keyboard_utf8_encode(55296);
+    let encoded_large: KeyboardUtf8Result = keyboard_utf8_encode(1114112);
+    failures = failures + keyboard_expect(encoded_zero.valid == 1 && encoded_zero.text.bytes.len == 1
+        && encoded_zero.text.bytes.data[0] as t27 == 0
+        && encoded_max.valid == 1 && encoded_max.text.bytes.len == 4
+        && encoded_surrogate.valid == 0 && encoded_surrogate.status == KeyboardStatus.InvalidUnicode
+        && encoded_large.valid == 0 && encoded_large.status == KeyboardStatus.InvalidUnicode,
+        "UTF-8 encoder accepts exactly Unicode scalar values including deterministic bounds");
+
+    let malformed: KeyboardMap = keyboard_map_parse_xkb_subset(
+        "<AD01>=24 key <AD01> { [ q Q ] }", 4);
+    let unknown_symbol: KeyboardMap = keyboard_map_parse_xkb_subset(
+        "<AD01>=24; key <AD01> { [ definitely_not_a_keysym, Q ] }", 4);
+    let invalid_unicode: KeyboardMap = keyboard_map_parse_xkb_subset(
+        "<UNIC>=40; key <UNIC> { [ UD800, U03A9 ] }", 4);
+    let missing_separator: KeyboardMap = keyboard_map_parse_xkb_subset(
+        "<AD01>=24key <AD01> { [ q, Q ] }", 4);
+    let unknown_name: KeyboardMap = keyboard_map_parse_xkb_subset(
+        "key <AD01> { [ q, Q ] }", 4);
+    let invalid_name: KeyboardMap = keyboard_map_parse_xkb_subset(
+        "<lower>=24; key <lower> { [ q, Q ] }", 4);
+    let full_xkb: KeyboardMap = keyboard_map_parse_xkb_subset(
+        "xkb_keymap { xkb_symbols { include us } }", 4);
+    let invalid_map_translation: KeyboardTranslation = keyboard_map_translate_press(&malformed, 24, none);
+    failures = failures + keyboard_expect(malformed.valid == 0
+        && malformed.status == KeyboardStatus.Malformed
+        && unknown_symbol.valid == 0 && unknown_symbol.status == KeyboardStatus.UnknownSymbol
+        && invalid_unicode.valid == 0 && invalid_unicode.status == KeyboardStatus.InvalidUnicode
+        && missing_separator.valid == 0 && missing_separator.status == KeyboardStatus.Malformed
+        && unknown_name.valid == 0 && unknown_name.status == KeyboardStatus.MissingCode
+        && invalid_name.valid == 0 && invalid_name.status == KeyboardStatus.InvalidName
+        && full_xkb.valid == 0 && full_xkb.status == KeyboardStatus.Malformed
+        && invalid_map_translation.valid == 0
+        && invalid_map_translation.status == KeyboardStatus.Malformed,
+        "malformed syntax, unknown symbols, invalid scalars, and unresolved names are typed failures");
+
+    let duplicate_name: KeyboardMap = keyboard_map_parse_xkb_subset(
+        "<AD01>=24; <AD01>=25; key <AD01> { [ q, Q ] }", 4);
+    let duplicate_code: KeyboardMap = keyboard_map_parse_xkb_subset(
+        "<AD01>=24; <AD02>=24; key <AD01> { [ q, Q ] }", 4);
+    let duplicate_key: KeyboardMap = keyboard_map_parse_xkb_subset(
+        "<AD01>=24; key <AD01> { [ q, Q ] }; key <AD01> { [ q, Q ] }", 4);
+    failures = failures + keyboard_expect(duplicate_name.status == KeyboardStatus.DuplicateName
+        && duplicate_code.status == KeyboardStatus.DuplicateCode
+        && duplicate_key.status == KeyboardStatus.DuplicateKey,
+        "duplicate name, code, and key declarations fail independently");
+
+    let too_many: KeyboardMap = keyboard_map_parse_xkb_subset(
+        "<AD01>=24; <AD02>=25; key <AD01> { [ q, Q ] }", 1);
+    let invalid_limit: KeyboardMap = keyboard_map_parse_xkb_subset(source, 0);
+    let oversized_bytes: ArrayList[u8] = keyboard_test_oversized_input();
+    let oversized: KeyboardMap = keyboard_map_parse_xkb_subset(
+        oversized_bytes.data[0..oversized_bytes.len], 16);
+    failures = failures + keyboard_expect(too_many.status == KeyboardStatus.TooManyEntries
+        && invalid_limit.status == KeyboardStatus.InvalidLimit
+        && oversized.status == KeyboardStatus.InputTooLarge,
+        "entry, configured-map, and byte limits terminate with exact statuses");
+
+    keyboard_translation_free(&lower); keyboard_translation_free(&shifted);
+    keyboard_translation_free(&controlled); keyboard_translation_free(&alt_translation);
+    keyboard_translation_free(&meta_translation); keyboard_translation_free(&left);
+    keyboard_translation_free(&right); keyboard_translation_free(&up); keyboard_translation_free(&down);
+    keyboard_translation_free(&backspace);
+    keyboard_translation_free(&tab); keyboard_translation_free(&omega);
+    keyboard_translation_free(&emoji); keyboard_translation_free(&punctuation);
+    keyboard_translation_free(&shifted_punctuation); keyboard_translation_free(&released);
+    keyboard_translation_free(&invalid_state); keyboard_translation_free(&missing);
+    keyboard_translation_free(&invalid_map_translation);
+    keyboard_utf8_result_free(&encoded_zero); keyboard_utf8_result_free(&encoded_max);
+    keyboard_utf8_result_free(&encoded_surrogate); keyboard_utf8_result_free(&encoded_large);
+    failures = failures + keyboard_expect(lower.text.bytes.data == null as *u8
+        && lower.text.bytes.len == 0 && lower.text.bytes.cap == 0
+        && emoji.text.bytes.data == null as *u8 && encoded_max.text.bytes.data == null as *u8,
+        "all translated and directly encoded text releases owned storage exactly once");
+
+    keyboard_map_free(&map); keyboard_map_free(&malformed); keyboard_map_free(&unknown_symbol);
+    keyboard_map_free(&invalid_unicode); keyboard_map_free(&missing_separator);
+    keyboard_map_free(&unknown_name); keyboard_map_free(&invalid_name); keyboard_map_free(&full_xkb);
+    keyboard_map_free(&duplicate_name); keyboard_map_free(&duplicate_code); keyboard_map_free(&duplicate_key);
+    keyboard_map_free(&too_many); keyboard_map_free(&invalid_limit); keyboard_map_free(&oversized);
+    free[u8](&oversized_bytes);
+    failures = failures + keyboard_expect(map.entries.data == null as *KeyboardBinding
+        && map.entries.len == 0 && map.entries.cap == 0 && map.valid == 0,
+        "keyboard map free clears every owned entry handle");
+
+    if (failures == 0) { _zag_println("keyboard_test: ok"); }
+    return failures;
+}

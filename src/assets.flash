@@ -1,0 +1,739 @@
+// Bounded SVG scene parsing and deterministic CPU rasterization for scalable assets.
+
+enum AssetError { None, Empty, TooLarge, InvalidSvg, MissingSize, InvalidNumber, InvalidColor, UnsupportedShape,
+    InvalidDimensions, InvalidStride, TruncatedData, TrailingData, InvalidPremultipliedData, Io, InvalidPath }
+enum SvgShapeKind { Rectangle, Circle, Line, Path }
+
+struct RawPixelResult {
+    // RGBA8 is a file/display boundary. The returned Surface is always
+    // premultiplied so renderer arithmetic stays deterministic.
+    surface: Surface,
+    valid: i32,
+    error: AssetError,
+    error_offset: t27,
+    source_bytes: t27,
+}
+
+fn raw_pixel_empty_result(error: AssetError, offset: t27) RawPixelResult {
+    return RawPixelResult{ .surface = surface_new(0, 0), .valid = 0, .error = error,
+        .error_offset = offset, .source_bytes = 0 };
+}
+
+fn raw_rgba8_decode(input: []u8, width: t27, height: t27, row_stride: t27,
+    already_premultiplied: i32) RawPixelResult {
+    if (width < 1 || height < 1 || width > 4096 || height > 4096) {
+        return raw_pixel_empty_result(AssetError.InvalidDimensions, 0);
+    }
+    if (already_premultiplied != 0 && already_premultiplied != 1) {
+        return raw_pixel_empty_result(AssetError.InvalidNumber, 0);
+    }
+    let packed_row: t27 = width * 4;
+    if (row_stride < packed_row || row_stride > 16777216) {
+        return raw_pixel_empty_result(AssetError.InvalidStride, 0);
+    }
+    let required: t27 = row_stride * height;
+    if (required > 67108864) { return raw_pixel_empty_result(AssetError.TooLarge, 0); }
+    if ((input.len as t27) < required) {
+        return raw_pixel_empty_result(AssetError.TruncatedData, input.len as t27);
+    }
+    if ((input.len as t27) > required) {
+        return raw_pixel_empty_result(AssetError.TrailingData, required);
+    }
+
+    let surface: Surface = surface_new(width, height);
+    let y: t27 = 0;
+    while (y < height) {
+        let x: t27 = 0;
+        while (x < width) {
+            let source_offset: i32 = (y * row_stride + x * 4) as i32;
+            let target_offset: i32 = ((y * width + x) * 4) as i32;
+            let red: t27 = input[source_offset] as t27;
+            let green: t27 = input[source_offset + 1] as t27;
+            let blue: t27 = input[source_offset + 2] as t27;
+            let alpha: t27 = input[source_offset + 3] as t27;
+            if (already_premultiplied == 1 && (red > alpha || green > alpha || blue > alpha)) {
+                surface_free(&surface);
+                return raw_pixel_empty_result(AssetError.InvalidPremultipliedData, source_offset as t27);
+            }
+            if (already_premultiplied == 1) {
+                surface.pixels.data[target_offset] = red as u8;
+                surface.pixels.data[target_offset + 1] = green as u8;
+                surface.pixels.data[target_offset + 2] = blue as u8;
+            } else {
+                surface.pixels.data[target_offset] = ((red * alpha) / 255) as u8;
+                surface.pixels.data[target_offset + 1] = ((green * alpha) / 255) as u8;
+                surface.pixels.data[target_offset + 2] = ((blue * alpha) / 255) as u8;
+            }
+            surface.pixels.data[target_offset + 3] = alpha as u8;
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return RawPixelResult{ .surface = surface, .valid = 1, .error = AssetError.None,
+        .error_offset = 0, .source_bytes = required };
+}
+
+fn raw_rgba8_load_file(path: []u8, width: t27, height: t27, row_stride: t27,
+    already_premultiplied: i32) RawPixelResult {
+    if (_zag_file_exists(path) == 0) { return raw_pixel_empty_result(AssetError.Io, 0); }
+    return raw_rgba8_decode(_zag_read_file(path), width, height, row_stride, already_premultiplied);
+}
+
+fn raw_pixel_free(result: *RawPixelResult) void {
+    surface_free(&result.*.surface);
+    result.*.valid = 0;
+    result.*.source_bytes = 0;
+}
+
+struct SvgShape {
+    kind: SvgShapeKind,
+    x: t27, y: t27, w: t27, h: t27,
+    x2: t27, y2: t27, radius: t27,
+    color: Color,
+    points: ArrayList[Point2D],
+    closed: i32,
+}
+
+struct SvgDocument {
+    width: t27,
+    height: t27,
+    shapes: ArrayList[SvgShape],
+}
+
+struct SvgResult {
+    document: SvgDocument,
+    valid: i32,
+    error: AssetError,
+    error_offset: t27,
+}
+
+fn svg_empty_result(error: AssetError, offset: t27) SvgResult {
+    return SvgResult{ .document = SvgDocument{ .width = 0, .height = 0, .shapes = make[SvgShape](8) },
+        .valid = 0, .error = error, .error_offset = offset };
+}
+
+fn svg_starts_at(input: []u8, offset: i32, pattern: []u8) i32 {
+    if (offset < 0 || offset + pattern.len > input.len) { return 0; }
+    let i: i32 = 0;
+    while (i < pattern.len) { if (input[offset + i] != pattern[i]) { return 0; } i = i + 1; }
+    return 1;
+}
+
+fn svg_find(input: []u8, pattern: []u8, start: i32) i32 {
+    let i: i32 = start;
+    while (i + pattern.len <= input.len) {
+        if (svg_starts_at(input, i, pattern) == 1) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn svg_tag_end(input: []u8, start: i32) i32 {
+    let i: i32 = start; let scanned: i32 = 0;
+    while (i < input.len && scanned <= 4096) {
+        if (input[i] == '>') { return i; }
+        i = i + 1; scanned = scanned + 1;
+    }
+    return -1;
+}
+
+fn svg_attr(tag: []u8, name: []u8) []u8 {
+    let needle: []u8 = _zag_str_concat(name, "=\"");
+    let start: i32 = svg_find(tag, needle, 0);
+    if (start < 0) { return ""; }
+    let value_start: i32 = start + needle.len; let end: i32 = value_start;
+    while (end < tag.len && tag[end] != '"') { end = end + 1; }
+    if (end >= tag.len) { return ""; }
+    return tag[value_start..end];
+}
+
+fn svg_parse_integer(text: []u8, ok: *i32) t27 {
+    ok.* = 0; if (text.len < 1) { return 0; }
+    let sign: t27 = 1; let i: i32 = 0;
+    if (text[0] == '-') { sign = -1; i = 1; }
+    if (i >= text.len) { return 0; }
+    let value: t27 = 0;
+    while (i < text.len) {
+        let c: t27 = text[i] as t27;
+        if (c < 48 || c > 57) { return 0; }
+        value = value * 10 + (c - 48); if (value > 1000000) { return 0; }
+        i = i + 1;
+    }
+    ok.* = 1; return value * sign;
+}
+
+fn svg_hex_digit(c: t27) t27 {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    return -1;
+}
+
+fn svg_parse_color(text: []u8, ok: *i32) Color {
+    ok.* = 0;
+    if (text.len != 7 || text[0] != '#') { return color_rgba(0, 0, 0, 255); }
+    let digits: ArrayList[t27] = make[t27](6); let i: i32 = 1;
+    while (i < 7) {
+        let digit: t27 = svg_hex_digit(text[i] as t27);
+        if (digit < 0) { free[t27](&digits); return color_rgba(0, 0, 0, 255); }
+        push[t27](&digits, digit); i = i + 1;
+    }
+    ok.* = 1;
+    let color: Color = color_rgba((digits.data[0] * 16 + digits.data[1]) as t9,
+        (digits.data[2] * 16 + digits.data[3]) as t9, (digits.data[4] * 16 + digits.data[5]) as t9, 255);
+    free[t27](&digits); return color;
+}
+
+fn svg_is_ws(value: t27) i32 {
+    return (value == 9 || value == 10 || value == 13 || value == 32 || value == 44);
+}
+
+fn svg_skip_ws(text: []u8, offset: i32) i32 {
+    let i: i32 = offset;
+    while (i < text.len && svg_is_ws(text[i] as t27) == 1) { i = i + 1; }
+    return i;
+}
+
+// 3^9 keeps every relative-coordinate, curvature, and flattening intermediate
+// inside t27 while leaving the SVG byte grammar at the storage boundary.
+fn svg_path_coordinate_limit() t27 { return 19683; }
+
+fn svg_read_integer(text: []u8, offset: i32, next: *i32, ok: *i32) t27 {
+    ok.* = 0;
+    if (offset < 0 || offset >= text.len) { next.* = offset; return 0; }
+    let i: i32 = svg_skip_ws(text, offset);
+    if (i >= text.len) { next.* = i; return 0; }
+    let sign: t27 = 1;
+    if (text[i] == 45) { sign = -1; i = i + 1; }
+    if (i >= text.len) { next.* = i; return 0; }
+    if (text[i] < 48 || text[i] > 57) { next.* = i; return 0; }
+    let value: t27 = 0;
+    let reading: i32 = 1;
+    while (reading == 1 && i < text.len) {
+        let digit: t27 = (text[i] as t27) - 48;
+        if (digit < 0 || digit > 9) {
+            reading = 0;
+        } else {
+            if (value > (svg_path_coordinate_limit() - digit) / 10) { next.* = i; return 0; }
+            value = value * 10 + digit;
+            i = i + 1;
+        }
+    }
+    ok.* = 1;
+    next.* = i;
+    return value * sign;
+}
+
+fn svg_read_pair(text: []u8, offset: i32, x: *t27, y: *t27, next: *i32) i32 {
+    let parse_ok: i32 = 0; let first_next: i32 = 0; let second_next: i32 = 0;
+    let first: t27 = svg_read_integer(text, offset, &first_next, &parse_ok);
+    if (parse_ok == 0) { next.* = offset; return 0; }
+    let second: t27 = svg_read_integer(text, first_next, &second_next, &parse_ok);
+    if (parse_ok == 0) { next.* = first_next; return 0; }
+    x.* = first; y.* = second; next.* = second_next; return 1;
+}
+
+fn svg_read_flag(text: []u8, offset: i32, next: *i32, ok: *i32) i32 {
+    ok.* = 0;
+    let i: i32 = svg_skip_ws(text, offset);
+    if (i >= text.len || (text[i] != 48 && text[i] != 49)) { next.* = i; return 0; }
+    let value: i32 = 0;
+    if (text[i] == 49) { value = 1; }
+    i = i + 1;
+    // Flags are single grammar tokens, not general integers. In particular,
+    // 00, 01, and 10 cannot be silently redistributed across adjacent fields.
+    if (i < text.len && text[i] >= 48 && text[i] <= 57) { next.* = i; return 0; }
+    next.* = i; ok.* = 1; return value;
+}
+
+fn svg_is_command(value: t27) i32 {
+    return ((value >= 65 && value <= 90) || (value >= 97 && value <= 122));
+}
+
+fn svg_path_resolve(value: t27, current: t27, relative: i32, resolved: *t27) i32 {
+    let coordinate: t27 = value;
+    if (relative == 1) { coordinate = current + value; }
+    if (coordinate < 0 - svg_path_coordinate_limit() || coordinate > svg_path_coordinate_limit()) { return 0; }
+    resolved.* = coordinate;
+    return 1;
+}
+
+fn svg_path_resolve_pair(value_x: t27, value_y: t27, current_x: t27, current_y: t27,
+    relative: i32, resolved_x: *t27, resolved_y: *t27) i32 {
+    if (svg_path_resolve(value_x, current_x, relative, resolved_x) == 0) { return 0; }
+    if (svg_path_resolve(value_y, current_y, relative, resolved_y) == 0) { return 0; }
+    return 1;
+}
+
+fn svg_path_reflect_control(current: t27, previous: t27, reflected: *t27) i32 {
+    // Written as current + delta so reflection stays in semantic t27 geometry
+    // and can be rejected before it leaves the bounded path envelope.
+    let coordinate: t27 = current + (current - previous);
+    if (coordinate < 0 - svg_path_coordinate_limit() || coordinate > svg_path_coordinate_limit()) { return 0; }
+    reflected.* = coordinate;
+    return 1;
+}
+
+fn svg_path_reflect_pair(current_x: t27, current_y: t27, previous_x: t27, previous_y: t27,
+    reflected_x: *t27, reflected_y: *t27) i32 {
+    if (svg_path_reflect_control(current_x, previous_x, reflected_x) == 0) { return 0; }
+    if (svg_path_reflect_control(current_y, previous_y, reflected_y) == 0) { return 0; }
+    return 1;
+}
+
+fn svg_path_reject(path: *Path2D, ok: *i32) i32 {
+    ok.* = 0;
+    path_free(path);
+    return 0;
+}
+
+fn svg_parse_path(path_data: []u8, shape: *SvgShape, ok: *i32) i32 {
+    let path: Path2D = path_new();
+    let current_x: t27 = 0;
+    let current_y: t27 = 0;
+    let subpath_x: t27 = 0;
+    let subpath_y: t27 = 0;
+    let mode: i32 = 0;
+    // 0 is not reflectable, 1 is Q/T, and 2 is C/S. Only the immediately
+    // preceding compatible segment authorizes a smooth-control reflection.
+    let last_curve_kind: i32 = 0;
+    let last_control_x: t27 = 0;
+    let last_control_y: t27 = 0;
+    let started: i32 = 0;
+    let closed: i32 = 0;
+    ok.* = 1;
+    let cursor: i32 = 0;
+    let parsing: i32 = 1;
+
+    if (path_data.len == 0 || path_data.len > 4096) { return svg_path_reject(&path, ok); }
+
+    while (parsing == 1 && cursor < path_data.len) {
+        cursor = svg_skip_ws(path_data, cursor);
+        if (cursor >= path_data.len) {
+            parsing = 0;
+        } else {
+            let token: t27 = path_data[cursor] as t27;
+            if (svg_is_command(token) == 1) { mode = token as i32; cursor = cursor + 1; }
+            if (mode == 0 || closed == 1) { return svg_path_reject(&path, ok); }
+            let relative: i32 = 0;
+            if (mode >= 97 && mode <= 122) { relative = 1; }
+
+            if (mode == 77 || mode == 109) {
+                if (started == 1) { return svg_path_reject(&path, ok); }
+                let groups: i32 = 0;
+                let group_loop: i32 = 1;
+                while (group_loop == 1) {
+                    cursor = svg_skip_ws(path_data, cursor);
+                    if (cursor >= path_data.len || svg_is_command(path_data[cursor] as t27) == 1) { group_loop = 0; }
+                    else {
+                        let value_x: t27 = 0; let value_y: t27 = 0; let next_cursor: i32 = 0;
+                        if (svg_read_pair(path_data, cursor, &value_x, &value_y, &next_cursor) == 0) {
+                            return svg_path_reject(&path, ok);
+                        }
+                        let point_x: t27 = 0; let point_y: t27 = 0;
+                        if (svg_path_resolve_pair(value_x, value_y, current_x, current_y,
+                            relative, &point_x, &point_y) == 0) { return svg_path_reject(&path, ok); }
+                        if (groups == 0) {
+                            path_move_to(&path, point_x, point_y);
+                            subpath_x = point_x; subpath_y = point_y; started = 1;
+                        } else if (path_line_to(&path, point_x, point_y) == 0) {
+                            return svg_path_reject(&path, ok);
+                        }
+                        current_x = point_x; current_y = point_y; cursor = next_cursor; groups = groups + 1;
+                    }
+                }
+                if (groups == 0) { return svg_path_reject(&path, ok); }
+                if (mode == 77) {
+                    mode = 76;
+                } else {
+                    mode = 108;
+                }
+                last_curve_kind = 0;
+            } else if (mode == 76 || mode == 108) {
+                if (started == 0) { return svg_path_reject(&path, ok); }
+                let groups: i32 = 0; let group_loop: i32 = 1;
+                while (group_loop == 1) {
+                    cursor = svg_skip_ws(path_data, cursor);
+                    if (cursor >= path_data.len || svg_is_command(path_data[cursor] as t27) == 1) { group_loop = 0; }
+                    else {
+                        let value_x: t27 = 0; let value_y: t27 = 0; let next_cursor: i32 = 0;
+                        if (svg_read_pair(path_data, cursor, &value_x, &value_y, &next_cursor) == 0) {
+                            return svg_path_reject(&path, ok);
+                        }
+                        let point_x: t27 = 0; let point_y: t27 = 0;
+                        if (svg_path_resolve_pair(value_x, value_y, current_x, current_y,
+                            relative, &point_x, &point_y) == 0) { return svg_path_reject(&path, ok); }
+                        if (path_line_to(&path, point_x, point_y) == 0) { return svg_path_reject(&path, ok); }
+                        current_x = point_x; current_y = point_y; cursor = next_cursor; groups = groups + 1;
+                    }
+                }
+                if (groups == 0) { return svg_path_reject(&path, ok); }
+                last_curve_kind = 0;
+            } else if (mode == 72 || mode == 104) {
+                if (started == 0) { return svg_path_reject(&path, ok); }
+                let groups: i32 = 0; let group_loop: i32 = 1;
+                while (group_loop == 1) {
+                    cursor = svg_skip_ws(path_data, cursor);
+                    if (cursor >= path_data.len || svg_is_command(path_data[cursor] as t27) == 1) { group_loop = 0; }
+                    else {
+                        let parse_ok: i32 = 0;
+                        let next_cursor: i32 = 0;
+                        let value_x: t27 = svg_read_integer(path_data, cursor, &next_cursor, &parse_ok);
+                        if (parse_ok == 0) { return svg_path_reject(&path, ok); }
+                        let point_x: t27 = 0;
+                        if (svg_path_resolve(value_x, current_x, relative, &point_x) == 0) {
+                            return svg_path_reject(&path, ok);
+                        }
+                        if (path_line_to(&path, point_x, current_y) == 0) { return svg_path_reject(&path, ok); }
+                        current_x = point_x; cursor = next_cursor; groups = groups + 1;
+                    }
+                }
+                if (groups == 0) { return svg_path_reject(&path, ok); }
+                last_curve_kind = 0;
+            } else if (mode == 86 || mode == 118) {
+                if (started == 0) { return svg_path_reject(&path, ok); }
+                let groups: i32 = 0; let group_loop: i32 = 1;
+                while (group_loop == 1) {
+                    cursor = svg_skip_ws(path_data, cursor);
+                    if (cursor >= path_data.len || svg_is_command(path_data[cursor] as t27) == 1) { group_loop = 0; }
+                    else {
+                        let parse_ok: i32 = 0;
+                        let next_cursor: i32 = 0;
+                        let value_y: t27 = svg_read_integer(path_data, cursor, &next_cursor, &parse_ok);
+                        if (parse_ok == 0) { return svg_path_reject(&path, ok); }
+                        let point_y: t27 = 0;
+                        if (svg_path_resolve(value_y, current_y, relative, &point_y) == 0) {
+                            return svg_path_reject(&path, ok);
+                        }
+                        if (path_line_to(&path, current_x, point_y) == 0) { return svg_path_reject(&path, ok); }
+                        current_y = point_y; cursor = next_cursor; groups = groups + 1;
+                    }
+                }
+                if (groups == 0) { return svg_path_reject(&path, ok); }
+                last_curve_kind = 0;
+            } else if (mode == 81 || mode == 113 || mode == 67 || mode == 99) {
+                if (started == 0) { return svg_path_reject(&path, ok); }
+                let is_quadratic: i32 = 0;
+                if (mode == 81 || mode == 113) { is_quadratic = 1; }
+                let groups: i32 = 0; let group_loop: i32 = 1;
+                while (group_loop == 1) {
+                    cursor = svg_skip_ws(path_data, cursor);
+                    if (cursor >= path_data.len || svg_is_command(path_data[cursor] as t27) == 1) { group_loop = 0; }
+                    else {
+                        let control_x: t27 = 0;
+                        let control_y: t27 = 0;
+                        let control2_x: t27 = 0;
+                        let control2_y: t27 = 0;
+                        let end_x: t27 = 0;
+                        let end_y: t27 = 0;
+                        let next_cursor: i32 = 0;
+                        if (svg_read_pair(path_data, cursor, &control_x, &control_y, &next_cursor) == 0) {
+                            return svg_path_reject(&path, ok);
+                        }
+                        if (is_quadratic == 0) {
+                            cursor = next_cursor;
+                            if (svg_read_pair(path_data, cursor, &control2_x, &control2_y, &next_cursor) == 0) {
+                                return svg_path_reject(&path, ok);
+                            }
+                        }
+                        cursor = next_cursor;
+                        if (svg_read_pair(path_data, cursor, &end_x, &end_y, &next_cursor) == 0) {
+                            return svg_path_reject(&path, ok);
+                        }
+                        let c1_x: t27 = 0; let c1_y: t27 = 0;
+                        let e_x: t27 = 0; let e_y: t27 = 0;
+                        if (svg_path_resolve_pair(control_x, control_y, current_x, current_y,
+                            relative, &c1_x, &c1_y) == 0
+                            || svg_path_resolve_pair(end_x, end_y, current_x, current_y,
+                                relative, &e_x, &e_y) == 0) { return svg_path_reject(&path, ok); }
+                        if (is_quadratic == 1) {
+                            if (path_quadratic_to(&path, c1_x, c1_y, e_x, e_y) == 0) {
+                                return svg_path_reject(&path, ok);
+                            }
+                            last_curve_kind = 1; last_control_x = c1_x; last_control_y = c1_y;
+                        } else {
+                            let c2_x: t27 = 0; let c2_y: t27 = 0;
+                            if (svg_path_resolve_pair(control2_x, control2_y, current_x, current_y,
+                                relative, &c2_x, &c2_y) == 0) { return svg_path_reject(&path, ok); }
+                            if (path_cubic_to(&path, c1_x, c1_y, c2_x, c2_y, e_x, e_y) == 0) {
+                                return svg_path_reject(&path, ok);
+                            }
+                            last_curve_kind = 2; last_control_x = c2_x; last_control_y = c2_y;
+                        }
+                        current_x = e_x; current_y = e_y; cursor = next_cursor; groups = groups + 1;
+                    }
+                }
+                if (groups == 0) { return svg_path_reject(&path, ok); }
+            } else if (mode == 84 || mode == 116) {
+                if (started == 0) { return svg_path_reject(&path, ok); }
+                let groups: i32 = 0; let group_loop: i32 = 1;
+                while (group_loop == 1) {
+                    cursor = svg_skip_ws(path_data, cursor);
+                    if (cursor >= path_data.len || svg_is_command(path_data[cursor] as t27) == 1) { group_loop = 0; }
+                    else {
+                        let end_x: t27 = 0; let end_y: t27 = 0; let next_cursor: i32 = 0;
+                        if (svg_read_pair(path_data, cursor, &end_x, &end_y, &next_cursor) == 0) {
+                            return svg_path_reject(&path, ok);
+                        }
+                        let control_x: t27 = current_x; let control_y: t27 = current_y;
+                        if (last_curve_kind == 1
+                            && svg_path_reflect_pair(current_x, current_y, last_control_x, last_control_y,
+                                &control_x, &control_y) == 0) { return svg_path_reject(&path, ok); }
+                        let e_x: t27 = 0; let e_y: t27 = 0;
+                        if (svg_path_resolve_pair(end_x, end_y, current_x, current_y,
+                            relative, &e_x, &e_y) == 0) { return svg_path_reject(&path, ok); }
+                        if (path_quadratic_to(&path, control_x, control_y, e_x, e_y) == 0) {
+                            return svg_path_reject(&path, ok);
+                        }
+                        last_curve_kind = 1; last_control_x = control_x; last_control_y = control_y;
+                        current_x = e_x; current_y = e_y; cursor = next_cursor; groups = groups + 1;
+                    }
+                }
+                if (groups == 0) { return svg_path_reject(&path, ok); }
+            } else if (mode == 83 || mode == 115) {
+                if (started == 0) { return svg_path_reject(&path, ok); }
+                let groups: i32 = 0; let group_loop: i32 = 1;
+                while (group_loop == 1) {
+                    cursor = svg_skip_ws(path_data, cursor);
+                    if (cursor >= path_data.len || svg_is_command(path_data[cursor] as t27) == 1) { group_loop = 0; }
+                    else {
+                        let control2_x: t27 = 0; let control2_y: t27 = 0;
+                        let end_x: t27 = 0; let end_y: t27 = 0; let next_cursor: i32 = 0;
+                        if (svg_read_pair(path_data, cursor, &control2_x, &control2_y, &next_cursor) == 0) {
+                            return svg_path_reject(&path, ok);
+                        }
+                        cursor = next_cursor;
+                        if (svg_read_pair(path_data, cursor, &end_x, &end_y, &next_cursor) == 0) {
+                            return svg_path_reject(&path, ok);
+                        }
+                        let control1_x: t27 = current_x; let control1_y: t27 = current_y;
+                        if (last_curve_kind == 2
+                            && svg_path_reflect_pair(current_x, current_y, last_control_x, last_control_y,
+                                &control1_x, &control1_y) == 0) { return svg_path_reject(&path, ok); }
+                        let c2_x: t27 = 0; let c2_y: t27 = 0;
+                        let e_x: t27 = 0; let e_y: t27 = 0;
+                        if (svg_path_resolve_pair(control2_x, control2_y, current_x, current_y,
+                            relative, &c2_x, &c2_y) == 0
+                            || svg_path_resolve_pair(end_x, end_y, current_x, current_y,
+                                relative, &e_x, &e_y) == 0) { return svg_path_reject(&path, ok); }
+                        if (path_cubic_to(&path, control1_x, control1_y, c2_x, c2_y, e_x, e_y) == 0) {
+                            return svg_path_reject(&path, ok);
+                        }
+                        last_curve_kind = 2; last_control_x = c2_x; last_control_y = c2_y;
+                        current_x = e_x; current_y = e_y; cursor = next_cursor; groups = groups + 1;
+                    }
+                }
+                if (groups == 0) { return svg_path_reject(&path, ok); }
+            } else if (mode == 65 || mode == 97) {
+                if (started == 0) { return svg_path_reject(&path, ok); }
+                let groups: i32 = 0; let group_loop: i32 = 1;
+                while (group_loop == 1) {
+                    cursor = svg_skip_ws(path_data, cursor);
+                    if (cursor >= path_data.len || svg_is_command(path_data[cursor] as t27) == 1) { group_loop = 0; }
+                    else {
+                        let radius_x: t27 = 0; let radius_y: t27 = 0; let next_cursor: i32 = 0;
+                        if (svg_read_pair(path_data, cursor, &radius_x, &radius_y, &next_cursor) == 0
+                            || radius_x < 0 || radius_y < 0) { return svg_path_reject(&path, ok); }
+                        cursor = next_cursor;
+                        let parse_ok: i32 = 0;
+                        let rotation: t27 = svg_read_integer(path_data, cursor, &next_cursor, &parse_ok);
+                        if (parse_ok == 0 || rotation != 0) { return svg_path_reject(&path, ok); }
+                        cursor = next_cursor;
+                        let large_arc: i32 = svg_read_flag(path_data, cursor, &next_cursor, &parse_ok);
+                        if (parse_ok == 0) { return svg_path_reject(&path, ok); }
+                        cursor = next_cursor;
+                        let sweep: i32 = svg_read_flag(path_data, cursor, &next_cursor, &parse_ok);
+                        if (parse_ok == 0) { return svg_path_reject(&path, ok); }
+                        cursor = next_cursor;
+                        let end_x: t27 = 0; let end_y: t27 = 0;
+                        if (svg_read_pair(path_data, cursor, &end_x, &end_y, &next_cursor) == 0) {
+                            return svg_path_reject(&path, ok);
+                        }
+                        let e_x: t27 = 0; let e_y: t27 = 0;
+                        if (svg_path_resolve_pair(end_x, end_y, current_x, current_y,
+                            relative, &e_x, &e_y) == 0
+                            || path_arc_axis_aligned_to(&path, radius_x, radius_y,
+                                large_arc, sweep, e_x, e_y) == 0) { return svg_path_reject(&path, ok); }
+                        current_x = e_x; current_y = e_y; cursor = next_cursor; groups = groups + 1;
+                        last_curve_kind = 0;
+                    }
+                }
+                if (groups == 0) { return svg_path_reject(&path, ok); }
+            } else if (mode == 90 || mode == 122) {
+                if (started == 0 || path_close(&path) == 0) { return svg_path_reject(&path, ok); }
+                shape.*.closed = 1;
+                closed = 1; current_x = subpath_x; current_y = subpath_y; last_curve_kind = 0;
+                cursor = svg_skip_ws(path_data, cursor);
+                if (cursor < path_data.len) { return svg_path_reject(&path, ok); }
+                parsing = 0;
+            } else {
+                return svg_path_reject(&path, ok);
+            }
+        }
+    }
+
+    if (started == 0) { return svg_path_reject(&path, ok); }
+    let i: i32 = 0;
+    while (i < len[Point2D](path.points)) { push[Point2D](&shape.*.points, get[Point2D](path.points, i)); i = i + 1; }
+    path_free(&path);
+    return 1;
+}
+
+fn svg_required_integer(tag: []u8, name: []u8, ok: *i32) t27 {
+    return svg_parse_integer(svg_attr(tag, name), ok);
+}
+
+fn svg_parse(input: []u8) SvgResult {
+    if (input.len == 0) { return svg_empty_result(AssetError.Empty, 0); }
+    if (input.len > 1048576) { return svg_empty_result(AssetError.TooLarge, 0); }
+    let root_start: i32 = svg_find(input, "<svg", 0);
+    if (root_start < 0) { return svg_empty_result(AssetError.InvalidSvg, 0); }
+    let root_end: i32 = svg_tag_end(input, root_start);
+    if (root_end < 0) { return svg_empty_result(AssetError.InvalidSvg, root_start as t27); }
+    let root: []u8 = input[root_start..root_end + 1]; let number_ok: i32 = 0;
+    let width: t27 = svg_required_integer(root, "width", &number_ok);
+    if (number_ok == 0) { return svg_empty_result(AssetError.MissingSize, root_start as t27); }
+    let height: t27 = svg_required_integer(root, "height", &number_ok);
+    if (number_ok == 0 || width < 1 || height < 1 || width > 4096 || height > 4096) {
+        return svg_empty_result(AssetError.MissingSize, root_start as t27);
+    }
+    let result: SvgResult = SvgResult{ .document = SvgDocument{ .width = width, .height = height,
+        .shapes = make[SvgShape](16) }, .valid = 1, .error = AssetError.None, .error_offset = 0 };
+    let cursor: i32 = root_end + 1;
+    while (cursor < input.len) {
+        let open: i32 = svg_find(input, "<", cursor);
+        if (open < 0) { return result; }
+        if (svg_starts_at(input, open, "</svg") == 1) { return result; }
+        let end: i32 = svg_tag_end(input, open);
+        if (end < 0) { result.valid = 0; result.error = AssetError.InvalidSvg; result.error_offset = open; return result; }
+        let tag: []u8 = input[open..end + 1];
+        let shape: SvgShape = SvgShape{ .kind = SvgShapeKind.Rectangle, .x = 0, .y = 0, .w = 0, .h = 0,
+            .x2 = 0, .y2 = 0, .radius = 0, .color = color_rgba(0, 0, 0, 255),
+            .points = make[Point2D](0), .closed = 0 };
+        let recognized: i32 = 0;
+        let shape_ok: i32 = 1;
+        if (svg_starts_at(tag, 0, "<rect") == 1) {
+            recognized = 1; shape.kind = SvgShapeKind.Rectangle;
+            shape.x = svg_required_integer(tag, "x", &number_ok); if (number_ok == 0) { shape.x = 0; }
+            shape.y = svg_required_integer(tag, "y", &number_ok); if (number_ok == 0) { shape.y = 0; }
+            shape.w = svg_required_integer(tag, "width", &number_ok); if (number_ok == 0) { shape_ok = 0; }
+            shape.h = svg_required_integer(tag, "height", &number_ok); if (number_ok == 0) { shape_ok = 0; }
+        } else if (svg_starts_at(tag, 0, "<circle") == 1) {
+            recognized = 1; shape.kind = SvgShapeKind.Circle;
+            shape.x = svg_required_integer(tag, "cx", &number_ok); if (number_ok == 0) { shape_ok = 0; }
+            shape.y = svg_required_integer(tag, "cy", &number_ok); if (number_ok == 0) { shape_ok = 0; }
+            shape.radius = svg_required_integer(tag, "r", &number_ok); if (number_ok == 0) { shape_ok = 0; }
+        } else if (svg_starts_at(tag, 0, "<line") == 1) {
+            recognized = 1; shape.kind = SvgShapeKind.Line;
+            shape.x = svg_required_integer(tag, "x1", &number_ok); if (number_ok == 0) { shape_ok = 0; }
+            shape.y = svg_required_integer(tag, "y1", &number_ok); if (number_ok == 0) { shape_ok = 0; }
+            shape.x2 = svg_required_integer(tag, "x2", &number_ok); if (number_ok == 0) { shape_ok = 0; }
+            shape.y2 = svg_required_integer(tag, "y2", &number_ok); if (number_ok == 0) { shape_ok = 0; }
+        } else if (svg_starts_at(tag, 0, "<path") == 1) {
+            recognized = 1; shape.kind = SvgShapeKind.Path;
+            let d: []u8 = svg_attr(tag, "d");
+            let parse_ok: i32 = 0;
+            if (svg_parse_path(d, &shape, &parse_ok) == 0 || parse_ok == 0 || len[Point2D](shape.points) < 2) {
+                result.valid = 0; result.error = AssetError.InvalidPath; result.error_offset = open;
+                free[Point2D](&shape.points); return result;
+            }
+        } else if (svg_starts_at(tag, 0, "<polygon") == 1 || svg_starts_at(tag, 0, "<ellipse") == 1) {
+            result.valid = 0; result.error = AssetError.UnsupportedShape; result.error_offset = open; free[Point2D](&shape.points); return result;
+        }
+        if (recognized == 1) {
+            if (shape_ok == 0 || shape.w < 0 || shape.h < 0 || shape.radius < 0) {
+                result.valid = 0; result.error = AssetError.InvalidNumber; result.error_offset = open; free[Point2D](&shape.points); return result;
+            }
+            let color_ok: i32 = 0; shape.color = svg_parse_color(svg_attr(tag, "fill"), &color_ok);
+            if (color_ok == 0) {
+                result.valid = 0; result.error = AssetError.InvalidColor; result.error_offset = open; free[Point2D](&shape.points); return result;
+            }
+            push[SvgShape](&result.document.shapes, shape);
+            if (len[SvgShape](result.document.shapes) > 4096) {
+                result.valid = 0; result.error = AssetError.TooLarge; result.error_offset = open; return result;
+            }
+        }
+        cursor = end + 1;
+    }
+    return result;
+}
+
+fn svg_load_file(path: []u8) SvgResult {
+    if (_zag_file_exists(path) == 0) { return svg_empty_result(AssetError.Io, 0); }
+    return svg_parse(_zag_read_file(path));
+}
+
+fn svg_abs(value: t27) t27 { if (value < 0) { return 0 - value; } return value; }
+
+fn svg_draw_line(surface: *Surface, x0: t27, y0: t27, x1: t27, y1: t27, color: Color) void {
+    let x: t27 = x0; let y: t27 = y0; let dx: t27 = svg_abs(x1 - x0); let dy: t27 = 0 - svg_abs(y1 - y0);
+    let sx: t27 = -1; if (x0 < x1) { sx = 1; } let sy: t27 = -1; if (y0 < y1) { sy = 1; }
+    let line_error: t27 = dx + dy; let active: i32 = 1;
+    while (active == 1) {
+        surface_blend(surface, x, y, color); if (x == x1 && y == y1) { active = 0; }
+        else {
+            let twice: t27 = line_error * 2;
+            if (twice >= dy) { line_error = line_error + dy; x = x + sx; }
+            if (twice <= dx) { line_error = line_error + dx; y = y + sy; }
+        }
+    }
+}
+
+fn svg_render(document: *SvgDocument, width: t27, height: t27) Surface {
+    let surface: Surface = surface_new(width, height); let i: i32 = 0;
+    while (i < len[SvgShape](document.*.shapes)) {
+        let shape: SvgShape = get[SvgShape](document.*.shapes, i);
+        let x: t27 = (shape.x * width) / document.*.width; let y: t27 = (shape.y * height) / document.*.height;
+        if (shape.kind == SvgShapeKind.Rectangle) {
+            surface_fill(&surface, rect(x, y, (shape.w * width) / document.*.width,
+                (shape.h * height) / document.*.height), shape.color);
+        } else if (shape.kind == SvgShapeKind.Circle) {
+            let rx: t27 = (shape.radius * width) / document.*.width;
+            let ry: t27 = (shape.radius * height) / document.*.height;
+            let py: t27 = y - ry;
+            while (py <= y + ry) {
+                let px: t27 = x - rx;
+                while (px <= x + rx) {
+                    if (rx > 0 && ry > 0 && ((px - x) * (px - x) * 10000) / (rx * rx)
+                        + ((py - y) * (py - y) * 10000) / (ry * ry) <= 10000) {
+                        surface_blend(&surface, px, py, shape.color);
+                    }
+                    px = px + 1;
+                }
+                py = py + 1;
+            }
+        } else if (shape.kind == SvgShapeKind.Line) {
+            svg_draw_line(&surface, x, y, (shape.x2 * width) / document.*.width,
+                (shape.y2 * height) / document.*.height, shape.color);
+        } else {
+            let path: Path2D = path_new();
+            let point: i32 = 0;
+            while (point < len[Point2D](shape.points)) {
+                let source: Point2D = get[Point2D](shape.points, point);
+                let px: t27 = (source.x * width) / document.*.width;
+                let py: t27 = (source.y * height) / document.*.height;
+                if (point == 0) { path_move_to(&path, px, py); } else { path_line_to(&path, px, py); }
+                point = point + 1;
+            }
+            if (shape.closed == 1 && point > 2) { path_close(&path); }
+            let _ = surface_fill_path_aa(&surface, &path, transform_identity(), rect(0, 0, width, height), shape.color);
+            path_free(&path);
+        }
+        i = i + 1;
+    }
+    return surface;
+}
+
+fn svg_free(result: *SvgResult) void {
+    let i: i32 = 0;
+    while (i < len[SvgShape](result.document.shapes)) {
+        let shape: SvgShape = get[SvgShape](result.document.shapes, i);
+        free[Point2D](&shape.points);
+        i = i + 1;
+    }
+    free[SvgShape](&result.*.document.shapes);
+    result.*.document.width = 0;
+    result.*.document.height = 0;
+    result.*.valid = 0;
+    result.*.error_offset = 0;
+}

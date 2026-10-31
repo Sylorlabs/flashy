@@ -1,0 +1,88 @@
+@import("../src/core.flash")
+@import("../src/layout.flash")
+@import("../src/render.flash")
+@import("../src/text.flash")
+@import("../src/events.flash")
+@import("../src/automation.flash")
+
+fn geometry_safety_expect(ok: i32, message: []u8) i32 {
+    if (ok == 0) { _zag_print("FAIL "); _zag_println(message); return 1; }
+    return 0;
+}
+
+fn main() i32 {
+    let failures: i32 = 0;
+    let maximum: t27 = flashy_t27_max();
+    let minimum: t27 = (0 as t27) - maximum;
+
+    failures = failures + geometry_safety_expect(
+        length_resolve(length_percent(100), maximum, 0) == maximum
+        && length_resolve(length_percent(99), maximum, 0)
+            == (maximum / 100) * 99 + ((maximum % 100) * 99) / 100,
+        "percentage resolution preserves full balanced-t27 range");
+
+    failures = failures + geometry_safety_expect(
+        rect_contains(rect(maximum - 1, 0, 1, 1), maximum - 1, 0) == 1
+        && rect_contains(rect(maximum - 1, 0, 3, 1), maximum, 0) == 0
+        && rect_contains(rect(minimum, 0, maximum, 1), -1, 0) == 1
+        && rect_contains(rect(minimum, 0, maximum, 1), 0, 0) == 0,
+        "half-open hit testing accepts exact endpoints and rejects overflowed geometry");
+
+    let center_x: t27 = 0;
+    let center_y: t27 = 0;
+    failures = failures + geometry_safety_expect(
+        rect_center_checked(rect(maximum - 1, 0, 6, 2),
+            &center_x, &center_y) == 0,
+        "unrepresentable centers fail before dispatch");
+
+    let surface: Surface = surface_new(2, 2);
+    let red: Color = color_rgba(255, 0, 0, 255);
+    surface_fill(&surface, rect(maximum - 1, 0, 3, 1), red);
+    surface_fill(&surface, rect(1, 0, maximum, 1), red);
+    failures = failures + geometry_safety_expect(surface.painted_pixels == 0,
+        "renderer rejects overflowed endpoints even when one origin is visible");
+    surface_fill(&surface, rect(minimum, 0, maximum, 1), red);
+    failures = failures + geometry_safety_expect(surface.painted_pixels == 0,
+        "renderer clips a valid full-range negative interval to an empty intersection");
+    surface_fill(&surface, rect(-1, 0, 2, 1), red);
+    failures = failures + geometry_safety_expect(surface.painted_pixels == 1
+        && surface.pixels.data[0] == 255 as u8,
+        "renderer preserves a valid visible intersection");
+    surface_free(&surface);
+
+    let invalid_ui: Ui = ui_new(maximum, 10);
+    ui_begin(&invalid_ui);
+    let invalid_button_style: Style = style_default();
+    let _invalid_button: i32 = ui_node(&invalid_ui, 9001, NodeKind.Button, -1,
+        rect(maximum - 1, 0, 6, 2), invalid_button_style,
+        semantics(Role.Button, "Overflow", "", "overflow"), "Overflow",
+        Action{ .id = 9 });
+    ui_end(&invalid_ui);
+    let invalid_locator: Locator = locate_key(&invalid_ui, 9001);
+    failures = failures + geometry_safety_expect(
+        locator_click(&invalid_ui, invalid_locator) == 0
+        && locator_hover(&invalid_ui, invalid_locator) == 0
+        && locator_double_click(&invalid_ui, invalid_locator) == 0
+        && len[t9](invalid_ui.emitted_actions) == 0
+        && invalid_ui.focused_node == -1 && invalid_ui.hovered_node == -1,
+        "strict locators reject invalid geometry without mutation");
+    ui_free(&invalid_ui);
+
+    let valid_ui: Ui = ui_new(maximum, 2);
+    ui_begin(&valid_ui);
+    let valid_button_style: Style = style_default();
+    let _valid_button: i32 = ui_node(&valid_ui, 9002, NodeKind.Button, -1,
+        rect(maximum - 1, 0, 1, 1), valid_button_style,
+        semantics(Role.Button, "Edge", "", "edge"), "Edge",
+        Action{ .id = 10 });
+    ui_end(&valid_ui);
+    failures = failures + geometry_safety_expect(
+        locator_click(&valid_ui, locate_key(&valid_ui, 9002)) == 1
+        && action_emission_count(&valid_ui, 10) == 1,
+        "strict locators preserve an exactly representable maximum-edge target");
+    ui_free(&valid_ui);
+
+    if (failures != 0) { return 1; }
+    _zag_println("geometry_safety_test: ok");
+    return 0;
+}

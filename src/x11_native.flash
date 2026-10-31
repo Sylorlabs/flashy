@@ -1,0 +1,1744 @@
+// Authenticated local X11 setup. Window creation/presentation is layered later.
+
+struct X11OwnedSelection {
+    selection_atom: t27,
+    owner_window: t27,
+    timestamp: t27,
+    text: TextBuffer,
+    generation: t27,
+    valid: i32,
+}
+
+struct X11ClipboardReadResult {
+    status: X11ClipboardStatus,
+    text: TextBuffer,
+    valid: i32,
+}
+
+struct X11NativeConnection {
+    fd: i64,
+    setup: X11SetupSuccess,
+    connected: i32,
+    authenticated: i32,
+    last_sent_sequence: t27,
+    next_resource_id: t27,
+    pending_events: ArrayList[X11Event],
+    live_windows: ArrayList[t27],
+    last_failure_timeout: i32,
+    keyboard_mapping: X11KeyboardMapping,
+    modifier_mapping: X11ModifierMapping,
+    net_wm_pid_atom: t27,
+    net_wm_name_atom: t27,
+    utf8_string_atom: t27,
+    primary_selection_atom: t27,
+    clipboard_selection_atom: t27,
+    clipboard_property_atom: t27,
+    primary_selection: X11OwnedSelection,
+    clipboard_selection: X11OwnedSelection,
+    wm_protocols_atom: t27,
+    wm_delete_window_atom: t27,
+    error: []u8,
+}
+
+fn x11_empty_owned_selection() X11OwnedSelection {
+    return X11OwnedSelection{ .selection_atom = 0, .owner_window = 0,
+        .timestamp = 0, .text = text_buffer_empty(), .generation = 0, .valid = 0 };
+}
+
+fn x11_owned_selection_free(selection: *X11OwnedSelection) void {
+    text_buffer_free(&selection.*.text);
+    selection.*.selection_atom = 0; selection.*.owner_window = 0;
+    selection.*.timestamp = 0; selection.*.valid = 0;
+}
+
+fn x11_clipboard_clear_authority(connection: *X11NativeConnection) void {
+    x11_owned_selection_free(&connection.*.primary_selection);
+    x11_owned_selection_free(&connection.*.clipboard_selection);
+}
+
+fn x11_clipboard_forget_window_identity(connection: *X11NativeConnection,
+    window_id: t27) void {
+    if (connection.*.primary_selection.valid != 0
+        && connection.*.primary_selection.owner_window == window_id) {
+        x11_owned_selection_free(&connection.*.primary_selection);
+    }
+    if (connection.*.clipboard_selection.valid != 0
+        && connection.*.clipboard_selection.owner_window == window_id) {
+        x11_owned_selection_free(&connection.*.clipboard_selection);
+    }
+}
+
+fn x11_clipboard_read_result_free(result: *X11ClipboardReadResult) void {
+    text_buffer_free(&result.*.text); result.*.valid = 0;
+}
+
+struct X11NativeWindow {
+    window_id: t27,
+    gc_id: t27,
+    width: t27,
+    height: t27,
+    live: i32,
+    mapped: i32,
+}
+
+struct X11NativeFrame {
+    input: WireBuffer,
+    response_type: t27,
+    sequence: t27,
+    reply_units: t27,
+    is_reply: i32,
+    is_event: i32,
+    timed_out: i32,
+    terminal: i32,
+    valid: i32,
+}
+
+struct X11NativeSendResult {
+    complete: i32,
+    timed_out: i32,
+}
+
+struct X11AtomLookupResult {
+    atom: t27,
+    status: X11ClipboardStatus,
+}
+
+fn x11_empty_connection() X11NativeConnection {
+    let setup: X11SetupSuccess = X11SetupSuccess{ .protocol_major = 0, .protocol_minor = 0,
+        .resource_id_base = 0, .resource_id_mask = 0, .maximum_request_length = 0, .roots = 0,
+        .root_window = 0, .white_pixel = 0, .black_pixel = 0, .root_visual = 0, .root_depth = 0,
+        .screen_width = 0, .screen_height = 0, .image_byte_order = 0,
+        .minimum_keycode = 0, .maximum_keycode = 0, .bits_per_pixel = 0,
+        .scanline_pad = 0, .visual_class = 0, .red_mask = 0, .green_mask = 0, .blue_mask = 0,
+        .pixel_format_valid = 0, .valid = 0 };
+    return X11NativeConnection{ .fd = 0 - 1, .setup = setup, .connected = 0,
+        .authenticated = 0, .last_sent_sequence = 0,
+        .next_resource_id = 1, .pending_events = make[X11Event](16),
+        .live_windows = make[t27](8), .last_failure_timeout = 0,
+        .keyboard_mapping = x11_keyboard_mapping_empty(),
+        .modifier_mapping = x11_modifier_mapping_empty(),
+        .net_wm_pid_atom = 0, .net_wm_name_atom = 0, .utf8_string_atom = 0,
+        .primary_selection_atom = 1, .clipboard_selection_atom = 0,
+        .clipboard_property_atom = 0,
+        .primary_selection = x11_empty_owned_selection(),
+        .clipboard_selection = x11_empty_owned_selection(),
+        .wm_protocols_atom = 0, .wm_delete_window_atom = 0,
+        .error = "X11 connection is not active" };
+}
+
+fn x11_native_max_pending_events() t27 { return 256; }
+fn x11_native_max_reply_units() t27 { return 65025; }
+fn x11_native_max_live_windows() t27 { return 256; }
+
+// A short X11 stream write leaves an irrecoverable request prefix on the
+// socket. Retire all protocol authority immediately so no later request can be
+// appended to that prefix. Container allocations remain owned by disconnect.
+fn x11_retire_connection(connection: *X11NativeConnection, reason: []u8) void {
+    if (connection.*.fd >= 0) { let _closed: i64 = linux_close(connection.*.fd); }
+    connection.*.fd = 0 - 1;
+    connection.*.connected = 0;
+    connection.*.authenticated = 0;
+    connection.*.last_sent_sequence = 0;
+    connection.*.pending_events.len = 0;
+    connection.*.live_windows.len = 0;
+    connection.*.last_failure_timeout = 0;
+    x11_keyboard_mapping_free(&connection.*.keyboard_mapping);
+    x11_modifier_mapping_free(&connection.*.modifier_mapping);
+    x11_clipboard_clear_authority(connection);
+    connection.*.error = reason;
+}
+
+fn x11_retire_connection_timeout(connection: *X11NativeConnection,
+    reason: []u8) void {
+    x11_retire_connection(connection, reason);
+    connection.*.last_failure_timeout = 1;
+}
+
+fn x11_connection_window_live(connection: *X11NativeConnection,
+    window_id: t27) i32 {
+    if (x11_wire_id_valid(window_id) == 0) { return 0; }
+    let i: i32 = 0;
+    while (i < len[t27](connection.*.live_windows)) {
+        if (get[t27](connection.*.live_windows, i) == window_id) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn x11_connection_register_window(connection: *X11NativeConnection,
+    window_id: t27) i32 {
+    if (connection.*.authenticated == 0 || x11_wire_id_valid(window_id) == 0
+        || x11_connection_window_live(connection, window_id) != 0
+        || len[t27](connection.*.live_windows) as t27
+            >= x11_native_max_live_windows()) { return 0; }
+    push[t27](&connection.*.live_windows, window_id);
+    return 1;
+}
+
+fn x11_connection_unregister_window(connection: *X11NativeConnection,
+    window_id: t27) void {
+    let found: i32 = -1;
+    let i: i32 = 0;
+    while (i < len[t27](connection.*.live_windows)) {
+        if (get[t27](connection.*.live_windows, i) == window_id) {
+            found = i; i = len[t27](connection.*.live_windows);
+        } else { i = i + 1; }
+    }
+    if (found < 0) { return; }
+    i = found + 1;
+    while (i < len[t27](connection.*.live_windows)) {
+        set[t27](&connection.*.live_windows, i - 1,
+            get[t27](connection.*.live_windows, i));
+        i = i + 1;
+    }
+    connection.*.live_windows.len = connection.*.live_windows.len - 1;
+}
+
+// Takes request ownership on every path. enabled carries a prior request result
+// so preconstructed sequences can free their remaining buffers without writing
+// after the first failure.
+fn x11_native_send_request_until(connection: *X11NativeConnection,
+    request: *WireBuffer, enabled: i32, deadline: i64) X11NativeSendResult {
+    let result: X11NativeSendResult = X11NativeSendResult{
+        .complete = 0, .timed_out = 0 };
+    let advances_sequence: i32 = connection.*.authenticated;
+    if (enabled != 0 && connection.*.connected != 0 && connection.*.fd >= 0
+        && request.*.error == 0) {
+        let expected: i64 = len[u8](request.*.bytes) as i64;
+        let sent: LinuxWriteAllResult = linux_send_wire_all_until(
+            connection.*.fd, request, deadline);
+        if (sent.complete != 0 && sent.written == expected) { result.complete = 1; }
+        else if (sent.error_code == (0 - 110)) { result.timed_out = 1; }
+    }
+    if (result.complete != 0 && advances_sequence != 0) {
+        connection.*.last_sent_sequence = (connection.*.last_sent_sequence + 1) % 65536;
+    }
+    if (enabled != 0 && result.complete == 0) {
+        if (result.timed_out != 0) {
+            x11_retire_connection_timeout(connection,
+                "X11 request write exceeded its caller deadline");
+        } else {
+            x11_retire_connection(connection, "X11 request write was incomplete");
+        }
+    }
+    wire_free(request);
+    return result;
+}
+
+fn x11_native_send_request(connection: *X11NativeConnection,
+    request: *WireBuffer, enabled: i32) i32 {
+    let result: X11NativeSendResult = x11_native_send_request_until(
+        connection, request, enabled, linux_monotonic_ms() + 1000);
+    return result.complete;
+}
+
+fn x11_owned_selection_slot(connection: *X11NativeConnection,
+    selection_atom: t27) *X11OwnedSelection {
+    if (selection_atom == connection.*.primary_selection_atom) {
+        return &connection.*.primary_selection;
+    }
+    if (selection_atom != 0
+        && selection_atom == connection.*.clipboard_selection_atom) {
+        return &connection.*.clipboard_selection;
+    }
+    return null as *X11OwnedSelection;
+}
+
+fn x11_clipboard_apply_selection_clear(connection: *X11NativeConnection,
+    event: X11Event) void {
+    let slot: *X11OwnedSelection = x11_owned_selection_slot(
+        connection, event.selection_atom);
+    if (slot == null as *X11OwnedSelection || slot.*.valid == 0
+        || slot.*.owner_window != event.owner) { return; }
+    // Only x11_note_event may attach local ownership authority to a decoded
+    // Clear. An untagged/replayed event cannot revoke a later acquisition.
+    if (event.selection_generation == 0
+        || event.selection_generation != slot.*.generation) { return; }
+    if (x11_time_precedes(event.time, slot.*.timestamp) != 0) { return; }
+    x11_owned_selection_free(slot);
+}
+
+fn x11_note_event(connection: *X11NativeConnection, event: X11Event) i32 {
+    if (event.valid == 0) { return 0; }
+    if (len[X11Event](connection.*.pending_events) as t27
+        >= x11_native_max_pending_events()) {
+        x11_retire_connection(connection, "X11 pending event queue exceeded its bound");
+        return 0;
+    }
+    if (event.kind == X11EventKind.MappingNotify) {
+        // Modifier and keyboard changes can both change the semantic meaning of
+        // keysyms. Invalidate conservatively before any queued key event can be
+        // interpreted; pointer-map changes do not affect keyboard authority.
+        if (event.mapping_request == 0 || event.mapping_request == 1) {
+            x11_keyboard_mapping_invalidate(&connection.*.keyboard_mapping);
+            x11_modifier_mapping_invalidate(&connection.*.modifier_mapping);
+        }
+    }
+    if (event.kind == X11EventKind.SelectionClear
+        || event.kind == X11EventKind.SelectionRequest) {
+        // Tag both revocation and service authority with the exact local
+        // generation visible when the event entered the FIFO. This preserves a
+        // Request-before-Clear ordering while preventing an old request from
+        // exposing bytes acquired by a later copy/release/reacquisition.
+        let slot: *X11OwnedSelection = x11_owned_selection_slot(
+            connection, event.selection_atom);
+        if (slot != null as *X11OwnedSelection && slot.*.valid != 0
+            && slot.*.owner_window == event.owner) {
+            event.selection_generation = slot.*.generation;
+        }
+    }
+    push[X11Event](&connection.*.pending_events, event);
+    return 1;
+}
+
+fn x11_empty_native_frame() X11NativeFrame {
+    return X11NativeFrame{ .input = wire_new(32), .response_type = 0,
+        .sequence = 0, .reply_units = 0, .is_reply = 0, .is_event = 0,
+        .timed_out = 0, .terminal = 0, .valid = 0 };
+}
+
+fn x11_native_frame_free(frame: *X11NativeFrame) void {
+    wire_free(&frame.*.input);
+    frame.*.valid = 0;
+}
+
+// Fill exactly one declared frame segment against a single absolute deadline.
+// Return one for completion, zero for a no-progress timeout, and minus one for
+// EOF or a transport error. The caller owns retirement once any prefix exists.
+fn x11_native_receive_until(connection: *X11NativeConnection, input: *WireBuffer,
+    target_size: i32, deadline: i64) i32 {
+    if (connection.*.authenticated == 0 || connection.*.fd < 0
+        || target_size < len[u8](input.*.bytes)) { return -1; }
+    while (len[u8](input.*.bytes) < target_size) {
+        let poll_status: i64 = linux_poll_event_until(connection.*.fd, 1, deadline);
+        if (poll_status == 0) { return 0; }
+        if (poll_status != 1) { return -1; }
+        let remaining: i32 = target_size - len[u8](input.*.bytes);
+        let native: LinuxByteBuffer = linux_buffer_new(remaining);
+        native.capacity_bytes = remaining;
+        let got: i64 = linux_read_into(connection.*.fd, &native);
+        if (got == (0 - 4) || got == (0 - 11)) {
+            linux_buffer_free(&native); continue;
+        }
+        if (got <= 0) { linux_buffer_free(&native); return -1; }
+        let i: i32 = 0;
+        while (i < native.len) {
+            wire_push_u8(input, linux_buffer_byte(&native, i) as t27);
+            i = i + 1;
+        }
+        linux_buffer_free(&native);
+    }
+    return 1;
+}
+
+// Own one X11 server frame. Core replies carry a bounded exact tail; core
+// events are exactly 32 bytes. A partial frame, protocol error packet, malformed
+// MappingNotify, or variable-length GenericEvent retires the stream so unread
+// bytes can never be mistaken for the next frame.
+fn x11_native_receive_frame_until(connection: *X11NativeConnection,
+    deadline: i64, maximum_reply_units: t27) X11NativeFrame {
+    let frame: X11NativeFrame = x11_empty_native_frame();
+    if (connection.*.authenticated == 0 || maximum_reply_units < 0
+        || maximum_reply_units > x11_native_max_reply_units()) {
+        frame.input.error = 1; return frame;
+    }
+    let header_status: i32 = x11_native_receive_until(connection, &frame.input, 32, deadline);
+    if (header_status != 1) {
+        frame.input.error = 1;
+        if (header_status == 0 && len[u8](frame.input.bytes) == 0) {
+            frame.timed_out = 1; return frame;
+        }
+        x11_retire_connection(connection, "X11 stream ended inside a 32-byte frame");
+        frame.terminal = 1; return frame;
+    }
+    let encoded_response: t27 = wire_read_u8(&frame.input, 0);
+    let response: t27 = encoded_response;
+    if (response >= 128) { response = response - 128; }
+    frame.response_type = response;
+    frame.sequence = wire_read_u16_le(&frame.input, 2);
+    if (response == 0) {
+        frame.input.error = 1;
+        x11_retire_connection(connection, "X11 server returned a protocol error packet");
+        frame.terminal = 1; return frame;
+    }
+    if (response == 1) {
+        if (encoded_response != 1) {
+            frame.input.error = 1;
+            x11_retire_connection(connection, "X11 reply used an invalid send-event bit");
+            frame.terminal = 1; return frame;
+        }
+        frame.reply_units = wire_read_u32_le(&frame.input, 4);
+        if (frame.reply_units > maximum_reply_units
+            || frame.reply_units > x11_native_max_reply_units()) {
+            frame.input.error = 1;
+            x11_retire_connection(connection, "X11 reply exceeded its declared bound");
+            frame.terminal = 1; return frame;
+        }
+        let target_size: i32 = 32 + (frame.reply_units as i32) * 4;
+        let tail_status: i32 = x11_native_receive_until(
+            connection, &frame.input, target_size, deadline);
+        if (tail_status != 1) {
+            frame.input.error = 1;
+            x11_retire_connection(connection, "X11 stream ended inside a reply tail");
+            frame.terminal = 1; return frame;
+        }
+        frame.is_reply = 1; frame.valid = 1; return frame;
+    }
+    if (response == 35) {
+        frame.input.error = 1;
+        x11_retire_connection(connection, "X11 GenericEvent is unsupported and variable-length");
+        frame.terminal = 1; return frame;
+    }
+    let decoded: X11Event = x11_decode_event(&frame.input, 0);
+    if (response == 34 && decoded.valid == 0) {
+        frame.input.error = 1;
+        x11_retire_connection(connection, "X11 MappingNotify schema was invalid");
+        frame.terminal = 1; return frame;
+    }
+    if (response >= 29 && response <= 31 && decoded.valid == 0) {
+        frame.input.error = 1;
+        x11_retire_connection(connection, "X11 selection event schema was invalid");
+        frame.terminal = 1; return frame;
+    }
+    frame.is_event = 1; frame.valid = 1; return frame;
+}
+
+fn x11_bad_reply_wire() WireBuffer {
+    let bad: WireBuffer = wire_new(0);
+    bad.error = 1;
+    return bad;
+}
+
+fn x11_receive_bounded_reply_until(connection: *X11NativeConnection,
+    expected_sequence: t27, deadline: i64, maximum_units: t27) WireBuffer {
+    if (connection.*.authenticated == 0 || expected_sequence < 0
+        || expected_sequence > 65535 || maximum_units < 0
+        || maximum_units > x11_native_max_reply_units()) { return x11_bad_reply_wire(); }
+    while (connection.*.authenticated != 0) {
+        let frame: X11NativeFrame = x11_native_receive_frame_until(
+            connection, deadline, maximum_units);
+        if (frame.valid == 0) {
+            if (frame.timed_out != 0) {
+                x11_retire_connection_timeout(connection,
+                    "X11 reply timed out after its request was sent");
+            }
+            x11_native_frame_free(&frame); return x11_bad_reply_wire();
+        }
+        if (frame.is_reply != 0) {
+            if (frame.sequence != expected_sequence) {
+                x11_native_frame_free(&frame);
+                x11_retire_connection(connection, "X11 reply sequence did not match its request");
+                return x11_bad_reply_wire();
+            }
+            return frame.input;
+        }
+        if (frame.is_event != 0) {
+            let event: X11Event = x11_decode_event(&frame.input, 0);
+            if (event.valid == 1 && x11_note_event(connection, event) == 0) {
+                x11_native_frame_free(&frame); return x11_bad_reply_wire();
+            }
+        }
+        x11_native_frame_free(&frame);
+    }
+    return x11_bad_reply_wire();
+}
+
+fn x11_receive_bounded_reply(connection: *X11NativeConnection,
+    expected_sequence: t27, timeout_ms: t27, maximum_units: t27) WireBuffer {
+    if (timeout_ms < 0) { return x11_bad_reply_wire(); }
+    return x11_receive_bounded_reply_until(connection, expected_sequence,
+        linux_monotonic_ms() + timeout_ms as i64, maximum_units);
+}
+
+fn x11_refresh_keyboard_mapping(connection: *X11NativeConnection, timeout_ms: t27) i32 {
+    let minimum: t27 = connection.*.setup.minimum_keycode;
+    let maximum: t27 = connection.*.setup.maximum_keycode;
+    if (connection.*.authenticated == 0 || minimum < 8 || maximum < minimum || maximum > 255) { return 0; }
+    let count: t27 = maximum - minimum + 1;
+    let request: WireBuffer = x11_get_keyboard_mapping_request(minimum, count);
+    if (x11_native_send_request(connection, &request, 1) == 0) { return 0; }
+    let expected_sequence: t27 = connection.*.last_sent_sequence;
+    let reply: WireBuffer = x11_receive_bounded_reply(
+        connection, expected_sequence, timeout_ms, count * 255);
+    if (reply.error != 0) { wire_free(&reply); return 0; }
+    let decoded: X11KeyboardMapping = x11_decode_keyboard_mapping_reply(&reply,
+        minimum, count, minimum, maximum);
+    wire_free(&reply);
+    if (decoded.valid == 0) { x11_keyboard_mapping_free(&decoded); return 0; }
+    let generation: t27 = connection.*.keyboard_mapping.generation + 1;
+    x11_keyboard_mapping_free(&connection.*.keyboard_mapping);
+    connection.*.keyboard_mapping = decoded;
+    connection.*.keyboard_mapping.generation = generation;
+    return 1;
+}
+
+fn x11_refresh_modifier_mapping(connection: *X11NativeConnection, timeout_ms: t27) i32 {
+    if (connection.*.authenticated == 0) { return 0; }
+    let request: WireBuffer = x11_get_modifier_mapping_request();
+    if (x11_native_send_request(connection, &request, 1) == 0) { return 0; }
+    let expected_sequence: t27 = connection.*.last_sent_sequence;
+    let reply: WireBuffer = x11_receive_bounded_reply(
+        connection, expected_sequence, timeout_ms, 510);
+    if (reply.error != 0) { wire_free(&reply); return 0; }
+    let decoded: X11ModifierMapping = x11_decode_modifier_mapping_reply(&reply);
+    wire_free(&reply);
+    if (decoded.valid == 0 || x11_modifier_mapping_within_bounds(&decoded,
+        connection.*.setup.minimum_keycode, connection.*.setup.maximum_keycode) == 0) {
+        x11_modifier_mapping_free(&decoded); return 0;
+    }
+    let generation: t27 = connection.*.modifier_mapping.generation + 1;
+    x11_modifier_mapping_free(&connection.*.modifier_mapping);
+    connection.*.modifier_mapping = decoded;
+    connection.*.modifier_mapping.generation = generation;
+    return 1;
+}
+
+fn x11_refresh_keyboard_state(connection: *X11NativeConnection, timeout_ms: t27) i32 {
+    if (timeout_ms < 0) { return 0; }
+    let deadline: i64 = linux_monotonic_ms() + timeout_ms as i64;
+    let attempt: t27 = 0;
+    while (attempt < 3 && linux_monotonic_ms() <= deadline) {
+        let map_remaining_i64: i64 = deadline - linux_monotonic_ms();
+        if (map_remaining_i64 < 0) { return 0; }
+        if (connection.*.keyboard_mapping.valid == 0
+            && x11_refresh_keyboard_mapping(connection, map_remaining_i64 as t27) == 0) { return 0; }
+        let modifier_remaining_i64: i64 = deadline - linux_monotonic_ms();
+        if (modifier_remaining_i64 < 0) { return 0; }
+        if (connection.*.modifier_mapping.valid == 0
+            && x11_refresh_modifier_mapping(connection, modifier_remaining_i64 as t27) == 0) {
+            x11_keyboard_mapping_invalidate(&connection.*.keyboard_mapping);
+            return 0;
+        }
+        if (connection.*.keyboard_mapping.valid == 1
+            && connection.*.modifier_mapping.valid == 1) { return 1; }
+        attempt = attempt + 1;
+    }
+    return 0;
+}
+
+fn x11_connection_keysym(connection: *X11NativeConnection, keycode: t27,
+    column: t27) X11KeysymLookup {
+    return x11_keyboard_lookup(&connection.*.keyboard_mapping, keycode, column);
+}
+
+fn x11_intern_atom_result_until(connection: *X11NativeConnection,
+    name: []u8, deadline: i64) X11AtomLookupResult {
+    let failed: X11AtomLookupResult = X11AtomLookupResult{ .atom = 0,
+        .status = X11ClipboardStatus.TransportFailed };
+    if (connection.*.authenticated == 0) { return failed; }
+    let request: WireBuffer = x11_intern_atom_request(name);
+    let sent: X11NativeSendResult = x11_native_send_request_until(
+        connection, &request, 1, deadline);
+    if (sent.complete == 0) {
+        if (sent.timed_out != 0) {
+            return X11AtomLookupResult{ .atom = 0,
+                .status = X11ClipboardStatus.Timeout };
+        }
+        return failed;
+    }
+    let expected_sequence: t27 = connection.*.last_sent_sequence;
+    let reply_wire: WireBuffer = x11_receive_bounded_reply_until(
+        connection, expected_sequence, deadline, 0);
+    if (reply_wire.error != 0) {
+        wire_free(&reply_wire);
+        if (connection.*.last_failure_timeout != 0) {
+            return X11AtomLookupResult{ .atom = 0,
+                .status = X11ClipboardStatus.Timeout };
+        }
+        return failed;
+    }
+    let reply: X11AtomReply = x11_decode_intern_atom_reply(&reply_wire);
+    wire_free(&reply_wire);
+    if (reply.valid == 0) {
+        x11_retire_connection(connection, "X11 InternAtom reply was malformed");
+        return X11AtomLookupResult{ .atom = 0,
+            .status = X11ClipboardStatus.MalformedReply };
+    }
+    return X11AtomLookupResult{ .atom = reply.atom,
+        .status = X11ClipboardStatus.Ok };
+}
+
+fn x11_intern_atom_until(connection: *X11NativeConnection,
+    name: []u8, deadline: i64) t27 {
+    let result: X11AtomLookupResult = x11_intern_atom_result_until(
+        connection, name, deadline);
+    return result.atom;
+}
+
+fn x11_intern_atom_timeout(connection: *X11NativeConnection,
+    name: []u8, timeout_ms: t27) t27 {
+    if (timeout_ms < 0) { return 0; }
+    return x11_intern_atom_until(connection, name,
+        linux_monotonic_ms() + timeout_ms as i64);
+}
+
+fn x11_intern_atom(connection: *X11NativeConnection, name: []u8) t27 {
+    return x11_intern_atom_timeout(connection, name, 2000);
+}
+
+fn x11_display_number(display: []u8) []u8 {
+    let colon: i32 = _zag_str_index_of_byte(display, ':' as i32);
+    if (colon < 0 || colon + 1 >= display.len) { return ""; }
+    let end: i32 = colon + 1;
+    while (end < display.len && display[end] >= '0' && display[end] <= '9') { end = end + 1; }
+    if (end == colon + 1) { return ""; }
+    return display[colon + 1..end];
+}
+
+fn x11_connect_local() X11NativeConnection {
+    let result: X11NativeConnection = x11_empty_connection();
+    result.error = "X11 setup not attempted";
+    let display: []u8 = _zag_getenv("DISPLAY");
+    let number: []u8 = x11_display_number(display);
+    if (number.len == 0 || number.len > 10) {
+        result.error = "unsupported or missing DISPLAY"; return result;
+    }
+    let authority_path: []u8 = _zag_getenv("XAUTHORITY");
+    if (authority_path.len == 0) { result.error = "XAUTHORITY is not set"; return result; }
+    let auth: XAuthRecord = xauth_find(authority_path, number);
+    if (auth.valid == 0) { result.error = "MIT-MAGIC-COOKIE-1 record not found"; return result; }
+    let socket_prefix: []u8 = "/tmp/.X11-unix/X";
+    let socket_path: WireBuffer = wire_new(socket_prefix.len + number.len);
+    let path_i: i32 = 0;
+    while (path_i < socket_prefix.len) {
+        wire_push_u8(&socket_path, socket_prefix[path_i] as t27); path_i = path_i + 1;
+    }
+    let number_i: i32 = 0;
+    while (number_i < number.len) {
+        wire_push_u8(&socket_path, number[number_i] as t27); number_i = number_i + 1;
+    }
+    let transport: LinuxConnectResult = linux_unix_connect(
+        socket_path.bytes.data[0..len[u8](socket_path.bytes)]);
+    wire_free(&socket_path);
+    if (transport.connected == 0) { result.error = "X11 Unix socket connection failed"; return result; }
+    result.fd = transport.fd;
+    result.connected = 1;
+    let request: WireBuffer = x11_setup_request(auth.protocol_name, auth.data);
+    if (x11_native_send_request(&result, &request, 1) == 0) {
+        result.error = "X11 setup request write failed"; return result;
+    }
+    let setup_header: WireBuffer = linux_receive_exact(result.fd, 8, 2000);
+    if (setup_header.error != 0) {
+        wire_free(&setup_header);
+        x11_retire_connection(&result, "X11 setup header read failed");
+        return result;
+    }
+    let setup_tail_size: i32 = (wire_read_u16_le(&setup_header, 6) * 4) as i32;
+    let setup_tail: WireBuffer = linux_receive_exact(result.fd, setup_tail_size, 2000);
+    if (setup_tail.error != 0) {
+        wire_free(&setup_header); wire_free(&setup_tail);
+        x11_retire_connection(&result, "X11 setup payload read failed");
+        return result;
+    }
+    let reply: WireBuffer = wire_new(8 + setup_tail_size);
+    wire_append(&reply, &setup_header); wire_append(&reply, &setup_tail);
+    wire_free(&setup_header); wire_free(&setup_tail);
+    let setup: X11SetupSuccess = x11_decode_setup_success(&reply);
+    wire_free(&reply);
+    if (setup.valid == 0) {
+        x11_retire_connection(&result, "X11 server rejected setup"); return result;
+    }
+    result.setup = setup;
+    result.authenticated = 1;
+    result.net_wm_pid_atom = x11_intern_atom(&result, "_NET_WM_PID");
+    result.net_wm_name_atom = x11_intern_atom(&result, "_NET_WM_NAME");
+    result.utf8_string_atom = x11_intern_atom(&result, "UTF8_STRING");
+    result.wm_protocols_atom = x11_intern_atom(&result, "WM_PROTOCOLS");
+    result.wm_delete_window_atom = x11_intern_atom(&result, "WM_DELETE_WINDOW");
+    if (result.net_wm_pid_atom == 0 || result.wm_protocols_atom == 0 || result.wm_delete_window_atom == 0) {
+        result.error = "required X11 window-manager atoms unavailable";
+        x11_disconnect(&result);
+        return result;
+    }
+    if (x11_refresh_keyboard_state(&result, 2000) == 0) {
+        result.error = "X11 keyboard mapping unavailable";
+        x11_disconnect(&result);
+        return result;
+    }
+    result.error = "";
+    return result;
+}
+
+fn x11_allocate_resource(connection: *X11NativeConnection) t27 {
+    if (connection.*.authenticated == 0 || connection.*.next_resource_id > connection.*.setup.resource_id_mask) { return 0; }
+    let id: t27 = connection.*.setup.resource_id_base + connection.*.next_resource_id;
+    connection.*.next_resource_id = connection.*.next_resource_id + 1;
+    return id;
+}
+
+fn x11_open_window(connection: *X11NativeConnection, width: t27, height: t27) X11NativeWindow {
+    let window: X11NativeWindow = X11NativeWindow{ .window_id = 0, .gc_id = 0,
+        .width = width, .height = height, .live = 0, .mapped = 0 };
+    if (connection.*.authenticated == 0 || width < 1 || height < 1
+        || width > 65535 || height > 65535
+        || len[t27](connection.*.live_windows) as t27
+            >= x11_native_max_live_windows()) { return window; }
+    window.window_id = x11_allocate_resource(connection);
+    window.gc_id = x11_allocate_resource(connection);
+    if (window.window_id == 0 || window.gc_id == 0) { return window; }
+    let create: WireBuffer = x11_create_window_request(window.window_id, connection.*.setup.root_window,
+        width, height, connection.*.setup.white_pixel);
+    if (x11_native_send_request(connection, &create, 1) == 0) { return window; }
+    if (x11_connection_register_window(connection, window.window_id) == 0) {
+        x11_retire_connection(connection,
+            "X11 created window could not enter the live identity registry");
+        return window;
+    }
+    let create_gc: WireBuffer = x11_create_gc_request(window.gc_id, window.window_id);
+    if (x11_native_send_request(connection, &create_gc, 1) == 0) { return window; }
+    let map: WireBuffer = x11_map_window_request(window.window_id);
+    if (x11_native_send_request(connection, &map, 1) == 0) { return window; }
+    window.live = 1;
+    return window;
+}
+
+fn x11_empty_event() X11Event {
+    return X11Event{ .kind = X11EventKind.Unknown, .response_type = 0,
+        .send_event = 0, .sequence = 0,
+        .window = 0, .time = 0, .state = 0, .x = 0, .y = 0,
+        .width = 0, .height = 0, .detail = 0, .message_type = 0, .data0 = 0,
+        .owner = 0, .requestor = 0, .selection_atom = 0,
+        .target_atom = 0, .property_atom = 0, .selection_generation = 0,
+        .mapping_request = 0, .mapping_first_keycode = 0, .mapping_keycode_count = 0,
+        .valid = 0 };
+}
+
+fn x11_take_pending_event(connection: *X11NativeConnection) X11Event {
+    let bad: X11Event = x11_empty_event();
+    if (len[X11Event](connection.*.pending_events) == 0) { return bad; }
+    let ready: X11Event = get[X11Event](connection.*.pending_events, 0);
+    if (ready.kind == X11EventKind.SelectionClear) {
+        x11_clipboard_apply_selection_clear(connection, ready);
+    }
+    let move_i: i32 = 1;
+    while (move_i < len[X11Event](connection.*.pending_events)) {
+        set[X11Event](&connection.*.pending_events, move_i - 1,
+            get[X11Event](connection.*.pending_events, move_i));
+        move_i = move_i + 1;
+    }
+    connection.*.pending_events.len = connection.*.pending_events.len - 1;
+    return ready;
+}
+
+fn x11_take_window_ready_event(connection: *X11NativeConnection,
+    window_id: t27) i32 {
+    let found: i32 = -1;
+    let i: i32 = 0;
+    while (i < len[X11Event](connection.*.pending_events)) {
+        let event: X11Event = get[X11Event](connection.*.pending_events, i);
+        if (event.window == window_id
+            && (event.kind == X11EventKind.Mapped || event.kind == X11EventKind.Expose)) {
+            found = i; i = len[X11Event](connection.*.pending_events);
+        } else { i = i + 1; }
+    }
+    if (found < 0) { return 0; }
+    i = found + 1;
+    while (i < len[X11Event](connection.*.pending_events)) {
+        set[X11Event](&connection.*.pending_events, i - 1,
+            get[X11Event](connection.*.pending_events, i));
+        i = i + 1;
+    }
+    connection.*.pending_events.len = connection.*.pending_events.len - 1;
+    return 1;
+}
+
+// Read one exact server frame and queue it when it is a supported event. Return
+// one when an event was queued, two when an unsupported fixed event was safely
+// discarded, zero on an event-only timeout, and minus one after retirement.
+fn x11_queue_next_frame_event_until(connection: *X11NativeConnection,
+    deadline: i64) i32 {
+    let frame: X11NativeFrame = x11_native_receive_frame_until(connection, deadline, 0);
+    if (frame.valid == 0) {
+        x11_native_frame_free(&frame); return 0;
+    }
+    if (frame.is_reply != 0) {
+        x11_native_frame_free(&frame);
+        x11_retire_connection(connection,
+            "X11 received an unexpected reply while waiting for an event");
+        return -1;
+    }
+    let event: X11Event = x11_decode_event(&frame.input, 0);
+    x11_native_frame_free(&frame);
+    // Unsupported fixed-size core/extension events are safe to discard. A
+    // GenericEvent or malformed MappingNotify was already terminal above.
+    if (event.valid == 0) { return 2; }
+    if (x11_note_event(connection, event) == 0) { return -1; }
+    return 1;
+}
+
+fn x11_next_event(connection: *X11NativeConnection, timeout_ms: t27) X11Event {
+    let ready: X11Event = x11_take_pending_event(connection);
+    if (ready.valid != 0) { return ready; }
+    let bad: X11Event = x11_empty_event();
+    if (connection.*.authenticated == 0 || timeout_ms < 0) { return bad; }
+    let deadline: i64 = linux_monotonic_ms() + timeout_ms as i64;
+    while (connection.*.authenticated != 0) {
+        let status: i32 = x11_queue_next_frame_event_until(connection, deadline);
+        if (status < 1) { return bad; }
+        let queued: X11Event = x11_take_pending_event(connection);
+        if (queued.valid != 0) { return queued; }
+    }
+    return bad;
+}
+
+fn x11_clipboard_bad_read(status: X11ClipboardStatus) X11ClipboardReadResult {
+    return X11ClipboardReadResult{ .status = status,
+        .text = text_buffer_empty(), .valid = 0 };
+}
+
+fn x11_clipboard_remaining(deadline: i64) t27 {
+    let remaining: i64 = deadline - linux_monotonic_ms();
+    if (remaining < 0) { return 0 - 1; }
+    return remaining as t27;
+}
+
+fn x11_clipboard_connection_failure(
+    connection: *X11NativeConnection) X11ClipboardStatus {
+    if (connection.*.last_failure_timeout != 0) {
+        return X11ClipboardStatus.Timeout;
+    }
+    return X11ClipboardStatus.TransportFailed;
+}
+
+fn x11_clipboard_ensure_atoms_until(connection: *X11NativeConnection,
+    deadline: i64) X11ClipboardStatus {
+    if (connection.*.authenticated == 0) { return X11ClipboardStatus.TransportFailed; }
+    if (connection.*.primary_selection_atom != 1) {
+        return X11ClipboardStatus.AtomUnavailable;
+    }
+    if (connection.*.utf8_string_atom == 0) {
+        if (linux_monotonic_ms() > deadline) { return X11ClipboardStatus.Timeout; }
+        let utf8: X11AtomLookupResult = x11_intern_atom_result_until(
+            connection, "UTF8_STRING", deadline);
+        if (utf8.status != X11ClipboardStatus.Ok) { return utf8.status; }
+        connection.*.utf8_string_atom = utf8.atom;
+    }
+    if (connection.*.utf8_string_atom == 0) {
+        if (connection.*.authenticated == 0) {
+            return x11_clipboard_connection_failure(connection);
+        }
+        return X11ClipboardStatus.AtomUnavailable;
+    }
+    if (connection.*.clipboard_selection_atom == 0) {
+        if (linux_monotonic_ms() > deadline) { return X11ClipboardStatus.Timeout; }
+        let clipboard: X11AtomLookupResult = x11_intern_atom_result_until(
+            connection, "CLIPBOARD", deadline);
+        if (clipboard.status != X11ClipboardStatus.Ok) { return clipboard.status; }
+        connection.*.clipboard_selection_atom = clipboard.atom;
+    }
+    if (connection.*.clipboard_selection_atom == 0) {
+        if (connection.*.authenticated == 0) {
+            return x11_clipboard_connection_failure(connection);
+        }
+        return X11ClipboardStatus.AtomUnavailable;
+    }
+    if (connection.*.clipboard_property_atom == 0) {
+        if (linux_monotonic_ms() > deadline) { return X11ClipboardStatus.Timeout; }
+        let property: X11AtomLookupResult = x11_intern_atom_result_until(
+            connection, "_FLASHY_SELECTION", deadline);
+        if (property.status != X11ClipboardStatus.Ok) { return property.status; }
+        connection.*.clipboard_property_atom = property.atom;
+    }
+    if (connection.*.clipboard_property_atom == 0) {
+        if (connection.*.authenticated == 0) {
+            return x11_clipboard_connection_failure(connection);
+        }
+        return X11ClipboardStatus.AtomUnavailable;
+    }
+    return X11ClipboardStatus.Ok;
+}
+
+fn x11_clipboard_ensure_atoms(connection: *X11NativeConnection,
+    timeout_ms: t27) X11ClipboardStatus {
+    if (timeout_ms < 0) { return X11ClipboardStatus.InvalidArgument; }
+    return x11_clipboard_ensure_atoms_until(
+        connection, linux_monotonic_ms() + timeout_ms as i64);
+}
+
+fn x11_selection_atom(connection: *X11NativeConnection,
+    kind: X11SelectionKind) t27 {
+    if (kind == X11SelectionKind.Primary) { return connection.*.primary_selection_atom; }
+    return connection.*.clipboard_selection_atom;
+}
+
+fn x11_clipboard_request_within_setup(connection: *X11NativeConnection,
+    request: *WireBuffer) i32 {
+    if (request.*.error != 0 || connection.*.setup.maximum_request_length < 1) { return 0; }
+    let units: t27 = ((len[u8](request.*.bytes) as t27) + 3) / 4;
+    if (units > connection.*.setup.maximum_request_length) { return 0; }
+    return 1;
+}
+
+fn x11_clipboard_change_property_fits(connection: *X11NativeConnection,
+    byte_count: t27) i32 {
+    if (byte_count < 0 || byte_count > x11_selection_max_bytes()
+        || connection.*.setup.maximum_request_length < 1) { return 0; }
+    // ChangeProperty is a six-unit fixed request plus padded format-8 data.
+    let units: t27 = (24 + byte_count + 3) / 4;
+    if (units > connection.*.setup.maximum_request_length) { return 0; }
+    return 1;
+}
+
+fn x11_clipboard_send_owned_until(connection: *X11NativeConnection,
+    request: *WireBuffer, deadline: i64) X11ClipboardStatus {
+    if (request.*.error != 0) { wire_free(request); return X11ClipboardStatus.InvalidArgument; }
+    if (x11_clipboard_request_within_setup(connection, request) == 0) {
+        wire_free(request); return X11ClipboardStatus.TooLarge;
+    }
+    if (linux_monotonic_ms() > deadline) {
+        wire_free(request); return X11ClipboardStatus.Timeout;
+    }
+    let sent: X11NativeSendResult = x11_native_send_request_until(
+        connection, request, 1, deadline);
+    if (sent.complete == 0) {
+        if (sent.timed_out != 0) { return X11ClipboardStatus.Timeout; }
+        return x11_clipboard_connection_failure(connection);
+    }
+    return X11ClipboardStatus.Ok;
+}
+
+fn x11_clipboard_round_trip_until(connection: *X11NativeConnection,
+    selection_atom: t27, deadline: i64) X11ClipboardStatus {
+    let barrier: WireBuffer = x11_get_selection_owner_request(selection_atom);
+    let sent: X11ClipboardStatus = x11_clipboard_send_owned_until(
+        connection, &barrier, deadline);
+    if (sent != X11ClipboardStatus.Ok) { return sent; }
+    let expected_sequence: t27 = connection.*.last_sent_sequence;
+    let reply_wire: WireBuffer = x11_receive_bounded_reply_until(
+        connection, expected_sequence, deadline, 0);
+    if (reply_wire.error != 0) {
+        wire_free(&reply_wire);
+        return x11_clipboard_connection_failure(connection);
+    }
+    let reply: X11SelectionOwnerReply =
+        x11_decode_get_selection_owner_reply(&reply_wire);
+    wire_free(&reply_wire);
+    if (reply.valid == 0) {
+        x11_retire_connection(connection,
+            "X11 clipboard round-trip reply was malformed");
+        return X11ClipboardStatus.MalformedReply;
+    }
+    return X11ClipboardStatus.Ok;
+}
+
+fn x11_clipboard_next_generation(connection: *X11NativeConnection,
+    selection_atom: t27, current: t27) t27 {
+    let candidate: t27 = 1;
+    if (current < flashy_t27_max()) { candidate = current + 1; }
+    let attempts: i32 = 0;
+    while (attempts <= len[X11Event](connection.*.pending_events)) {
+        let collision: i32 = 0;
+        let i: i32 = 0;
+        while (i < len[X11Event](connection.*.pending_events)) {
+            let event: X11Event = get[X11Event](connection.*.pending_events, i);
+            if ((event.kind == X11EventKind.SelectionClear
+                || event.kind == X11EventKind.SelectionRequest)
+                && event.selection_atom == selection_atom
+                && event.selection_generation == candidate) {
+                collision = 1; i = len[X11Event](connection.*.pending_events);
+            } else { i = i + 1; }
+        }
+        if (collision == 0) { return candidate; }
+        if (candidate >= flashy_t27_max()) { candidate = 1; }
+        else { candidate = candidate + 1; }
+        attempts = attempts + 1;
+    }
+    return 0;
+}
+
+fn x11_clipboard_store_owned(connection: *X11NativeConnection,
+    selection_atom: t27, owner_window: t27, timestamp: t27, text: []u8) i32 {
+    let slot: *X11OwnedSelection = x11_owned_selection_slot(connection, selection_atom);
+    if (slot == null as *X11OwnedSelection) { return 0; }
+    // The caller may be replacing a selection from a view of this exact slot.
+    // Own the bytes before releasing the old allocation.
+    let next: TextBuffer = text_buffer_copy(text);
+    let generation: t27 = x11_clipboard_next_generation(
+        connection, selection_atom, slot.*.generation);
+    if (generation == 0) { text_buffer_free(&next); return 0; }
+    x11_owned_selection_free(slot);
+    slot.*.selection_atom = selection_atom; slot.*.owner_window = owner_window;
+    slot.*.timestamp = timestamp; slot.*.text = next;
+    slot.*.generation = generation; slot.*.valid = 1;
+    return 1;
+}
+
+fn x11_clipboard_copy(connection: *X11NativeConnection, owner_window: t27,
+    kind: X11SelectionKind, text: []u8, timestamp: t27,
+    timeout_ms: t27) X11ClipboardStatus {
+    if (connection.*.authenticated == 0) { return X11ClipboardStatus.TransportFailed; }
+    connection.*.last_failure_timeout = 0;
+    if (x11_connection_window_live(connection, owner_window) == 0 || timestamp < 0
+        || timestamp > 4294967295 || timeout_ms < 0) {
+        return X11ClipboardStatus.InvalidArgument;
+    }
+    if (text.len as t27 > x11_selection_max_bytes()) { return X11ClipboardStatus.TooLarge; }
+    if (utf8_validate(text).valid == 0) { return X11ClipboardStatus.InvalidUtf8; }
+    // The caller may supply a view of a currently owned slot. Snapshot before
+    // any request/reply path can queue ownership transitions or retire state.
+    let snapshot: TextBuffer = text_buffer_copy(text);
+    let stable_text: []u8 = text_buffer_view(&snapshot);
+    // Serving this selection eventually requires one core ChangeProperty.
+    // Reject before atom lookup or SetSelectionOwner so no request is emitted
+    // and the previous local authority remains byte-for-byte intact.
+    if (x11_clipboard_change_property_fits(
+        connection, stable_text.len as t27) == 0) {
+        text_buffer_free(&snapshot);
+        return X11ClipboardStatus.TooLarge;
+    }
+    let deadline: i64 = linux_monotonic_ms() + timeout_ms as i64;
+    let atoms: X11ClipboardStatus = x11_clipboard_ensure_atoms_until(connection, deadline);
+    if (atoms != X11ClipboardStatus.Ok) {
+        text_buffer_free(&snapshot); return atoms;
+    }
+    let selection_atom: t27 = x11_selection_atom(connection, kind);
+    if (selection_atom == 0) {
+        text_buffer_free(&snapshot); return X11ClipboardStatus.AtomUnavailable;
+    }
+    let prior: *X11OwnedSelection = x11_owned_selection_slot(
+        connection, selection_atom);
+    if (prior != null as *X11OwnedSelection && prior.*.valid != 0
+        && prior.*.owner_window == owner_window
+        && timestamp != 0 && timestamp != prior.*.timestamp) {
+        // GetSelectionOwner cannot distinguish an accepted same-owner change
+        // from a future/ignored timestamp. CurrentTime, or the exact timestamp
+        // already proven by the previous acquisition, is the bounded contract.
+        text_buffer_free(&snapshot);
+        return X11ClipboardStatus.OwnershipRejected;
+    }
+    if (prior != null as *X11OwnedSelection && prior.*.valid != 0
+        && prior.*.owner_window == owner_window) {
+        // Content replacement does not need a second SetSelectionOwner. Fence
+        // that the server still names this owner, then publish new bytes while
+        // retaining the original proven acquisition timestamp.
+        let verify_existing: WireBuffer = x11_get_selection_owner_request(
+            selection_atom);
+        let verify_existing_status: X11ClipboardStatus =
+            x11_clipboard_send_owned_until(connection, &verify_existing, deadline);
+        if (verify_existing_status != X11ClipboardStatus.Ok) {
+            text_buffer_free(&snapshot); return verify_existing_status;
+        }
+        let verify_existing_sequence: t27 = connection.*.last_sent_sequence;
+        let verify_existing_wire: WireBuffer = x11_receive_bounded_reply_until(
+            connection, verify_existing_sequence, deadline, 0);
+        if (verify_existing_wire.error != 0) {
+            wire_free(&verify_existing_wire);
+            let failed: X11ClipboardStatus = x11_clipboard_connection_failure(connection);
+            text_buffer_free(&snapshot); return failed;
+        }
+        let verify_existing_reply: X11SelectionOwnerReply =
+            x11_decode_get_selection_owner_reply(&verify_existing_wire);
+        wire_free(&verify_existing_wire);
+        if (verify_existing_reply.valid == 0) {
+            x11_retire_connection(connection,
+                "X11 existing selection-owner verification reply was malformed");
+            text_buffer_free(&snapshot);
+            return X11ClipboardStatus.MalformedReply;
+        }
+        if (verify_existing_reply.owner != owner_window) {
+            x11_owned_selection_free(prior);
+            text_buffer_free(&snapshot);
+            return X11ClipboardStatus.OwnershipRejected;
+        }
+        let retained_timestamp: t27 = prior.*.timestamp;
+        let replaced: i32 = x11_clipboard_store_owned(connection,
+            selection_atom, owner_window, retained_timestamp, stable_text);
+        text_buffer_free(&snapshot);
+        if (replaced == 0) { return X11ClipboardStatus.AtomUnavailable; }
+        return X11ClipboardStatus.Ok;
+    }
+    let set_owner: WireBuffer = x11_set_selection_owner_request(
+        owner_window, selection_atom, timestamp);
+    let set_status: X11ClipboardStatus = x11_clipboard_send_owned_until(
+        connection, &set_owner, deadline);
+    if (set_status != X11ClipboardStatus.Ok) {
+        text_buffer_free(&snapshot); return set_status;
+    }
+    let get_owner: WireBuffer = x11_get_selection_owner_request(selection_atom);
+    let get_status: X11ClipboardStatus = x11_clipboard_send_owned_until(
+        connection, &get_owner, deadline);
+    if (get_status != X11ClipboardStatus.Ok) {
+        text_buffer_free(&snapshot); return get_status;
+    }
+    let expected_sequence: t27 = connection.*.last_sent_sequence;
+    let reply_wire: WireBuffer = x11_receive_bounded_reply_until(
+        connection, expected_sequence, deadline, 0);
+    if (reply_wire.error != 0) {
+        wire_free(&reply_wire);
+        let failed: X11ClipboardStatus = x11_clipboard_connection_failure(connection);
+        text_buffer_free(&snapshot);
+        return failed;
+    }
+    let reply: X11SelectionOwnerReply = x11_decode_get_selection_owner_reply(&reply_wire);
+    wire_free(&reply_wire);
+    if (reply.valid == 0) {
+        x11_retire_connection(connection,
+            "X11 selection-owner verification reply was malformed");
+        text_buffer_free(&snapshot);
+        return X11ClipboardStatus.MalformedReply;
+    }
+    if (reply.owner != owner_window) {
+        let slot: *X11OwnedSelection = x11_owned_selection_slot(connection, selection_atom);
+        // An ignored timestamp can leave the previous local owner unchanged.
+        // Preserve its bytes in that case; None or a foreign owner is an
+        // authoritative loss and must revoke the old slot.
+        if (slot != null as *X11OwnedSelection && slot.*.valid != 0
+            && reply.owner != slot.*.owner_window) {
+            x11_owned_selection_free(slot);
+        }
+        text_buffer_free(&snapshot);
+        return X11ClipboardStatus.OwnershipRejected;
+    }
+    let stored: i32 = x11_clipboard_store_owned(
+        connection, selection_atom, owner_window, timestamp, stable_text);
+    text_buffer_free(&snapshot);
+    if (stored == 0) {
+        return X11ClipboardStatus.AtomUnavailable;
+    }
+    return X11ClipboardStatus.Ok;
+}
+
+fn x11_clipboard_abort_server_grab(connection: *X11NativeConnection,
+    status: X11ClipboardStatus, reason: []u8) X11ClipboardStatus {
+    if (connection.*.authenticated != 0) {
+        if (status == X11ClipboardStatus.Timeout) {
+            x11_retire_connection_timeout(connection, reason);
+        } else { x11_retire_connection(connection, reason); }
+    }
+    return status;
+}
+
+fn x11_clipboard_release(connection: *X11NativeConnection,
+    kind: X11SelectionKind, timestamp: t27, timeout_ms: t27) X11ClipboardStatus {
+    if (connection.*.authenticated == 0) { return X11ClipboardStatus.TransportFailed; }
+    connection.*.last_failure_timeout = 0;
+    if (timestamp < 0 || timestamp > 4294967295 || timeout_ms < 0) {
+        return X11ClipboardStatus.InvalidArgument;
+    }
+    let deadline: i64 = linux_monotonic_ms() + timeout_ms as i64;
+    let atoms: X11ClipboardStatus = x11_clipboard_ensure_atoms_until(connection, deadline);
+    if (atoms != X11ClipboardStatus.Ok) { return atoms; }
+    let selection_atom: t27 = x11_selection_atom(connection, kind);
+    let slot: *X11OwnedSelection = x11_owned_selection_slot(
+        connection, selection_atom);
+    if (slot == null as *X11OwnedSelection || slot.*.valid == 0
+        || x11_connection_window_live(connection, slot.*.owner_window) == 0) {
+        return X11ClipboardStatus.NotOwner;
+    }
+    // ICCCM discourages CurrentTime because its resolved acquisition time is
+    // unknowable to the client. Bracket preflight, clear, and verification in
+    // one bounded server grab so CurrentTime and equal-timestamp races cannot
+    // clear a foreign selection. Any failure retires the connection, and the X
+    // server releases a grab when that client disconnects.
+    let grab_deadline: i64 = deadline;
+    let bounded_grab_deadline: i64 = linux_monotonic_ms() + 250;
+    if (grab_deadline > bounded_grab_deadline) {
+        grab_deadline = bounded_grab_deadline;
+    }
+    let grab: WireBuffer = x11_grab_server_request();
+    let grab_status: X11ClipboardStatus = x11_clipboard_send_owned_until(
+        connection, &grab, grab_deadline);
+    if (grab_status != X11ClipboardStatus.Ok) { return grab_status; }
+    let preflight: WireBuffer = x11_get_selection_owner_request(selection_atom);
+    let preflight_status: X11ClipboardStatus = x11_clipboard_send_owned_until(
+        connection, &preflight, grab_deadline);
+    if (preflight_status != X11ClipboardStatus.Ok) {
+        return x11_clipboard_abort_server_grab(connection, preflight_status,
+            "X11 release preflight failed while server was grabbed");
+    }
+    let preflight_sequence: t27 = connection.*.last_sent_sequence;
+    let preflight_wire: WireBuffer = x11_receive_bounded_reply_until(
+        connection, preflight_sequence, grab_deadline, 0);
+    if (preflight_wire.error != 0) {
+        wire_free(&preflight_wire);
+        let failed: X11ClipboardStatus = x11_clipboard_connection_failure(connection);
+        return x11_clipboard_abort_server_grab(connection, failed,
+            "X11 release preflight reply failed while server was grabbed");
+    }
+    let preflight_reply: X11SelectionOwnerReply =
+        x11_decode_get_selection_owner_reply(&preflight_wire);
+    wire_free(&preflight_wire);
+    if (preflight_reply.valid == 0) {
+        x11_retire_connection(connection,
+            "X11 pre-release selection-owner reply was malformed");
+        return X11ClipboardStatus.MalformedReply;
+    }
+    if (preflight_reply.owner != slot.*.owner_window) {
+        x11_owned_selection_free(slot);
+        let ungrab_foreign: WireBuffer = x11_ungrab_server_request();
+        let ungrab_foreign_status: X11ClipboardStatus =
+            x11_clipboard_send_owned_until(
+                connection, &ungrab_foreign, grab_deadline);
+        if (ungrab_foreign_status != X11ClipboardStatus.Ok) {
+            return x11_clipboard_abort_server_grab(connection,
+                ungrab_foreign_status,
+                "X11 foreign-owner ungrab failed");
+        }
+        let ungrab_foreign_barrier: X11ClipboardStatus =
+            x11_clipboard_round_trip_until(
+                connection, selection_atom, grab_deadline);
+        if (ungrab_foreign_barrier != X11ClipboardStatus.Ok) {
+            return x11_clipboard_abort_server_grab(connection,
+                ungrab_foreign_barrier,
+                "X11 foreign-owner ungrab confirmation failed");
+        }
+        return X11ClipboardStatus.NotOwner;
+    }
+    let request: WireBuffer = x11_set_selection_owner_request(
+        0, selection_atom, timestamp);
+    let status: X11ClipboardStatus = x11_clipboard_send_owned_until(
+        connection, &request, grab_deadline);
+    if (status != X11ClipboardStatus.Ok) {
+        return x11_clipboard_abort_server_grab(connection, status,
+            "X11 release clear failed while server was grabbed");
+    }
+    let verify: WireBuffer = x11_get_selection_owner_request(selection_atom);
+    let verify_status: X11ClipboardStatus = x11_clipboard_send_owned_until(
+        connection, &verify, grab_deadline);
+    if (verify_status != X11ClipboardStatus.Ok) {
+        return x11_clipboard_abort_server_grab(connection, verify_status,
+            "X11 release verification send failed while server was grabbed");
+    }
+    let expected_sequence: t27 = connection.*.last_sent_sequence;
+    let reply_wire: WireBuffer = x11_receive_bounded_reply_until(
+        connection, expected_sequence, grab_deadline, 0);
+    if (reply_wire.error != 0) {
+        wire_free(&reply_wire);
+        let failed: X11ClipboardStatus = x11_clipboard_connection_failure(connection);
+        return x11_clipboard_abort_server_grab(connection, failed,
+            "X11 release verification reply failed while server was grabbed");
+    }
+    let reply: X11SelectionOwnerReply = x11_decode_get_selection_owner_reply(&reply_wire);
+    wire_free(&reply_wire);
+    if (reply.valid == 0) {
+        x11_retire_connection(connection,
+            "X11 selection release verification reply was malformed");
+        return X11ClipboardStatus.MalformedReply;
+    }
+    let result: X11ClipboardStatus = X11ClipboardStatus.Ok;
+    if (reply.owner != 0) {
+        // The same owner means the server ignored an earlier release timestamp;
+        // retain its bytes. A foreign owner is authoritative loss.
+        if (reply.owner != slot.*.owner_window) { x11_owned_selection_free(slot); }
+        result = X11ClipboardStatus.OwnershipRejected;
+    } else {
+        x11_owned_selection_free(slot);
+    }
+    let ungrab: WireBuffer = x11_ungrab_server_request();
+    let ungrab_status: X11ClipboardStatus = x11_clipboard_send_owned_until(
+        connection, &ungrab, grab_deadline);
+    if (ungrab_status != X11ClipboardStatus.Ok) {
+        return x11_clipboard_abort_server_grab(connection, ungrab_status,
+            "X11 release ungrab failed");
+    }
+    let ungrab_barrier: X11ClipboardStatus = x11_clipboard_round_trip_until(
+        connection, selection_atom, grab_deadline);
+    if (ungrab_barrier != X11ClipboardStatus.Ok) {
+        return x11_clipboard_abort_server_grab(connection, ungrab_barrier,
+            "X11 release ungrab confirmation failed");
+    }
+    return result;
+}
+
+fn x11_clipboard_notify_failure(connection: *X11NativeConnection,
+    event: X11Event, status: X11ClipboardStatus,
+    deadline: i64) X11ClipboardStatus {
+    let notify: WireBuffer = x11_send_selection_notify_request(event.requestor,
+        event.selection_atom, event.target_atom, 0, event.time);
+    let sent: X11ClipboardStatus = x11_clipboard_send_owned_until(
+        connection, &notify, deadline);
+    if (sent != X11ClipboardStatus.Ok) { return sent; }
+    let barrier: X11ClipboardStatus = x11_clipboard_round_trip_until(
+        connection, event.selection_atom, deadline);
+    if (barrier != X11ClipboardStatus.Ok) { return barrier; }
+    return status;
+}
+
+fn x11_clipboard_notify_success_until(connection: *X11NativeConnection,
+    event: X11Event, response_property: t27,
+    deadline: i64) X11ClipboardStatus {
+    let notify: WireBuffer = x11_send_selection_notify_request(event.requestor,
+        event.selection_atom, event.target_atom, response_property, event.time);
+    let notified: X11ClipboardStatus = x11_clipboard_send_owned_until(
+        connection, &notify, deadline);
+    if (notified != X11ClipboardStatus.Ok) { return notified; }
+    return x11_clipboard_round_trip_until(
+        connection, event.selection_atom, deadline);
+}
+
+fn x11_time_precedes(candidate: t27, reference: t27) i32 {
+    // CurrentTime is resolved inside the X server. A zero acquisition or
+    // request time therefore carries no comparable local timestamp and is an
+    // explicit fail-open boundary; server selection authority remains final.
+    if (candidate == 0 || reference == 0) { return 0; }
+    let delta: t27 = candidate - reference;
+    if (delta < 0) { delta = delta + 4294967296; }
+    if (delta >= 2147483648) { return 1; }
+    return 0;
+}
+
+fn x11_clipboard_respond_inner(connection: *X11NativeConnection,
+    event: X11Event, timeout_ms: t27) X11ClipboardStatus {
+    if (event.valid == 0 || event.kind != X11EventKind.SelectionRequest
+        || event.send_event != 0 || event.window != event.owner
+        || x11_wire_id_valid(event.owner) == 0
+        || x11_wire_id_valid(event.requestor) == 0
+        || x11_wire_id_valid(event.selection_atom) == 0
+        || x11_wire_id_valid(event.target_atom) == 0
+        || (event.property_atom != 0
+            && x11_wire_id_valid(event.property_atom) == 0)
+        || event.time < 0 || event.time > 4294967295
+        || event.sequence < 0 || event.sequence > 65535
+        || timeout_ms < 0) { return X11ClipboardStatus.InvalidArgument; }
+    connection.*.last_failure_timeout = 0;
+    let deadline: i64 = linux_monotonic_ms() + timeout_ms as i64;
+    if (x11_connection_window_live(connection, event.owner) == 0) {
+        // Window registry loss is stronger than a timestamped SelectionClear:
+        // this process can no longer service the exact local owner identity.
+        let missing_slot: *X11OwnedSelection = x11_owned_selection_slot(
+            connection, event.selection_atom);
+        if (missing_slot != null as *X11OwnedSelection
+            && missing_slot.*.valid != 0
+            && missing_slot.*.owner_window == event.owner) {
+            x11_owned_selection_free(missing_slot);
+        }
+        let missing_atoms: X11ClipboardStatus = x11_clipboard_ensure_atoms_until(
+            connection, deadline);
+        if (missing_atoms != X11ClipboardStatus.Ok) { return missing_atoms; }
+        return x11_clipboard_notify_failure(
+            connection, event, X11ClipboardStatus.NotOwner, deadline);
+    }
+    let atoms: X11ClipboardStatus = x11_clipboard_ensure_atoms_until(connection, deadline);
+    if (atoms != X11ClipboardStatus.Ok) { return atoms; }
+    let slot: *X11OwnedSelection = x11_owned_selection_slot(
+        connection, event.selection_atom);
+    if (slot == null as *X11OwnedSelection || slot.*.valid == 0
+        || slot.*.owner_window != event.owner) {
+        return x11_clipboard_notify_failure(
+            connection, event, X11ClipboardStatus.NotOwner, deadline);
+    }
+    if (event.selection_generation == 0
+        || event.selection_generation != slot.*.generation) {
+        return x11_clipboard_notify_failure(
+            connection, event, X11ClipboardStatus.OwnershipRejected, deadline);
+    }
+    if (x11_time_precedes(event.time, slot.*.timestamp) != 0) {
+        return x11_clipboard_notify_failure(
+            connection, event, X11ClipboardStatus.OwnershipRejected, deadline);
+    }
+    if (event.target_atom != connection.*.utf8_string_atom) {
+        return x11_clipboard_notify_failure(
+            connection, event, X11ClipboardStatus.UnsupportedTarget, deadline);
+    }
+    // ICCCM compatibility for obsolete requestors: property=None asks the
+    // owner to use the target atom as the response property.
+    let response_property: t27 = event.property_atom;
+    if (response_property == 0) { response_property = event.target_atom; }
+    let change: WireBuffer = x11_change_property8_request(event.requestor,
+        response_property, connection.*.utf8_string_atom,
+        text_buffer_view(&slot.*.text));
+    let changed: X11ClipboardStatus = x11_clipboard_send_owned_until(
+        connection, &change, deadline);
+    if (changed != X11ClipboardStatus.Ok) {
+        if (changed == X11ClipboardStatus.TransportFailed
+            || changed == X11ClipboardStatus.Timeout) { return changed; }
+        return x11_clipboard_notify_failure(connection, event, changed, deadline);
+    }
+    let change_barrier: X11ClipboardStatus = x11_clipboard_round_trip_until(
+        connection, event.selection_atom, deadline);
+    if (change_barrier != X11ClipboardStatus.Ok) { return change_barrier; }
+    return x11_clipboard_notify_success_until(
+        connection, event, response_property, deadline);
+}
+
+fn x11_clipboard_finish_response(connection: *X11NativeConnection,
+    status: X11ClipboardStatus) X11ClipboardStatus {
+    // A valid SelectionRequest is consumed before this function is entered.
+    // Once its completion deadline is missed, keeping the stream live would
+    // let App report the event handled even though the requestor received no
+    // authoritative SelectionNotify (and may have observed only a property
+    // mutation). Retire on every timeout, including pre-send deadline checks
+    // that have not already retired the exact-reply stream.
+    if (status == X11ClipboardStatus.Timeout
+        && connection.*.authenticated != 0) {
+        x11_retire_connection_timeout(connection,
+            "X11 SelectionRequest response exceeded its caller deadline");
+    }
+    return status;
+}
+
+fn x11_clipboard_respond(connection: *X11NativeConnection,
+    event: X11Event, timeout_ms: t27) X11ClipboardStatus {
+    return x11_clipboard_finish_response(connection,
+        x11_clipboard_respond_inner(connection, event, timeout_ms));
+}
+
+fn x11_remove_pending_event_at(connection: *X11NativeConnection,
+    index: i32) X11Event {
+    let bad: X11Event = x11_empty_event();
+    if (index < 0 || index >= len[X11Event](connection.*.pending_events)) {
+        return bad;
+    }
+    let removed: X11Event = get[X11Event](connection.*.pending_events, index);
+    let i: i32 = index + 1;
+    while (i < len[X11Event](connection.*.pending_events)) {
+        set[X11Event](&connection.*.pending_events, i - 1,
+            get[X11Event](connection.*.pending_events, i));
+        i = i + 1;
+    }
+    connection.*.pending_events.len = connection.*.pending_events.len - 1;
+    return removed;
+}
+
+fn x11_selection_notify_matches(event: X11Event,
+    requestor: t27, selection: t27, target: t27, property: t27,
+    timestamp: t27) i32 {
+    if (event.kind == X11EventKind.SelectionNotify
+        && event.requestor == requestor && event.selection_atom == selection
+        && event.target_atom == target && event.time == timestamp
+        && (event.property_atom == property || event.property_atom == 0)) {
+        return 1;
+    }
+    return 0;
+}
+
+fn x11_drop_selection_notifies(connection: *X11NativeConnection,
+    requestor: t27, selection: t27, target: t27, property: t27,
+    timestamp: t27) void {
+    let i: i32 = 0;
+    while (i < len[X11Event](connection.*.pending_events)) {
+        let event: X11Event = get[X11Event](connection.*.pending_events, i);
+        if (x11_selection_notify_matches(event, requestor, selection,
+            target, property, timestamp) != 0) {
+            let _stale: X11Event = x11_remove_pending_event_at(connection, i);
+        } else { i = i + 1; }
+    }
+}
+
+fn x11_take_selection_notify(connection: *X11NativeConnection,
+    requestor: t27, selection: t27, target: t27, property: t27,
+    timestamp: t27, expected_sequence: t27) X11Event {
+    let bad: X11Event = x11_empty_event();
+    let i: i32 = 0;
+    while (i < len[X11Event](connection.*.pending_events)) {
+        let event: X11Event = get[X11Event](connection.*.pending_events, i);
+        if (x11_selection_notify_matches(event, requestor, selection,
+            target, property, timestamp) != 0) {
+            let removed: X11Event = x11_remove_pending_event_at(connection, i);
+            // Same-identity notifications with another sequence predate or do
+            // not causally follow this ConvertSelection. Drop only those stale
+            // candidates; unrelated FIFO entries remain in exact order.
+            if (removed.sequence == expected_sequence) { return removed; }
+        } else { i = i + 1; }
+    }
+    return bad;
+}
+
+fn x11_wait_selection_notify_until(connection: *X11NativeConnection,
+    requestor: t27, selection: t27, target: t27, property: t27,
+    timestamp: t27, expected_sequence: t27, deadline: i64) X11Event {
+    let ready: X11Event = x11_take_selection_notify(
+        connection, requestor, selection, target, property,
+        timestamp, expected_sequence);
+    if (ready.valid != 0) { return ready; }
+    let bad: X11Event = x11_empty_event();
+    while (connection.*.authenticated != 0) {
+        let status: i32 = x11_queue_next_frame_event_until(connection, deadline);
+        if (status < 1) { return bad; }
+        let queued: X11Event = x11_take_selection_notify(
+            connection, requestor, selection, target, property,
+            timestamp, expected_sequence);
+        if (queued.valid != 0) { return queued; }
+    }
+    return bad;
+}
+
+fn x11_clipboard_cleanup_property_until(connection: *X11NativeConnection,
+    requestor: t27, property: t27, selection: t27,
+    deadline: i64) X11ClipboardStatus {
+    let request: WireBuffer = x11_delete_property_request(requestor, property);
+    let deleted: X11ClipboardStatus = x11_clipboard_send_owned_until(
+        connection, &request, deadline);
+    if (deleted != X11ClipboardStatus.Ok) { return deleted; }
+    return x11_clipboard_round_trip_until(connection, selection, deadline);
+}
+
+fn x11_clipboard_read(connection: *X11NativeConnection, requestor: t27,
+    kind: X11SelectionKind, timestamp: t27, timeout_ms: t27,
+    maximum_bytes: t27) X11ClipboardReadResult {
+    if (connection.*.authenticated == 0) {
+        return x11_clipboard_bad_read(X11ClipboardStatus.TransportFailed);
+    }
+    connection.*.last_failure_timeout = 0;
+    if (x11_connection_window_live(connection, requestor) == 0 || timestamp < 0
+        || timestamp > 4294967295 || timeout_ms < 0
+        || maximum_bytes < 1 || maximum_bytes > x11_selection_max_bytes()) {
+        return x11_clipboard_bad_read(X11ClipboardStatus.InvalidArgument);
+    }
+    let deadline: i64 = linux_monotonic_ms() + timeout_ms as i64;
+    let atoms: X11ClipboardStatus = x11_clipboard_ensure_atoms_until(connection, deadline);
+    if (atoms != X11ClipboardStatus.Ok) { return x11_clipboard_bad_read(atoms); }
+    let selection: t27 = x11_selection_atom(connection, kind);
+    let target: t27 = connection.*.utf8_string_atom;
+    let property: t27 = connection.*.clipboard_property_atom;
+
+    // Fence all server events preceding this read. The shared reply waiter
+    // queues and generation-tags them in wire order; public dequeue applies a
+    // tagged SelectionClear. This closes the 16-bit sequence-wrap hole before
+    // stale notifies are purged and a new conversion begins.
+    let barrier: WireBuffer = x11_get_selection_owner_request(selection);
+    let barrier_status: X11ClipboardStatus = x11_clipboard_send_owned_until(
+        connection, &barrier, deadline);
+    if (barrier_status != X11ClipboardStatus.Ok) {
+        return x11_clipboard_bad_read(barrier_status);
+    }
+    let barrier_sequence: t27 = connection.*.last_sent_sequence;
+    let barrier_wire: WireBuffer = x11_receive_bounded_reply_until(
+        connection, barrier_sequence, deadline, 0);
+    if (barrier_wire.error != 0) {
+        wire_free(&barrier_wire);
+        return x11_clipboard_bad_read(
+            x11_clipboard_connection_failure(connection));
+    }
+    let owner_reply: X11SelectionOwnerReply =
+        x11_decode_get_selection_owner_reply(&barrier_wire);
+    wire_free(&barrier_wire);
+    if (owner_reply.valid == 0) {
+        x11_retire_connection(connection,
+            "X11 clipboard owner barrier reply was malformed");
+        return x11_clipboard_bad_read(X11ClipboardStatus.MalformedReply);
+    }
+    if (owner_reply.owner == 0) {
+        return x11_clipboard_bad_read(X11ClipboardStatus.NoSelection);
+    }
+    let local: *X11OwnedSelection = x11_owned_selection_slot(
+        connection, selection);
+    if (local != null as *X11OwnedSelection && local.*.valid != 0
+        && local.*.owner_window == owner_reply.owner) {
+        // Bypassing ConvertSelection is safe only for CurrentTime or the exact
+        // nonzero timestamp previously proven by SetSelectionOwner verification.
+        if (timestamp != 0 && timestamp != local.*.timestamp) {
+            return x11_clipboard_bad_read(X11ClipboardStatus.ConversionRejected);
+        }
+        let local_value: []u8 = text_buffer_view(&local.*.text);
+        if (local_value.len as t27 > maximum_bytes) {
+            return x11_clipboard_bad_read(X11ClipboardStatus.TooLarge);
+        }
+        return X11ClipboardReadResult{ .status = X11ClipboardStatus.Ok,
+            .text = text_buffer_copy(local_value), .valid = 1 };
+    }
+    x11_drop_selection_notifies(connection, requestor, selection,
+        target, property, timestamp);
+    let clear: WireBuffer = x11_delete_property_request(requestor, property);
+    let clear_status: X11ClipboardStatus = x11_clipboard_send_owned_until(
+        connection, &clear, deadline);
+    if (clear_status != X11ClipboardStatus.Ok) { return x11_clipboard_bad_read(clear_status); }
+    let convert: WireBuffer = x11_convert_selection_request(
+        requestor, selection, target, property, timestamp);
+    let convert_status: X11ClipboardStatus = x11_clipboard_send_owned_until(
+        connection, &convert, deadline);
+    if (convert_status != X11ClipboardStatus.Ok) {
+        return x11_clipboard_bad_read(convert_status);
+    }
+    let convert_sequence: t27 = connection.*.last_sent_sequence;
+    let notify: X11Event = x11_wait_selection_notify_until(connection,
+        requestor, selection, target, property, timestamp,
+        convert_sequence, deadline);
+    if (notify.valid == 0) {
+        if (connection.*.authenticated != 0) {
+            x11_retire_connection_timeout(connection,
+                "X11 selection conversion timed out after ConvertSelection");
+            return x11_clipboard_bad_read(X11ClipboardStatus.Timeout);
+        }
+        return x11_clipboard_bad_read(
+            x11_clipboard_connection_failure(connection));
+    }
+    if (notify.property_atom == 0) {
+        return x11_clipboard_bad_read(X11ClipboardStatus.ConversionRejected);
+    }
+    let long_length: t27 = (maximum_bytes + 3) / 4;
+    let get_property: WireBuffer = x11_get_property_range_request(
+        requestor, property, target, 0, long_length, 1);
+    let get_status: X11ClipboardStatus = x11_clipboard_send_owned_until(
+        connection, &get_property, deadline);
+    if (get_status != X11ClipboardStatus.Ok) {
+        return x11_clipboard_bad_read(get_status);
+    }
+    let expected_sequence: t27 = connection.*.last_sent_sequence;
+    let reply_wire: WireBuffer = x11_receive_bounded_reply_until(
+        connection, expected_sequence, deadline, long_length);
+    if (reply_wire.error != 0) {
+        wire_free(&reply_wire);
+        return x11_clipboard_bad_read(
+            x11_clipboard_connection_failure(connection));
+    }
+    let reply: X11GetPropertyReply = x11_decode_get_property_reply(&reply_wire);
+    if (reply.valid == 0) {
+        wire_free(&reply_wire);
+        let cleanup: X11ClipboardStatus = x11_clipboard_cleanup_property_until(
+            connection, requestor, property, selection, deadline);
+        if (cleanup != X11ClipboardStatus.Ok) { return x11_clipboard_bad_read(cleanup); }
+        return x11_clipboard_bad_read(X11ClipboardStatus.MalformedReply);
+    }
+    if (reply.property_type == 0) {
+        wire_free(&reply_wire);
+        return x11_clipboard_bad_read(X11ClipboardStatus.PropertyMissing);
+    }
+    if (reply.property_type != target) {
+        wire_free(&reply_wire);
+        let cleanup: X11ClipboardStatus = x11_clipboard_cleanup_property_until(
+            connection, requestor, property, selection, deadline);
+        if (cleanup != X11ClipboardStatus.Ok) { return x11_clipboard_bad_read(cleanup); }
+        return x11_clipboard_bad_read(X11ClipboardStatus.PropertyTypeMismatch);
+    }
+    if (reply.format != 8) {
+        wire_free(&reply_wire);
+        let cleanup: X11ClipboardStatus = x11_clipboard_cleanup_property_until(
+            connection, requestor, property, selection, deadline);
+        if (cleanup != X11ClipboardStatus.Ok) { return x11_clipboard_bad_read(cleanup); }
+        return x11_clipboard_bad_read(X11ClipboardStatus.PropertyFormatMismatch);
+    }
+    if (reply.bytes_after != 0) {
+        wire_free(&reply_wire);
+        let cleanup: X11ClipboardStatus = x11_clipboard_cleanup_property_until(
+            connection, requestor, property, selection, deadline);
+        if (cleanup != X11ClipboardStatus.Ok) { return x11_clipboard_bad_read(cleanup); }
+        return x11_clipboard_bad_read(X11ClipboardStatus.PropertyTruncated);
+    }
+    if (reply.value_bytes as t27 > maximum_bytes) {
+        wire_free(&reply_wire);
+        let cleanup: X11ClipboardStatus = x11_clipboard_cleanup_property_until(
+            connection, requestor, property, selection, deadline);
+        if (cleanup != X11ClipboardStatus.Ok) { return x11_clipboard_bad_read(cleanup); }
+        return x11_clipboard_bad_read(X11ClipboardStatus.TooLarge);
+    }
+    let value: []u8 = reply_wire.bytes.data[
+        reply.value_offset..reply.value_offset + reply.value_bytes];
+    if (utf8_validate(value).valid == 0) {
+        wire_free(&reply_wire);
+        return x11_clipboard_bad_read(X11ClipboardStatus.InvalidUtf8);
+    }
+    let result: X11ClipboardReadResult = X11ClipboardReadResult{
+        .status = X11ClipboardStatus.Ok, .text = text_buffer_copy(value), .valid = 1 };
+    wire_free(&reply_wire); return result;
+}
+
+fn x11_set_window_metadata(connection: *X11NativeConnection, window: *X11NativeWindow, title: []u8) i32 {
+    if (connection.*.authenticated == 0 || window.*.live == 0 || title.len < 1) { return 0; }
+    let name_request: WireBuffer = x11_change_property8_request(window.*.window_id, 39, 31, title); // WM_NAME, STRING
+    if (x11_native_send_request(connection, &name_request, 1) == 0) { return 0; }
+    let class_data: []u8 = "flashy\0Flashy\0";
+    let class_request: WireBuffer = x11_change_property8_request(window.*.window_id, 67, 31, class_data); // WM_CLASS
+    if (x11_native_send_request(connection, &class_request, 1) == 0) { return 0; }
+    if (connection.*.net_wm_name_atom != 0 && connection.*.utf8_string_atom != 0) {
+        let utf8_title: WireBuffer = x11_change_property8_request(window.*.window_id,
+            connection.*.net_wm_name_atom, connection.*.utf8_string_atom, title);
+        if (x11_native_send_request(connection, &utf8_title, 1) == 0) { return 0; }
+    }
+    let pid_property: WireBuffer = x11_change_property32_request(window.*.window_id,
+        connection.*.net_wm_pid_atom, 6, linux_getpid()); // CARDINAL
+    if (x11_native_send_request(connection, &pid_property, 1) == 0) { return 0; }
+    let protocols: WireBuffer = x11_change_property32_request(window.*.window_id,
+        connection.*.wm_protocols_atom, 4, connection.*.wm_delete_window_atom); // ATOM
+    if (x11_native_send_request(connection, &protocols, 1) == 0) { return 0; }
+    return 1;
+}
+
+fn x11_verify_window_pid(connection: *X11NativeConnection, window: *X11NativeWindow, timeout_ms: t27) i32 {
+    if (connection.*.authenticated == 0 || window.*.live == 0 || connection.*.net_wm_pid_atom == 0) { return 0; }
+    let request: WireBuffer = x11_get_property_request(window.*.window_id, connection.*.net_wm_pid_atom, 6);
+    if (x11_native_send_request(connection, &request, 1) == 0) { return 0; }
+    let expected_sequence: t27 = connection.*.last_sent_sequence;
+    let input: WireBuffer = x11_receive_bounded_reply(
+        connection, expected_sequence, timeout_ms, 1);
+    if (input.error != 0 || len[u8](input.bytes) != 36
+        || wire_read_u8(&input, 1) != 32 || wire_read_u32_le(&input, 8) != 6
+        || wire_read_u32_le(&input, 16) != 1) {
+        wire_free(&input); return 0;
+    }
+    let matches: i32 = 0;
+    if (wire_read_u32_le(&input, 32) == linux_getpid()) { matches = 1; }
+    wire_free(&input); return matches;
+}
+
+fn x11_wait_window_ready(connection: *X11NativeConnection, window: *X11NativeWindow, timeout_ms: t27) i32 {
+    if (x11_take_window_ready_event(connection, window.*.window_id) != 0) {
+        window.*.mapped = 1; return 1;
+    }
+    if (connection.*.authenticated == 0 || timeout_ms < 0) { return 0; }
+    let deadline: i64 = linux_monotonic_ms() + timeout_ms as i64;
+    while (connection.*.authenticated != 0) {
+        let status: i32 = x11_queue_next_frame_event_until(connection, deadline);
+        if (status < 1) { return 0; }
+        if (x11_take_window_ready_event(connection, window.*.window_id) != 0) {
+            window.*.mapped = 1; return 1;
+        }
+    }
+    return 0;
+}
+
+fn x11_close_window(connection: *X11NativeConnection, window: *X11NativeWindow) i32 {
+    if (window.*.live == 0) { return 0; }
+    x11_clipboard_forget_window_identity(connection, window.*.window_id);
+    let destroy_ok: i32 = connection.*.authenticated;
+    let free_gc: WireBuffer = x11_free_gc_request(window.*.gc_id);
+    destroy_ok = x11_native_send_request(connection, &free_gc, destroy_ok);
+    let destroy: WireBuffer = x11_destroy_window_request(window.*.window_id);
+    destroy_ok = x11_native_send_request(connection, &destroy, destroy_ok);
+    x11_connection_unregister_window(connection, window.*.window_id);
+    window.*.live = 0; window.*.mapped = 0;
+    return destroy_ok;
+}
+
+fn x11_sync_window_geometry(connection: *X11NativeConnection, window: *X11NativeWindow, timeout_ms: t27) i32 {
+    if (connection.*.authenticated == 0 || window.*.live == 0) { return 0; }
+    let request: WireBuffer = x11_get_geometry_request(window.*.window_id);
+    if (x11_native_send_request(connection, &request, 1) == 0) { return 0; }
+    let expected_sequence: t27 = connection.*.last_sent_sequence;
+    let input: WireBuffer = x11_receive_bounded_reply(
+        connection, expected_sequence, timeout_ms, 0);
+    let geometry: X11Geometry = x11_decode_geometry_reply(&input);
+    wire_free(&input);
+    if (geometry.valid == 1 && geometry.root == connection.*.setup.root_window
+        && geometry.width == window.*.width && geometry.height == window.*.height) { return 1; }
+    return 0;
+}
+
+fn x11_disconnect(connection: *X11NativeConnection) void {
+    if (connection.*.fd >= 0) { let _closed: i64 = linux_close(connection.*.fd); }
+    connection.*.fd = 0 - 1;
+    connection.*.connected = 0;
+    connection.*.authenticated = 0;
+    connection.*.last_sent_sequence = 0;
+    if (connection.*.pending_events.cap > 0) { free[X11Event](&connection.*.pending_events); }
+    if (connection.*.live_windows.cap > 0) { free[t27](&connection.*.live_windows); }
+    connection.*.last_failure_timeout = 0;
+    x11_keyboard_mapping_free(&connection.*.keyboard_mapping);
+    x11_modifier_mapping_free(&connection.*.modifier_mapping);
+    x11_clipboard_clear_authority(connection);
+}
+
+fn x11_probe_window(connection: *X11NativeConnection, width: t27, height: t27, timeout_ms: t27) i32 {
+    if (connection.*.authenticated == 0 || width < 1 || height < 1 || width > 65535 || height > 65535) { return 0; }
+    let window_id: t27 = x11_allocate_resource(connection);
+    if (window_id == 0) { return 0; }
+    let create: WireBuffer = x11_create_window_request(window_id, connection.*.setup.root_window,
+        width, height, connection.*.setup.white_pixel);
+    if (x11_native_send_request(connection, &create, 1) == 0) { return 0; }
+    let map: WireBuffer = x11_map_window_request(window_id);
+    if (x11_native_send_request(connection, &map, 1) == 0) { return 0; }
+    let geometry_request: WireBuffer = x11_get_geometry_request(window_id);
+    if (x11_native_send_request(connection, &geometry_request, 1) == 0) { return 0; }
+    let expected_sequence: t27 = connection.*.last_sent_sequence;
+    let geometry: X11Geometry = X11Geometry{ .depth = 0, .root = 0,
+        .width = 0, .height = 0, .border_width = 0, .valid = 0 };
+    let reply: WireBuffer = x11_receive_bounded_reply(
+        connection, expected_sequence, timeout_ms, 0);
+    geometry = x11_decode_geometry_reply(&reply);
+    wire_free(&reply);
+    let destroy: WireBuffer = x11_destroy_window_request(window_id);
+    let destroyed: i32 = x11_native_send_request(connection, &destroy, 1);
+    if (geometry.valid == 1 && geometry.root == connection.*.setup.root_window
+        && geometry.width == width && geometry.height == height && destroyed == 1) { return 1; }
+    return 0;
+}

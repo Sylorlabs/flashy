@@ -1,0 +1,928 @@
+// X11 core request framing in client byte order (little-endian Linux target).
+
+struct X11Request {
+    opcode: t27,
+    detail: t27,
+    length_units: t27,
+    payload_offset: i32,
+    valid: i32,
+}
+
+struct X11SetupRequest {
+    byte_order: t27,
+    protocol_major: t27,
+    protocol_minor: t27,
+    auth_name: []u8,
+    auth_data: []u8,
+    valid: i32,
+}
+
+struct X11SetupSuccess {
+    protocol_major: t27,
+    protocol_minor: t27,
+    resource_id_base: t27,
+    resource_id_mask: t27,
+    maximum_request_length: t27,
+    roots: t27,
+    root_window: t27,
+    white_pixel: t27,
+    black_pixel: t27,
+    root_visual: t27,
+    root_depth: t27,
+    screen_width: t27,
+    screen_height: t27,
+    image_byte_order: t27,
+    minimum_keycode: t27,
+    maximum_keycode: t27,
+    bits_per_pixel: t27,
+    scanline_pad: t27,
+    visual_class: t27,
+    red_mask: t27,
+    green_mask: t27,
+    blue_mask: t27,
+    pixel_format_valid: i32,
+    valid: i32,
+}
+
+struct X11Geometry {
+    depth: t27,
+    root: t27,
+    width: t27,
+    height: t27,
+    border_width: t27,
+    valid: i32,
+}
+
+enum X11EventKind { Unknown, KeyDown, KeyUp, PointerDown, PointerUp, PointerMove, Enter,
+    Leave, FocusIn, FocusOut, Expose, Mapped, Unmapped, Configure, SelectionClear,
+    SelectionRequest, SelectionNotify, ClientMessage, MappingNotify }
+
+struct X11Event {
+    kind: X11EventKind,
+    response_type: t27,
+    send_event: t9,
+    sequence: t27,
+    window: t27,
+    time: t27,
+    state: t27,
+    x: t27,
+    y: t27,
+    width: t27,
+    height: t27,
+    detail: t27,
+    message_type: t27,
+    data0: t27,
+    owner: t27,
+    requestor: t27,
+    selection_atom: t27,
+    target_atom: t27,
+    property_atom: t27,
+    selection_generation: t27,
+    mapping_request: t27,
+    mapping_first_keycode: t27,
+    mapping_keycode_count: t27,
+    valid: i32,
+}
+
+struct X11AtomReply {
+    atom: t27,
+    valid: i32,
+}
+
+// PRIMARY is a predefined core atom. CLIPBOARD and UTF8_STRING are resolved
+// from the authenticated server before clipboard authority can be used.
+enum X11SelectionKind { Clipboard, Primary }
+
+enum X11ClipboardStatus { Ok, InvalidArgument, AtomUnavailable, InvalidUtf8,
+    TooLarge, TransportFailed, OwnershipRejected, NotOwner, UnsupportedTarget,
+    ConversionRejected, NoSelection, PropertyMissing, PropertyTypeMismatch,
+    PropertyFormatMismatch, PropertyTruncated, MalformedReply, Timeout }
+
+struct X11SelectionOwnerReply {
+    owner: t27,
+    valid: i32,
+}
+
+struct X11GetPropertyReply {
+    property_type: t27,
+    format: t27,
+    bytes_after: t27,
+    value_items: t27,
+    value_offset: i32,
+    value_bytes: i32,
+    valid: i32,
+}
+
+// Core X11 keycodes and keysyms are wire-protocol numbers. They remain t27
+// values after decoding; this layer deliberately does not guess a keyboard
+// layout, compose state, Alt, Meta, or UTF-8 text.
+struct X11KeyboardMapping {
+    first_keycode: t27,
+    keycode_count: t27,
+    keysyms_per_keycode: t27,
+    keysyms: ArrayList[t27],
+    generation: t27,
+    valid: i32,
+}
+
+struct X11KeysymLookup {
+    keycode: t27,
+    keysym: t27,
+    column: t27,
+    group: t27,
+    level: t27,
+    generation: t27,
+    valid: i32,
+}
+
+struct X11ModifierMapping {
+    keycodes_per_modifier: t27,
+    keycodes: ArrayList[t27],
+    shift_resolved: t9,
+    control_resolved: t9,
+    mod1_resolved: t9,
+    mod2_resolved: t9,
+    mod3_resolved: t9,
+    mod4_resolved: t9,
+    mod5_resolved: t9,
+    generation: t27,
+    valid: i32,
+}
+
+fn x11_encode_request(opcode: t27, detail: t27, payload: *WireBuffer) WireBuffer {
+    let out: WireBuffer = wire_new(4 + len[u8](payload.*.bytes) + 3);
+    let payload_len: t27 = len[u8](payload.*.bytes) as t27;
+    let total: t27 = 4 + ((payload_len + 3) / 4) * 4;
+    if (payload.*.error != 0 || opcode < 1 || opcode > 255 || detail < 0
+        || detail > 255 || total / 4 > 65535) { out.error = 1; return out; }
+    wire_push_u8(&out, opcode);
+    wire_push_u8(&out, detail);
+    wire_push_u16_le(&out, total / 4);
+    wire_append(&out, payload);
+    wire_pad4(&out);
+    return out;
+}
+
+fn x11_wire_id_valid(value: t27) i32 {
+    if (value < 1 || value > 536870911) { return 0; }
+    return 1;
+}
+
+// This remains below the exact-frame reply cap and below the largest core
+// ChangeProperty request. Larger transfers require the deliberately unsupported
+// INCR protocol instead of allocating an unbounded property.
+fn x11_selection_max_bytes() t27 { return clipboard_max_bytes(); }
+
+fn x11_decode_request(input: *WireBuffer, offset: i32) X11Request {
+    let bad: X11Request = X11Request{ .opcode = 0, .detail = 0, .length_units = 0, .payload_offset = offset + 4, .valid = 0 };
+    if (offset < 0 || offset + 4 > len[u8](input.*.bytes)) { return bad; }
+    let opcode: t27 = wire_read_u8(input, offset);
+    let detail: t27 = wire_read_u8(input, offset + 1);
+    let units: t27 = wire_read_u16_le(input, offset + 2);
+    let bytes: t27 = units * 4;
+    if (opcode < 1 || units < 1 || offset + (bytes as i32) > len[u8](input.*.bytes)) { return bad; }
+    return X11Request{ .opcode = opcode, .detail = detail, .length_units = units, .payload_offset = offset + 4, .valid = 1 };
+}
+
+fn x11_setup_request(auth_name: []u8, auth_data: []u8) WireBuffer {
+    let out: WireBuffer = wire_new(12 + auth_name.len + auth_data.len + 6);
+    wire_push_u8(&out, 'l'); wire_push_u8(&out, 0);
+    wire_push_u16_le(&out, 11); wire_push_u16_le(&out, 0);
+    wire_push_u16_le(&out, auth_name.len as t27); wire_push_u16_le(&out, auth_data.len as t27);
+    wire_push_u16_le(&out, 0);
+    let i: i32 = 0;
+    while (i < auth_name.len) { wire_push_u8(&out, auth_name[i] as t27); i = i + 1; }
+    wire_pad4(&out);
+    i = 0;
+    while (i < auth_data.len) { wire_push_u8(&out, auth_data[i] as t27); i = i + 1; }
+    wire_pad4(&out);
+    return out;
+}
+
+fn x11_decode_setup_request(input: *WireBuffer) X11SetupRequest {
+    let bad: X11SetupRequest = X11SetupRequest{ .byte_order = 0, .protocol_major = 0, .protocol_minor = 0, .auth_name = "", .auth_data = "", .valid = 0 };
+    if (len[u8](input.*.bytes) < 12) { return bad; }
+    let order: t27 = wire_read_u8(input, 0);
+    let major: t27 = wire_read_u16_le(input, 2);
+    let minor: t27 = wire_read_u16_le(input, 4);
+    let name_len: i32 = wire_read_u16_le(input, 6) as i32;
+    let data_len: i32 = wire_read_u16_le(input, 8) as i32;
+    let name_start: i32 = 12;
+    let data_start: i32 = name_start + ((name_len + 3) / 4) * 4;
+    let end: i32 = data_start + ((data_len + 3) / 4) * 4;
+    if (order != 'l' || major != 11 || end > len[u8](input.*.bytes)) { return bad; }
+    return X11SetupRequest{ .byte_order = order, .protocol_major = major, .protocol_minor = minor,
+        .auth_name = input.*.bytes.data[name_start..name_start + name_len],
+        .auth_data = input.*.bytes.data[data_start..data_start + data_len], .valid = 1 };
+}
+
+fn x11_setup_success(resource_base: t27, resource_mask: t27, maximum_request_length: t27) WireBuffer {
+    let out: WireBuffer = wire_new(120);
+    wire_push_u8(&out, 1); wire_push_u8(&out, 0);
+    wire_push_u16_le(&out, 11); wire_push_u16_le(&out, 0); wire_push_u16_le(&out, 28);
+    wire_push_u32_le(&out, 1); wire_push_u32_le(&out, resource_base); wire_push_u32_le(&out, resource_mask);
+    wire_push_u32_le(&out, 0); wire_push_u16_le(&out, 0); wire_push_u16_le(&out, maximum_request_length);
+    wire_push_u8(&out, 1); wire_push_u8(&out, 1); wire_push_u8(&out, 0); wire_push_u8(&out, 0);
+    wire_push_u8(&out, 32); wire_push_u8(&out, 32); wire_push_u8(&out, 8); wire_push_u8(&out, 255);
+    wire_push_u32_le(&out, 0);
+    // One root-depth pixmap format: depth 24 stored in 32-bit scanline units.
+    wire_push_u8(&out, 24); wire_push_u8(&out, 32); wire_push_u8(&out, 32);
+    wire_push_u8(&out, 0); wire_push_u32_le(&out, 0);
+    // One minimal screen. Depth/visual catalogues are empty because this packet is
+    // a deterministic protocol fixture rather than a drawable server contract.
+    wire_push_u32_le(&out, 256); wire_push_u32_le(&out, 0);
+    wire_push_u32_le(&out, 16777215); wire_push_u32_le(&out, 0);
+    wire_push_u32_le(&out, 0);
+    wire_push_u16_le(&out, 800); wire_push_u16_le(&out, 600);
+    wire_push_u16_le(&out, 200); wire_push_u16_le(&out, 150);
+    wire_push_u16_le(&out, 1); wire_push_u16_le(&out, 1);
+    wire_push_u32_le(&out, 32);
+    wire_push_u8(&out, 0); wire_push_u8(&out, 0); wire_push_u8(&out, 24); wire_push_u8(&out, 1);
+    // One TrueColor visual for the root depth.
+    wire_push_u8(&out, 24); wire_push_u8(&out, 0); wire_push_u16_le(&out, 1); wire_push_u32_le(&out, 0);
+    wire_push_u32_le(&out, 32); wire_push_u8(&out, 4); wire_push_u8(&out, 8); wire_push_u16_le(&out, 256);
+    wire_push_u32_le(&out, 16711680); wire_push_u32_le(&out, 65280); wire_push_u32_le(&out, 255); wire_push_u32_le(&out, 0);
+    return out;
+}
+
+fn x11_decode_setup_success(input: *WireBuffer) X11SetupSuccess {
+    let bad: X11SetupSuccess = X11SetupSuccess{ .protocol_major = 0, .protocol_minor = 0,
+        .resource_id_base = 0, .resource_id_mask = 0, .maximum_request_length = 0, .roots = 0,
+        .root_window = 0, .white_pixel = 0, .black_pixel = 0, .root_visual = 0, .root_depth = 0,
+        .screen_width = 0, .screen_height = 0, .image_byte_order = 0,
+        .minimum_keycode = 0, .maximum_keycode = 0, .bits_per_pixel = 0,
+        .scanline_pad = 0, .visual_class = 0, .red_mask = 0, .green_mask = 0, .blue_mask = 0,
+        .pixel_format_valid = 0, .valid = 0 };
+    if (len[u8](input.*.bytes) < 40 || wire_read_u8(input, 0) != 1) { return bad; }
+    let additional: t27 = wire_read_u16_le(input, 6) * 4;
+    if (8 + (additional as i32) > len[u8](input.*.bytes)) { return bad; }
+    let minimum_keycode: t27 = wire_read_u8(input, 34);
+    let maximum_keycode: t27 = wire_read_u8(input, 35);
+    if (minimum_keycode < 8 || maximum_keycode > 255 || minimum_keycode > maximum_keycode) { return bad; }
+    let vendor_len: i32 = wire_read_u16_le(input, 24) as i32;
+    let format_count: i32 = wire_read_u8(input, 29) as i32;
+    let formats_offset: i32 = 40 + ((vendor_len + 3) / 4) * 4;
+    let screen_offset: i32 = formats_offset + format_count * 8;
+    if (wire_read_u8(input, 28) < 1 || screen_offset + 40 > len[u8](input.*.bytes)) { return bad; }
+    let root_depth: t27 = wire_read_u8(input, screen_offset + 38);
+    let root_visual: t27 = wire_read_u32_le(input, screen_offset + 32);
+    let bits_per_pixel: t27 = 0;
+    let scanline_pad: t27 = 0;
+    let format_i: i32 = 0;
+    while (format_i < format_count) {
+        let format_offset: i32 = formats_offset + format_i * 8;
+        if (wire_read_u8(input, format_offset) == root_depth) {
+            bits_per_pixel = wire_read_u8(input, format_offset + 1);
+            scanline_pad = wire_read_u8(input, format_offset + 2);
+        }
+        format_i = format_i + 1;
+    }
+    let visual_class: t27 = 0;
+    let red_mask: t27 = 0;
+    let green_mask: t27 = 0;
+    let blue_mask: t27 = 0;
+    let visual_found: i32 = 0;
+    let depth_offset: i32 = screen_offset + 40;
+    let depth_i: i32 = 0;
+    let depth_count: i32 = wire_read_u8(input, screen_offset + 39) as i32;
+    while (depth_i < depth_count && depth_offset + 8 <= len[u8](input.*.bytes)) {
+        let visual_count: i32 = wire_read_u16_le(input, depth_offset + 2) as i32;
+        let visual_offset: i32 = depth_offset + 8;
+        if (visual_offset + visual_count * 24 > len[u8](input.*.bytes)) { return bad; }
+        let visual_i: i32 = 0;
+        while (visual_i < visual_count) {
+            let current: i32 = visual_offset + visual_i * 24;
+            if (wire_read_u32_le(input, current) == root_visual) {
+                visual_class = wire_read_u8(input, current + 4);
+                red_mask = wire_read_u32_le(input, current + 8);
+                green_mask = wire_read_u32_le(input, current + 12);
+                blue_mask = wire_read_u32_le(input, current + 16);
+                visual_found = 1;
+            }
+            visual_i = visual_i + 1;
+        }
+        depth_offset = visual_offset + visual_count * 24;
+        depth_i = depth_i + 1;
+    }
+    let pixel_valid: i32 = 0;
+    if (visual_found == 1 && (visual_class == 4 || visual_class == 5)
+        && (bits_per_pixel == 16 || bits_per_pixel == 24 || bits_per_pixel == 32)
+        && (scanline_pad == 8 || scanline_pad == 16 || scanline_pad == 32)
+        && red_mask > 0 && green_mask > 0 && blue_mask > 0) { pixel_valid = 1; }
+    return X11SetupSuccess{ .protocol_major = wire_read_u16_le(input, 2), .protocol_minor = wire_read_u16_le(input, 4),
+        .resource_id_base = wire_read_u32_le(input, 12), .resource_id_mask = wire_read_u32_le(input, 16),
+        .maximum_request_length = wire_read_u16_le(input, 26), .roots = wire_read_u8(input, 28),
+        .root_window = wire_read_u32_le(input, screen_offset), .white_pixel = wire_read_u32_le(input, screen_offset + 8),
+        .black_pixel = wire_read_u32_le(input, screen_offset + 12), .screen_width = wire_read_u16_le(input, screen_offset + 20),
+        .screen_height = wire_read_u16_le(input, screen_offset + 22), .root_visual = root_visual,
+        .root_depth = root_depth, .image_byte_order = wire_read_u8(input, 30),
+        .minimum_keycode = minimum_keycode, .maximum_keycode = maximum_keycode,
+        .bits_per_pixel = bits_per_pixel,
+        .scanline_pad = scanline_pad, .visual_class = visual_class, .red_mask = red_mask,
+        .green_mask = green_mask, .blue_mask = blue_mask, .pixel_format_valid = pixel_valid, .valid = 1 };
+}
+
+fn x11_create_window_request(window_id: t27, parent: t27, width: t27, height: t27, background_pixel: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(36);
+    wire_push_u32_le(&payload, window_id); wire_push_u32_le(&payload, parent);
+    wire_push_u16_le(&payload, 0); wire_push_u16_le(&payload, 0);
+    wire_push_u16_le(&payload, width); wire_push_u16_le(&payload, height);
+    wire_push_u16_le(&payload, 0); wire_push_u16_le(&payload, 1); // border, InputOutput
+    wire_push_u32_le(&payload, 0); // CopyFromParent visual
+    wire_push_u32_le(&payload, 2050); // CWBackPixel | CWEventMask
+    wire_push_u32_le(&payload, background_pixel);
+    // Core input, focus, exposure, and structure events. This number is an
+    // X11 wire mask; Flashy event state remains typed balanced ternary.
+    wire_push_u32_le(&payload, 2261119);
+    let out: WireBuffer = x11_encode_request(1, 0, &payload); // CopyFromParent depth
+    wire_free(&payload);
+    return out;
+}
+
+fn x11_window_request(opcode: t27, window_id: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(4);
+    wire_push_u32_le(&payload, window_id);
+    let out: WireBuffer = x11_encode_request(opcode, 0, &payload);
+    wire_free(&payload);
+    return out;
+}
+
+fn x11_map_window_request(window_id: t27) WireBuffer { return x11_window_request(8, window_id); }
+fn x11_destroy_window_request(window_id: t27) WireBuffer { return x11_window_request(4, window_id); }
+fn x11_get_geometry_request(window_id: t27) WireBuffer { return x11_window_request(14, window_id); }
+
+fn x11_create_gc_request(gc_id: t27, drawable: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(12);
+    wire_push_u32_le(&payload, gc_id); wire_push_u32_le(&payload, drawable); wire_push_u32_le(&payload, 0);
+    let out: WireBuffer = x11_encode_request(55, 0, &payload);
+    wire_free(&payload);
+    return out;
+}
+
+fn x11_free_gc_request(gc_id: t27) WireBuffer { return x11_window_request(60, gc_id); }
+
+fn x11_put_image_request(drawable: t27, gc_id: t27, width: t27, height: t27,
+    destination_x: t27, destination_y: t27, depth: t27, pixels: *WireBuffer) WireBuffer {
+    let payload: WireBuffer = wire_new(20 + len[u8](pixels.*.bytes));
+    wire_push_u32_le(&payload, drawable); wire_push_u32_le(&payload, gc_id);
+    wire_push_u16_le(&payload, width); wire_push_u16_le(&payload, height);
+    wire_push_u16_le(&payload, destination_x); wire_push_u16_le(&payload, destination_y);
+    wire_push_u8(&payload, 0); wire_push_u8(&payload, depth); wire_push_u16_le(&payload, 0);
+    wire_append(&payload, pixels);
+    let out: WireBuffer = x11_encode_request(72, 2, &payload); // ZPixmap
+    wire_free(&payload);
+    return out;
+}
+
+fn x11_change_property8_request(window_id: t27, property: t27, property_type: t27, data: []u8) WireBuffer {
+    // Validate the declared view before reserving for it. An oversized caller
+    // must not turn a typed INCR-required failure into an eager allocation.
+    let payload: WireBuffer = wire_new(20);
+    if (x11_wire_id_valid(window_id) == 0 || x11_wire_id_valid(property) == 0
+        || x11_wire_id_valid(property_type) == 0
+        || data.len as t27 > x11_selection_max_bytes()) {
+        payload.error = 1;
+        let bad: WireBuffer = x11_encode_request(18, 0, &payload);
+        wire_free(&payload); return bad;
+    }
+    wire_push_u32_le(&payload, window_id); wire_push_u32_le(&payload, property);
+    wire_push_u32_le(&payload, property_type); wire_push_u8(&payload, 8);
+    wire_push_u8(&payload, 0); wire_push_u8(&payload, 0); wire_push_u8(&payload, 0);
+    wire_push_u32_le(&payload, data.len as t27);
+    let i: i32 = 0;
+    while (i < data.len) { wire_push_u8(&payload, data[i] as t27); i = i + 1; }
+    let out: WireBuffer = x11_encode_request(18, 0, &payload); // PropModeReplace
+    wire_free(&payload);
+    return out;
+}
+
+fn x11_change_property32_request(window_id: t27, property: t27, property_type: t27, value: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(24);
+    if (x11_wire_id_valid(window_id) == 0 || x11_wire_id_valid(property) == 0
+        || x11_wire_id_valid(property_type) == 0 || value < 0 || value > 4294967295) {
+        payload.error = 1;
+        let bad: WireBuffer = x11_encode_request(18, 0, &payload);
+        wire_free(&payload); return bad;
+    }
+    wire_push_u32_le(&payload, window_id); wire_push_u32_le(&payload, property);
+    wire_push_u32_le(&payload, property_type); wire_push_u8(&payload, 32);
+    wire_push_u8(&payload, 0); wire_push_u8(&payload, 0); wire_push_u8(&payload, 0);
+    wire_push_u32_le(&payload, 1); wire_push_u32_le(&payload, value);
+    let out: WireBuffer = x11_encode_request(18, 0, &payload);
+    wire_free(&payload);
+    return out;
+}
+
+fn x11_intern_atom_request(name: []u8) WireBuffer {
+    let payload: WireBuffer = wire_new(4);
+    if (name.len < 1 || name.len > 65535) {
+        payload.error = 1;
+        let bad: WireBuffer = x11_encode_request(16, 0, &payload);
+        wire_free(&payload); return bad;
+    }
+    wire_push_u16_le(&payload, name.len as t27); wire_push_u16_le(&payload, 0);
+    let i: i32 = 0;
+    while (i < name.len) { wire_push_u8(&payload, name[i] as t27); i = i + 1; }
+    let out: WireBuffer = x11_encode_request(16, 0, &payload);
+    wire_free(&payload);
+    return out;
+}
+
+fn x11_keyboard_mapping_empty() X11KeyboardMapping {
+    return X11KeyboardMapping{ .first_keycode = 0, .keycode_count = 0,
+        .keysyms_per_keycode = 0,
+        .keysyms = ArrayList[t27]{ .data = null as *t27, .len = 0, .cap = 0 },
+        .generation = 0, .valid = 0 };
+}
+
+fn x11_keyboard_mapping_free(mapping: *X11KeyboardMapping) void {
+    if (mapping.*.keysyms.cap > 0) { free[t27](&mapping.*.keysyms); }
+    mapping.*.first_keycode = 0; mapping.*.keycode_count = 0;
+    mapping.*.keysyms_per_keycode = 0; mapping.*.valid = 0;
+}
+
+fn x11_keyboard_mapping_invalidate(mapping: *X11KeyboardMapping) void {
+    mapping.*.valid = 0;
+    mapping.*.generation = mapping.*.generation + 1;
+}
+
+fn x11_get_keyboard_mapping_request(first_keycode: t27, keycode_count: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(4);
+    if (first_keycode < 8 || first_keycode > 255 || keycode_count < 1 || keycode_count > 255
+        || first_keycode + keycode_count - 1 > 255) {
+        payload.error = 1;
+        return payload;
+    }
+    wire_push_u8(&payload, keycode_count);
+    wire_push_u8(&payload, 0); wire_push_u8(&payload, 0); wire_push_u8(&payload, 0);
+    let out: WireBuffer = x11_encode_request(101, first_keycode, &payload);
+    wire_free(&payload);
+    return out;
+}
+
+fn x11_keyboard_mapping_reply(keysyms_per_keycode: t27, keysyms: *ArrayList[t27]) WireBuffer {
+    let out: WireBuffer = wire_new(32 + len[t27](keysyms.*) * 4);
+    if (keysyms_per_keycode < 1 || keysyms_per_keycode > 255
+        || len[t27](keysyms.*) < 1 || (len[t27](keysyms.*) % (keysyms_per_keycode as i32)) != 0) {
+        out.error = 1;
+        return out;
+    }
+    wire_push_u8(&out, 1); wire_push_u8(&out, keysyms_per_keycode); wire_push_u16_le(&out, 0);
+    wire_push_u32_le(&out, len[t27](keysyms.*) as t27);
+    while (len[u8](out.bytes) < 32) { wire_push_u8(&out, 0); }
+    let i: i32 = 0;
+    while (i < len[t27](keysyms.*)) { wire_push_u32_le(&out, get[t27](keysyms.*, i)); i = i + 1; }
+    return out;
+}
+
+fn x11_decode_keyboard_mapping_reply(input: *WireBuffer, first_keycode: t27,
+    keycode_count: t27, minimum_keycode: t27, maximum_keycode: t27) X11KeyboardMapping {
+    let bad: X11KeyboardMapping = x11_keyboard_mapping_empty();
+    if (minimum_keycode < 8 || maximum_keycode > 255 || minimum_keycode > maximum_keycode
+        || first_keycode < minimum_keycode || keycode_count < 1
+        || keycode_count > maximum_keycode - first_keycode + 1
+        || input.*.error != 0 || len[u8](input.*.bytes) < 32
+        || wire_read_u8(input, 0) != 1) { return bad; }
+    let per_code: t27 = wire_read_u8(input, 1);
+    let units: t27 = wire_read_u32_le(input, 4);
+    if (per_code < 1 || per_code > 255 || units != per_code * keycode_count
+        || units > 65025 || len[u8](input.*.bytes) != 32 + (units as i32) * 4) { return bad; }
+    let result: X11KeyboardMapping = x11_keyboard_mapping_empty();
+    result.first_keycode = first_keycode; result.keycode_count = keycode_count;
+    result.keysyms_per_keycode = per_code; result.generation = 1;
+    let i: i32 = 0;
+    while (i < units as i32) {
+        push[t27](&result.keysyms, wire_read_u32_le(input, 32 + i * 4));
+        i = i + 1;
+    }
+    if (input.*.error != 0) { x11_keyboard_mapping_free(&result); return bad; }
+    result.valid = 1;
+    return result;
+}
+
+fn x11_keyboard_lookup(mapping: *X11KeyboardMapping, keycode: t27, column: t27) X11KeysymLookup {
+    let bad: X11KeysymLookup = X11KeysymLookup{ .keycode = keycode, .keysym = 0,
+        .column = column, .group = 0, .level = 0,
+        .generation = mapping.*.generation, .valid = 0 };
+    if (mapping.*.valid == 0 || keycode < mapping.*.first_keycode
+        || keycode >= mapping.*.first_keycode + mapping.*.keycode_count
+        || column < 0 || column >= mapping.*.keysyms_per_keycode) { return bad; }
+    let index: t27 = (keycode - mapping.*.first_keycode) * mapping.*.keysyms_per_keycode + column;
+    if (index < 0 || index >= len[t27](mapping.*.keysyms) as t27) { return bad; }
+    return X11KeysymLookup{ .keycode = keycode,
+        .keysym = get[t27](mapping.*.keysyms, index as i32), .column = column,
+        .group = column / 2, .level = column % 2,
+        .generation = mapping.*.generation, .valid = 1 };
+}
+
+fn x11_keyboard_lookup_level(mapping: *X11KeyboardMapping, keycode: t27,
+    group: t27, level: t27) X11KeysymLookup {
+    if (group < 0 || level < 0 || level > 1) {
+        return X11KeysymLookup{ .keycode = keycode, .keysym = 0, .column = 0,
+            .group = group, .level = level, .generation = mapping.*.generation, .valid = 0 };
+    }
+    return x11_keyboard_lookup(mapping, keycode, group * 2 + level);
+}
+
+fn x11_modifier_mapping_empty() X11ModifierMapping {
+    return X11ModifierMapping{ .keycodes_per_modifier = 0,
+        .keycodes = ArrayList[t27]{ .data = null as *t27, .len = 0, .cap = 0 },
+        .shift_resolved = 0, .control_resolved = 0, .mod1_resolved = 0,
+        .mod2_resolved = 0, .mod3_resolved = 0, .mod4_resolved = 0,
+        .mod5_resolved = 0, .generation = 0, .valid = 0 };
+}
+
+fn x11_modifier_mapping_free(mapping: *X11ModifierMapping) void {
+    if (mapping.*.keycodes.cap > 0) { free[t27](&mapping.*.keycodes); }
+    mapping.*.keycodes_per_modifier = 0; mapping.*.valid = 0;
+}
+
+fn x11_modifier_mapping_invalidate(mapping: *X11ModifierMapping) void {
+    mapping.*.valid = 0;
+    mapping.*.generation = mapping.*.generation + 1;
+}
+
+fn x11_get_modifier_mapping_request() WireBuffer {
+    let payload: WireBuffer = wire_new(0);
+    let out: WireBuffer = x11_encode_request(119, 0, &payload);
+    wire_free(&payload);
+    return out;
+}
+
+fn x11_modifier_mapping_reply(keycodes_per_modifier: t27, keycodes: *ArrayList[t27]) WireBuffer {
+    let out: WireBuffer = wire_new(32 + len[t27](keycodes.*));
+    if (keycodes_per_modifier < 0 || keycodes_per_modifier > 255
+        || len[t27](keycodes.*) != (keycodes_per_modifier as i32) * 8) {
+        out.error = 1;
+        return out;
+    }
+    wire_push_u8(&out, 1); wire_push_u8(&out, keycodes_per_modifier); wire_push_u16_le(&out, 0);
+    wire_push_u32_le(&out, keycodes_per_modifier * 2);
+    while (len[u8](out.bytes) < 32) { wire_push_u8(&out, 0); }
+    let i: i32 = 0;
+    while (i < len[t27](keycodes.*)) { wire_push_u8(&out, get[t27](keycodes.*, i)); i = i + 1; }
+    return out;
+}
+
+fn x11_decode_modifier_mapping_reply(input: *WireBuffer) X11ModifierMapping {
+    let bad: X11ModifierMapping = x11_modifier_mapping_empty();
+    if (input.*.error != 0 || len[u8](input.*.bytes) < 32
+        || wire_read_u8(input, 0) != 1) { return bad; }
+    let per_modifier: t27 = wire_read_u8(input, 1);
+    let units: t27 = wire_read_u32_le(input, 4);
+    if (per_modifier < 0 || per_modifier > 255 || units != per_modifier * 2
+        || len[u8](input.*.bytes) != 32 + (per_modifier as i32) * 8) { return bad; }
+    let result: X11ModifierMapping = x11_modifier_mapping_empty();
+    result.keycodes_per_modifier = per_modifier; result.generation = 1;
+    let i: i32 = 0;
+    while (i < (per_modifier as i32) * 8) {
+        let keycode: t27 = wire_read_u8(input, 32 + i);
+        if (keycode != 0 && (keycode < 8 || keycode > 255)) {
+            x11_modifier_mapping_free(&result); return bad;
+        }
+        push[t27](&result.keycodes, keycode);
+        i = i + 1;
+    }
+    if (input.*.error != 0) { x11_modifier_mapping_free(&result); return bad; }
+    // X11 defines rows 0 and 2 as Shift and Control. Mod1-Mod5 name wire
+    // groups, not semantic Alt/Meta roles, so those roles remain unresolved.
+    result.shift_resolved = 1; result.control_resolved = 1;
+    result.mod1_resolved = 0; result.mod2_resolved = 0; result.mod3_resolved = 0;
+    result.mod4_resolved = 0; result.mod5_resolved = 0;
+    result.valid = 1;
+    return result;
+}
+
+fn x11_modifier_row_has_keycode(mapping: *X11ModifierMapping, row: t27, keycode: t27) i32 {
+    if (mapping.*.valid == 0 || row < 0 || row > 7 || keycode < 8 || keycode > 255) { return 0; }
+    let i: i32 = 0;
+    while (i < mapping.*.keycodes_per_modifier as i32) {
+        let index: i32 = (row as i32) * (mapping.*.keycodes_per_modifier as i32) + i;
+        if (get[t27](mapping.*.keycodes, index) == keycode) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn x11_modifier_keycode_is_shift(mapping: *X11ModifierMapping, keycode: t27) i32 {
+    return x11_modifier_row_has_keycode(mapping, 0, keycode);
+}
+
+fn x11_modifier_keycode_is_control(mapping: *X11ModifierMapping, keycode: t27) i32 {
+    return x11_modifier_row_has_keycode(mapping, 2, keycode);
+}
+
+fn x11_modifier_mapping_within_bounds(mapping: *X11ModifierMapping,
+    minimum_keycode: t27, maximum_keycode: t27) i32 {
+    if (mapping.*.valid == 0 || minimum_keycode < 8 || maximum_keycode > 255
+        || minimum_keycode > maximum_keycode) { return 0; }
+    let i: i32 = 0;
+    while (i < len[t27](mapping.*.keycodes)) {
+        let keycode: t27 = get[t27](mapping.*.keycodes, i);
+        if (keycode != 0 && (keycode < minimum_keycode || keycode > maximum_keycode)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn x11_state_shift(state: t27) t9 { return ((state / 1) % 2) as t9; }
+fn x11_state_control(state: t27) t9 { return ((state / 4) % 2) as t9; }
+
+fn x11_decode_intern_atom_reply(input: *WireBuffer) X11AtomReply {
+    let bad: X11AtomReply = X11AtomReply{ .atom = 0, .valid = 0 };
+    if (input.*.error != 0 || len[u8](input.*.bytes) != 32
+        || wire_read_u8(input, 0) != 1
+        || wire_read_u32_le(input, 4) != 0) { return bad; }
+    let atom: t27 = wire_read_u32_le(input, 8);
+    if (x11_wire_id_valid(atom) == 0) { return bad; }
+    return X11AtomReply{ .atom = atom, .valid = 1 };
+}
+
+fn x11_grab_server_request() WireBuffer {
+    let payload: WireBuffer = wire_new(0);
+    let out: WireBuffer = x11_encode_request(36, 0, &payload);
+    wire_free(&payload); return out;
+}
+
+fn x11_ungrab_server_request() WireBuffer {
+    let payload: WireBuffer = wire_new(0);
+    let out: WireBuffer = x11_encode_request(37, 0, &payload);
+    wire_free(&payload); return out;
+}
+
+fn x11_delete_property_request(window_id: t27, property: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(8);
+    if (x11_wire_id_valid(window_id) == 0 || x11_wire_id_valid(property) == 0) {
+        payload.error = 1;
+    } else {
+        wire_push_u32_le(&payload, window_id); wire_push_u32_le(&payload, property);
+    }
+    let out: WireBuffer = x11_encode_request(19, 0, &payload);
+    wire_free(&payload); return out;
+}
+
+fn x11_get_property_range_request(window_id: t27, property: t27,
+    property_type: t27, long_offset: t27, long_length: t27, delete: t9) WireBuffer {
+    let payload: WireBuffer = wire_new(20);
+    if (x11_wire_id_valid(window_id) == 0 || x11_wire_id_valid(property) == 0
+        || (property_type != 0 && x11_wire_id_valid(property_type) == 0)
+        || long_offset < 0 || long_offset > 4294967295
+        || long_length < 0 || long_length > 4294967295
+        || (delete != 0 && delete != 1)) {
+        payload.error = 1;
+    } else {
+        wire_push_u32_le(&payload, window_id); wire_push_u32_le(&payload, property);
+        wire_push_u32_le(&payload, property_type); wire_push_u32_le(&payload, long_offset);
+        wire_push_u32_le(&payload, long_length);
+    }
+    let out: WireBuffer = x11_encode_request(20, delete as t27, &payload);
+    wire_free(&payload);
+    return out;
+}
+
+fn x11_get_property_request(window_id: t27, property: t27, property_type: t27) WireBuffer {
+    return x11_get_property_range_request(window_id, property, property_type, 0, 1, 0);
+}
+
+fn x11_set_selection_owner_request(owner: t27, selection: t27, time: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(12);
+    if ((owner != 0 && x11_wire_id_valid(owner) == 0)
+        || x11_wire_id_valid(selection) == 0 || time < 0 || time > 4294967295) {
+        payload.error = 1;
+    } else {
+        wire_push_u32_le(&payload, owner); wire_push_u32_le(&payload, selection);
+        wire_push_u32_le(&payload, time);
+    }
+    let out: WireBuffer = x11_encode_request(22, 0, &payload);
+    wire_free(&payload); return out;
+}
+
+fn x11_get_selection_owner_request(selection: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(4);
+    if (x11_wire_id_valid(selection) == 0) { payload.error = 1; }
+    else { wire_push_u32_le(&payload, selection); }
+    let out: WireBuffer = x11_encode_request(23, 0, &payload);
+    wire_free(&payload); return out;
+}
+
+fn x11_convert_selection_request(requestor: t27, selection: t27,
+    target: t27, property: t27, time: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(20);
+    if (x11_wire_id_valid(requestor) == 0 || x11_wire_id_valid(selection) == 0
+        || x11_wire_id_valid(target) == 0
+        || (property != 0 && x11_wire_id_valid(property) == 0)
+        || time < 0 || time > 4294967295) {
+        payload.error = 1;
+    } else {
+        wire_push_u32_le(&payload, requestor); wire_push_u32_le(&payload, selection);
+        wire_push_u32_le(&payload, target); wire_push_u32_le(&payload, property);
+        wire_push_u32_le(&payload, time);
+    }
+    let out: WireBuffer = x11_encode_request(24, 0, &payload);
+    wire_free(&payload); return out;
+}
+
+fn x11_selection_notify_event(requestor: t27, selection: t27,
+    target: t27, property: t27, time: t27) WireBuffer {
+    let out: WireBuffer = wire_new(32);
+    if (x11_wire_id_valid(requestor) == 0 || x11_wire_id_valid(selection) == 0
+        || x11_wire_id_valid(target) == 0
+        || (property != 0 && x11_wire_id_valid(property) == 0)
+        || time < 0 || time > 4294967295) { out.error = 1; return out; }
+    wire_push_u8(&out, 31); wire_push_u8(&out, 0); wire_push_u16_le(&out, 0);
+    wire_push_u32_le(&out, time); wire_push_u32_le(&out, requestor);
+    wire_push_u32_le(&out, selection); wire_push_u32_le(&out, target);
+    wire_push_u32_le(&out, property);
+    while (len[u8](out.bytes) < 32) { wire_push_u8(&out, 0); }
+    return out;
+}
+
+fn x11_send_selection_notify_request(requestor: t27, selection: t27,
+    target: t27, property: t27, time: t27) WireBuffer {
+    let event: WireBuffer = x11_selection_notify_event(
+        requestor, selection, target, property, time);
+    let payload: WireBuffer = wire_new(40);
+    if (event.error != 0) { payload.error = 1; }
+    else {
+        // SendEvent's propagate flag is the core request detail byte. Its
+        // payload is exactly destination, event-mask, and one 32-byte event.
+        wire_push_u32_le(&payload, requestor); wire_push_u32_le(&payload, 0);
+        wire_append(&payload, &event);
+    }
+    let out: WireBuffer = x11_encode_request(25, 0, &payload);
+    wire_free(&payload); wire_free(&event); return out;
+}
+
+fn x11_decode_get_selection_owner_reply(input: *WireBuffer) X11SelectionOwnerReply {
+    let bad: X11SelectionOwnerReply = X11SelectionOwnerReply{ .owner = 0, .valid = 0 };
+    if (input.*.error != 0 || len[u8](input.*.bytes) != 32
+        || wire_read_u8(input, 0) != 1 || wire_read_u32_le(input, 4) != 0) { return bad; }
+    let owner: t27 = wire_read_u32_le(input, 8);
+    if (owner != 0 && x11_wire_id_valid(owner) == 0) { return bad; }
+    return X11SelectionOwnerReply{ .owner = owner, .valid = 1 };
+}
+
+fn x11_decode_get_property_reply(input: *WireBuffer) X11GetPropertyReply {
+    let bad: X11GetPropertyReply = X11GetPropertyReply{ .property_type = 0,
+        .format = 0, .bytes_after = 0, .value_items = 0,
+        .value_offset = 32, .value_bytes = 0, .valid = 0 };
+    if (input.*.error != 0 || len[u8](input.*.bytes) < 32
+        || wire_read_u8(input, 0) != 1) { return bad; }
+    let format: t27 = wire_read_u8(input, 1);
+    let property_type: t27 = wire_read_u32_le(input, 8);
+    let bytes_after: t27 = wire_read_u32_le(input, 12);
+    let value_items: t27 = wire_read_u32_le(input, 16);
+    let units: t27 = wire_read_u32_le(input, 4);
+    let tail_bytes: i32 = len[u8](input.*.bytes) - 32;
+    if (property_type != 0 && x11_wire_id_valid(property_type) == 0) {
+        return bad;
+    }
+    if (units > x11_selection_max_bytes() / 4 || units * 4 != tail_bytes as t27) { return bad; }
+    if (property_type == 0) {
+        if (format != 0 || bytes_after != 0 || value_items != 0 || units != 0) { return bad; }
+        return X11GetPropertyReply{ .property_type = 0, .format = 0,
+            .bytes_after = 0, .value_items = 0, .value_offset = 32,
+            .value_bytes = 0, .valid = 1 };
+    }
+    if (x11_wire_id_valid(property_type) == 0
+        || (format != 8 && format != 16 && format != 32)) { return bad; }
+    let bytes_per_item: t27 = format / 8;
+    if (value_items > (tail_bytes as t27) / bytes_per_item) { return bad; }
+    let value_bytes: t27 = value_items * bytes_per_item;
+    let padded: t27 = ((value_bytes + 3) / 4) * 4;
+    if (padded != tail_bytes as t27) { return bad; }
+    return X11GetPropertyReply{ .property_type = property_type,
+        .format = format, .bytes_after = bytes_after, .value_items = value_items,
+        .value_offset = 32, .value_bytes = value_bytes as i32, .valid = 1 };
+}
+
+fn x11_decode_geometry_reply(input: *WireBuffer) X11Geometry {
+    let bad: X11Geometry = X11Geometry{ .depth = 0, .root = 0, .width = 0, .height = 0, .border_width = 0, .valid = 0 };
+    if (len[u8](input.*.bytes) < 32 || wire_read_u8(input, 0) != 1) { return bad; }
+    return X11Geometry{ .depth = wire_read_u8(input, 1), .root = wire_read_u32_le(input, 8),
+        .width = wire_read_u16_le(input, 16), .height = wire_read_u16_le(input, 18),
+        .border_width = wire_read_u16_le(input, 20), .valid = 1 };
+}
+
+fn x11_read_i16(input: *WireBuffer, offset: i32) t27 {
+    let value: t27 = wire_read_u16_le(input, offset);
+    if (value >= 32768) { return value - 65536; }
+    return value;
+}
+
+fn x11_decode_event(input: *WireBuffer, offset: i32) X11Event {
+    let bad: X11Event = X11Event{ .kind = X11EventKind.Unknown, .response_type = 0,
+        .send_event = 0, .sequence = 0,
+        .window = 0, .time = 0, .state = 0, .x = 0, .y = 0,
+        .width = 0, .height = 0, .detail = 0, .message_type = 0, .data0 = 0,
+        .owner = 0, .requestor = 0, .selection_atom = 0,
+        .target_atom = 0, .property_atom = 0, .selection_generation = 0,
+        .mapping_request = 0, .mapping_first_keycode = 0, .mapping_keycode_count = 0,
+        .valid = 0 };
+    if (offset < 0 || offset + 32 > len[u8](input.*.bytes)) { return bad; }
+    let response: t27 = wire_read_u8(input, offset);
+    let send_event: t9 = 0;
+    if (response >= 128) { response = response - 128; send_event = 1; }
+    let event: X11Event = bad;
+    event.response_type = response;
+    event.send_event = send_event;
+    event.sequence = wire_read_u16_le(input, offset + 2);
+    event.detail = wire_read_u8(input, offset + 1);
+    if (response >= 2 && response <= 8) {
+        if (response == 2) { event.kind = X11EventKind.KeyDown; }
+        else if (response == 3) { event.kind = X11EventKind.KeyUp; }
+        else if (response == 4) { event.kind = X11EventKind.PointerDown; }
+        else if (response == 5) { event.kind = X11EventKind.PointerUp; }
+        else if (response == 6) { event.kind = X11EventKind.PointerMove; }
+        else if (response == 7) { event.kind = X11EventKind.Enter; }
+        else { event.kind = X11EventKind.Leave; }
+        event.time = wire_read_u32_le(input, offset + 4);
+        event.window = wire_read_u32_le(input, offset + 12);
+        event.x = x11_read_i16(input, offset + 24); event.y = x11_read_i16(input, offset + 26);
+        event.state = wire_read_u16_le(input, offset + 28);
+        event.valid = 1; return event;
+    }
+    if (response == 9 || response == 10) {
+        if (response == 9) { event.kind = X11EventKind.FocusIn; } else { event.kind = X11EventKind.FocusOut; }
+        event.window = wire_read_u32_le(input, offset + 8); event.valid = 1; return event;
+    }
+    if (response == 12) {
+        event.kind = X11EventKind.Expose; event.window = wire_read_u32_le(input, offset + 4);
+        event.x = wire_read_u16_le(input, offset + 8); event.y = wire_read_u16_le(input, offset + 10);
+        event.width = wire_read_u16_le(input, offset + 12); event.height = wire_read_u16_le(input, offset + 14);
+        event.valid = 1; return event;
+    }
+    if (response == 18 || response == 19) {
+        if (response == 18) { event.kind = X11EventKind.Unmapped; } else { event.kind = X11EventKind.Mapped; }
+        event.window = wire_read_u32_le(input, offset + 8); event.valid = 1; return event;
+    }
+    if (response == 22) {
+        event.kind = X11EventKind.Configure; event.window = wire_read_u32_le(input, offset + 8);
+        event.x = x11_read_i16(input, offset + 16); event.y = x11_read_i16(input, offset + 18);
+        event.width = wire_read_u16_le(input, offset + 20); event.height = wire_read_u16_le(input, offset + 22);
+        event.valid = 1; return event;
+    }
+    if (response == 29) {
+        if (send_event != 0) { return bad; }
+        event.kind = X11EventKind.SelectionClear;
+        event.time = wire_read_u32_le(input, offset + 4);
+        event.owner = wire_read_u32_le(input, offset + 8);
+        event.window = event.owner;
+        event.selection_atom = wire_read_u32_le(input, offset + 12);
+        if (x11_wire_id_valid(event.owner) == 0
+            || x11_wire_id_valid(event.selection_atom) == 0) { return bad; }
+        event.valid = 1; return event;
+    }
+    if (response == 30) {
+        if (send_event != 0) { return bad; }
+        event.kind = X11EventKind.SelectionRequest;
+        event.time = wire_read_u32_le(input, offset + 4);
+        event.owner = wire_read_u32_le(input, offset + 8);
+        event.window = event.owner;
+        event.requestor = wire_read_u32_le(input, offset + 12);
+        event.selection_atom = wire_read_u32_le(input, offset + 16);
+        event.target_atom = wire_read_u32_le(input, offset + 20);
+        event.property_atom = wire_read_u32_le(input, offset + 24);
+        if (x11_wire_id_valid(event.owner) == 0
+            || x11_wire_id_valid(event.requestor) == 0
+            || x11_wire_id_valid(event.selection_atom) == 0
+            || x11_wire_id_valid(event.target_atom) == 0
+            || (event.property_atom != 0
+                && x11_wire_id_valid(event.property_atom) == 0)) { return bad; }
+        event.valid = 1; return event;
+    }
+    if (response == 31) {
+        event.kind = X11EventKind.SelectionNotify;
+        event.time = wire_read_u32_le(input, offset + 4);
+        event.requestor = wire_read_u32_le(input, offset + 8);
+        event.window = event.requestor;
+        event.selection_atom = wire_read_u32_le(input, offset + 12);
+        event.target_atom = wire_read_u32_le(input, offset + 16);
+        event.property_atom = wire_read_u32_le(input, offset + 20);
+        if (x11_wire_id_valid(event.requestor) == 0
+            || x11_wire_id_valid(event.selection_atom) == 0
+            || x11_wire_id_valid(event.target_atom) == 0
+            || (event.property_atom != 0
+                && x11_wire_id_valid(event.property_atom) == 0)) { return bad; }
+        // A successful owner response is delivered through SendEvent and must
+        // carry its synthetic bit. A server-generated no-owner rejection may
+        // use a non-synthetic SelectionNotify with property None.
+        if (event.property_atom != 0 && send_event == 0) { return bad; }
+        event.valid = 1; return event;
+    }
+    if (response == 33) {
+        event.kind = X11EventKind.ClientMessage; event.window = wire_read_u32_le(input, offset + 4);
+        event.message_type = wire_read_u32_le(input, offset + 8);
+        event.data0 = wire_read_u32_le(input, offset + 12);
+        event.valid = 1; return event;
+    }
+    if (response == 34) {
+        event.kind = X11EventKind.MappingNotify;
+        event.mapping_request = event.detail;
+        event.mapping_first_keycode = wire_read_u8(input, offset + 4);
+        event.mapping_keycode_count = wire_read_u8(input, offset + 5);
+        if (event.mapping_request < 0 || event.mapping_request > 2) { return bad; }
+        event.valid = 1; return event;
+    }
+    return bad;
+}

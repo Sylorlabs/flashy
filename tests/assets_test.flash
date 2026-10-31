@@ -1,0 +1,996 @@
+@import("../src/flashy.flash")
+
+fn asset_expect(ok: i32, message: []u8) i32 {
+    if (ok == 0) { _zag_print("FAIL "); _zag_println(message); return 1; }
+    return 0;
+}
+
+fn asset_append_ascii(bytes: *ArrayList[u8], text: []u8) void {
+    let i: i32 = 0;
+    while (i < text.len) { push[u8](bytes, text[i]); i = i + 1; }
+}
+
+fn asset_svg_path_points_equal(left: *SvgResult, right: *SvgResult) i32 {
+    if (left.*.valid == 0 || right.*.valid == 0
+        || len[SvgShape](left.*.document.shapes) != 1 || len[SvgShape](right.*.document.shapes) != 1) { return 0; }
+    let left_shape: SvgShape = get[SvgShape](left.*.document.shapes, 0);
+    let right_shape: SvgShape = get[SvgShape](right.*.document.shapes, 0);
+    if (left_shape.closed != right_shape.closed || len[Point2D](left_shape.points) != len[Point2D](right_shape.points)) {
+        return 0;
+    }
+    let i: i32 = 0;
+    while (i < len[Point2D](left_shape.points)) {
+        if (left_shape.points.data[i].x != right_shape.points.data[i].x
+            || left_shape.points.data[i].y != right_shape.points.data[i].y) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn asset_hex_bytes(text: []u8) ArrayList[u8] {
+    let bytes: ArrayList[u8] = make[u8](text.len / 2);
+    if ((text.len % 2) != 0) { return bytes; }
+    let i: i32 = 0;
+    while (i < text.len) {
+        let high: t27 = svg_hex_digit(text[i] as t27);
+        let low: t27 = svg_hex_digit(text[i + 1] as t27);
+        if (high < 0 || low < 0) { free[u8](&bytes); return make[u8](0); }
+        push[u8](&bytes, (high * 16 + low) as u8);
+        i = i + 2;
+    }
+    return bytes;
+}
+
+fn asset_filter_case(filter: t27, row0a: t27, row0b: t27, row0c: t27,
+    row1a: t27, row1b: t27, row1c: t27) i32 {
+    let encoded: ArrayList[u8] = make[u8](8);
+    push[u8](&encoded, filter as u8); push[u8](&encoded, row0a as u8);
+    push[u8](&encoded, row0b as u8); push[u8](&encoded, row0c as u8);
+    push[u8](&encoded, filter as u8); push[u8](&encoded, row1a as u8);
+    push[u8](&encoded, row1b as u8); push[u8](&encoded, row1c as u8);
+    let ok: i32 = 0;
+    let decoded: ArrayList[u8] = png_unfilter(&encoded, 3, 2, 1, &ok);
+    let valid: i32 = ok == 1 && len[u8](decoded) == 6
+        && decoded.data[0] == 10 && decoded.data[1] == 20 && decoded.data[2] == 30
+        && decoded.data[3] == 15 && decoded.data[4] == 25 && decoded.data[5] == 35;
+    free[u8](&encoded); free[u8](&decoded);
+    return valid;
+}
+
+fn asset_make_png_with_metadata(width: t27, height: t27, bit_depth: t27, color_type: t27, interlace: t27,
+    raw: *ArrayList[u8], palette: *ArrayList[u8], transparency: *ArrayList[u8]) ArrayList[u8] {
+    let output: ArrayList[u8] = make[u8](96);
+    push[u8](&output, 137 as u8); push[u8](&output, 80 as u8); push[u8](&output, 78 as u8);
+    push[u8](&output, 71 as u8); push[u8](&output, 13 as u8); push[u8](&output, 10 as u8);
+    push[u8](&output, 26 as u8); push[u8](&output, 10 as u8);
+    let header: ArrayList[u8] = make[u8](13);
+    png_push_u32_be(&header, width); png_push_u32_be(&header, height);
+    push[u8](&header, bit_depth as u8); push[u8](&header, color_type as u8);
+    push[u8](&header, 0 as u8); push[u8](&header, 0 as u8); push[u8](&header, interlace as u8);
+    png_append_chunk(&output, "IHDR", &header);
+    if (len[u8](palette.*) > 0) { png_append_chunk(&output, "PLTE", palette); }
+    if (len[u8](transparency.*) > 0) { png_append_chunk(&output, "tRNS", transparency); }
+    let compressed: ArrayList[u8] = png_zlib_store(raw);
+    png_append_chunk(&output, "IDAT", &compressed);
+    let empty: ArrayList[u8] = make[u8](0);
+    png_append_chunk(&output, "IEND", &empty);
+    free[u8](&header); free[u8](&compressed); free[u8](&empty);
+    return output;
+}
+
+fn asset_make_png(width: t27, height: t27, color_type: t27, raw: *ArrayList[u8]) ArrayList[u8] {
+    let empty_palette: ArrayList[u8] = make[u8](0);
+    let empty_transparency: ArrayList[u8] = make[u8](0);
+    let output: ArrayList[u8] = asset_make_png_with_metadata(width, height, 8, color_type, 0,
+        raw, &empty_palette, &empty_transparency);
+    free[u8](&empty_palette); free[u8](&empty_transparency);
+    return output;
+}
+
+fn asset_adam7_rgba_raw(surface: *Surface) ArrayList[u8] {
+    let raw: ArrayList[u8] = make[u8](((surface.*.width * 4 + 1) * surface.*.height) as i32);
+    let pass: i32 = 0;
+    while (pass < 7) {
+        let start_x: t27 = png_adam7_start_x(pass); let start_y: t27 = png_adam7_start_y(pass);
+        let step_x: t27 = png_adam7_step_x(pass); let step_y: t27 = png_adam7_step_y(pass);
+        let pass_width: t27 = png_adam7_extent(surface.*.width, start_x, step_x);
+        let pass_height: t27 = png_adam7_extent(surface.*.height, start_y, step_y);
+        let pass_y: t27 = 0;
+        while (pass_y < pass_height) {
+            push[u8](&raw, 0 as u8);
+            let pass_x: t27 = 0;
+            while (pass_x < pass_width) {
+                let source_x: t27 = start_x + pass_x * step_x;
+                let source_y: t27 = start_y + pass_y * step_y;
+                let offset: i32 = ((source_y * surface.*.width + source_x) * 4) as i32;
+                push[u8](&raw, surface.*.pixels.data[offset]); push[u8](&raw, surface.*.pixels.data[offset + 1]);
+                push[u8](&raw, surface.*.pixels.data[offset + 2]); push[u8](&raw, surface.*.pixels.data[offset + 3]);
+                pass_x = pass_x + 1;
+            }
+            pass_y = pass_y + 1;
+        }
+        pass = pass + 1;
+    }
+    return raw;
+}
+
+fn asset_set_u32_be(bytes: *ArrayList[u8], offset: i32, value: t27) void {
+    bytes.*.data[offset] = ((value / 16777216) % 256) as u8;
+    bytes.*.data[offset + 1] = ((value / 65536) % 256) as u8;
+    bytes.*.data[offset + 2] = ((value / 256) % 256) as u8;
+    bytes.*.data[offset + 3] = (value % 256) as u8;
+}
+
+fn asset_copy_bytes(source: *ArrayList[u8]) ArrayList[u8] {
+    let copy: ArrayList[u8] = make[u8](len[u8](source.*));
+    let i: i32 = 0;
+    while (i < len[u8](source.*)) { push[u8](&copy, source.*.data[i]); i = i + 1; }
+    return copy;
+}
+
+fn asset_copy_slice(source: []u8) ArrayList[u8] {
+    let copy: ArrayList[u8] = make[u8](source.len);
+    let i: i32 = 0;
+    while (i < source.len) { push[u8](&copy, source[i]); i = i + 1; }
+    return copy;
+}
+
+fn asset_push_u16_be(out: *ArrayList[u8], value: t27) void {
+    push[u8](out, ((value / 256) % 256) as u8); push[u8](out, (value % 256) as u8);
+}
+
+fn asset_apng_begin(width: t27, height: t27, frame_count: t27, play_count: t27) ArrayList[u8] {
+    let output: ArrayList[u8] = make[u8](256);
+    push[u8](&output, 137 as u8); push[u8](&output, 80 as u8); push[u8](&output, 78 as u8);
+    push[u8](&output, 71 as u8); push[u8](&output, 13 as u8); push[u8](&output, 10 as u8);
+    push[u8](&output, 26 as u8); push[u8](&output, 10 as u8);
+    let header: ArrayList[u8] = make[u8](13);
+    png_push_u32_be(&header, width); png_push_u32_be(&header, height);
+    push[u8](&header, 8 as u8); push[u8](&header, 6 as u8); push[u8](&header, 0 as u8);
+    push[u8](&header, 0 as u8); push[u8](&header, 0 as u8);
+    png_append_chunk(&output, "IHDR", &header);
+    let animation: ArrayList[u8] = make[u8](8);
+    png_push_u32_be(&animation, frame_count); png_push_u32_be(&animation, play_count);
+    png_append_chunk(&output, "acTL", &animation);
+    free[u8](&header); free[u8](&animation);
+    return output;
+}
+
+fn asset_apng_control(output: *ArrayList[u8], sequence: t27, width: t27, height: t27,
+    x: t27, y: t27, delay_numerator: t27, delay_denominator: t27, dispose: t27, blend: t27) void {
+    let control: ArrayList[u8] = make[u8](26);
+    png_push_u32_be(&control, sequence); png_push_u32_be(&control, width); png_push_u32_be(&control, height);
+    png_push_u32_be(&control, x); png_push_u32_be(&control, y);
+    asset_push_u16_be(&control, delay_numerator); asset_push_u16_be(&control, delay_denominator);
+    push[u8](&control, dispose as u8); push[u8](&control, blend as u8);
+    png_append_chunk(output, "fcTL", &control); free[u8](&control);
+}
+
+fn asset_apng_frame_data(output: *ArrayList[u8], sequence: t27, compressed: *ArrayList[u8]) void {
+    let data: ArrayList[u8] = make[u8](len[u8](compressed.*) + 4);
+    png_push_u32_be(&data, sequence);
+    let i: i32 = 0; while (i < len[u8](compressed.*)) { push[u8](&data, compressed.*.data[i]); i = i + 1; }
+    png_append_chunk(output, "fdAT", &data); free[u8](&data);
+}
+
+fn asset_apng_end(output: *ArrayList[u8]) void {
+    let empty: ArrayList[u8] = make[u8](0); png_append_chunk(output, "IEND", &empty); free[u8](&empty);
+}
+
+fn main() i32 {
+    let failures: i32 = 0;
+
+    let jpeg_bytes: ArrayList[u8] = asset_hex_bytes("ffd8ffe000104a46494600010100000000000000ffdb0043000302020302020303030304030304050805050404050a070706080c0a0c0c0b0a0b0b0d0e12100d0e110e0b0b1016101113141515150c0f171816141812141514ffdb00430103040405040509050509140d0b0d1414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414ffc00011080002000203011100021101031101ffc40014000100000000000000000000000000000007ffc40014100100000000000000000000000000000000ffc4001501010100000000000000000000000000000008ffc40014110100000000000000000000000000000000ffda000c03010002110311003f003c1603ffd9");
+    let jpeg_info: JpegInfoResult = jpeg_probe(jpeg_bytes.data[0..jpeg_bytes.len]);
+    failures = failures + asset_expect(jpeg_info.valid == 1 && jpeg_info.error == JpegError.None
+        && jpeg_info.width == 2 && jpeg_info.height == 2 && jpeg_info.components == 3
+        && jpeg_info.scans == 1, "baseline JPEG marker and scan contract");
+    let jpeg_decoded: JpegDecodeResult = jpeg_decode(jpeg_bytes.data[0..jpeg_bytes.len]);
+    failures = failures + asset_expect(jpeg_decoded.valid == 1 && jpeg_decoded.error == JpegError.None
+        && jpeg_decoded.width == 2 && jpeg_decoded.height == 2, "baseline JPEG decodes to a CPU surface");
+    if (jpeg_decoded.valid == 1) {
+        failures = failures + asset_expect(jpeg_decoded.surface.pixels.data[0] >= 198
+            && jpeg_decoded.surface.pixels.data[0] <= 210 && jpeg_decoded.surface.pixels.data[1] >= 45
+            && jpeg_decoded.surface.pixels.data[1] <= 57 && jpeg_decoded.surface.pixels.data[2] >= 96
+            && jpeg_decoded.surface.pixels.data[2] <= 108 && jpeg_decoded.surface.pixels.data[3] == 255,
+            "baseline JPEG deterministic YCbCr conversion");
+    }
+    let jpeg_write_ok: i32 = _zag_write_file(".build/assets_baseline.jpg", jpeg_bytes.data[0..jpeg_bytes.len]);
+    let loaded_jpeg: JpegDecodeResult = jpeg_load_file(".build/assets_baseline.jpg");
+    failures = failures + asset_expect(jpeg_write_ok == 0 && loaded_jpeg.valid == 1
+        && surface_checksum(&loaded_jpeg.surface) == surface_checksum(&jpeg_decoded.surface),
+        "baseline JPEG filesystem loading matches memory decode");
+    jpeg_bytes.data[159] = 194 as u8;
+    let progressive_jpeg: JpegInfoResult = jpeg_probe(jpeg_bytes.data[0..jpeg_bytes.len]);
+    let progressive_decode_pending: JpegDecodeResult = jpeg_decode(jpeg_bytes.data[0..jpeg_bytes.len]);
+    failures = failures + asset_expect(progressive_jpeg.valid == 1 && progressive_jpeg.progressive == 1
+        && progressive_decode_pending.valid == 0 && progressive_decode_pending.error == JpegError.BadScan,
+        "sequential scan parameters relabeled as progressive are rejected");
+    jpeg_bytes.data[159] = 192 as u8;
+    let truncated_jpeg: JpegInfoResult = jpeg_probe(jpeg_bytes.data[0..280]);
+    failures = failures + asset_expect(truncated_jpeg.valid == 0
+        && truncated_jpeg.error == JpegError.Truncated, "truncated JPEG entropy data is bounded");
+    let jpeg_prefix: i32 = 0; let all_prefixes_rejected: i32 = 1;
+    while (jpeg_prefix < jpeg_bytes.len) {
+        let prefix_result: JpegDecodeResult = jpeg_decode(jpeg_bytes.data[0..jpeg_prefix]);
+        if (prefix_result.valid == 1) { all_prefixes_rejected = 0; }
+        jpeg_free(&prefix_result); jpeg_prefix = jpeg_prefix + 1;
+    }
+    failures = failures + asset_expect(all_prefixes_rejected == 1,
+        "every truncated JPEG prefix returns a bounded typed failure");
+    let missing_jpeg: JpegInfoResult = jpeg_probe_file(".build/does-not-exist.jpg");
+    failures = failures + asset_expect(missing_jpeg.valid == 0 && missing_jpeg.error == JpegError.Io,
+        "missing JPEG returns typed IO error");
+    let gray_jpeg_bytes: ArrayList[u8] = asset_hex_bytes("ffd8ffe000104a46494600010100000000000000ffdb004300030202020202030202020303030304060404040404080606050609080a0a090809090a0c0f0c0a0b0e0b09090d110d0e0f101011100a0c12131210130f101010ffc0000b080007000901011100ffc4001500010100000000000000000000000000000006ffc4001a100000070000000000000000000000000000020405195592ffda0008010100003f00a989963af43b2044cb1d7a1d907fffd9");
+    let gray_jpeg: JpegDecodeResult = jpeg_decode(gray_jpeg_bytes.data[0..gray_jpeg_bytes.len]);
+    failures = failures + asset_expect(gray_jpeg.valid == 1 && gray_jpeg.width == 9 && gray_jpeg.height == 7,
+        "grayscale JPEG with partial edge block decodes");
+    let y420_jpeg_bytes: ArrayList[u8] = asset_hex_bytes("ffd8ffe000104a46494600010100000000000000ffdb0043000302020302020303030304030304050805050404050a070706080c0a0c0c0b0a0b0b0d0e12100d0e110e0b0b1016101113141515150c0f171816141812141514ffdb00430103040405040509050509140d0b0d1414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414ffc00011080009001103012200021101031101ffc4001700000301000000000000000000000000000008090affc4002110000101070500000000000000000000000005020306185593d304175492d2ffc400160101010100000000000000000000000000070408ffc4002b1100000206070900000000000000000000021100010607121403051316515292041721223132334161ffda000c03010002110311003f0051773d2b8face8c7a2af4a745d5145befb1114cd2d880f6dd032f5148c9806a8ed0cc6b5f4b32f5f569236bb7d33d597bca42968e08393c90c46467d812c38e28a84a745d5145befb100d7819e6e0549945a90c775ecee51ea5a7fffd9");
+    let y420_jpeg: JpegDecodeResult = jpeg_decode(y420_jpeg_bytes.data[0..y420_jpeg_bytes.len]);
+    failures = failures + asset_expect(y420_jpeg.valid == 1 && y420_jpeg.width == 17 && y420_jpeg.height == 9,
+        "4:2:0 JPEG sampling and partial MCU edges decode");
+    failures = failures + asset_expect(gray_jpeg.valid == 1
+        && surface_checksum(&gray_jpeg.surface) == 370201457, "grayscale JPEG deterministic pixel golden");
+    failures = failures + asset_expect(y420_jpeg.valid == 1
+        && surface_checksum(&y420_jpeg.surface) == 573148659, "4:2:0 JPEG deterministic pixel golden");
+    let baseline_multiscan_embedded: []u8 = _zag_read_file("tests/fixtures/baseline-multiscan.jpg");
+    let baseline_multiscan_bytes: ArrayList[u8] = asset_copy_slice(baseline_multiscan_embedded);
+    let baseline_multiscan_info: JpegInfoResult = jpeg_probe(baseline_multiscan_bytes.data[0..baseline_multiscan_bytes.len]);
+    let baseline_multiscan: JpegDecodeResult = jpeg_decode(baseline_multiscan_bytes.data[0..baseline_multiscan_bytes.len]);
+    failures = failures + asset_expect(baseline_multiscan_info.valid == 1 && baseline_multiscan_info.progressive == 0
+        && baseline_multiscan_info.scans == 3 && baseline_multiscan.valid == 1 && baseline_multiscan.width == 8
+        && baseline_multiscan.height == 8 && surface_checksum(&baseline_multiscan.surface) == 645158062,
+        "three-scan non-interleaved baseline JPEG decodes deterministically");
+    let progressive_gray_embedded: []u8 = _zag_read_file("tests/fixtures/progressive-gray.jpg");
+    let progressive_gray_bytes: ArrayList[u8] = asset_copy_slice(progressive_gray_embedded);
+    let progressive_gray_info: JpegInfoResult = jpeg_probe(progressive_gray_bytes.data[0..progressive_gray_bytes.len]);
+    let progressive_gray: JpegDecodeResult = jpeg_decode(progressive_gray_bytes.data[0..progressive_gray_bytes.len]);
+    failures = failures + asset_expect(progressive_gray_info.valid == 1 && progressive_gray_info.progressive == 1
+        && progressive_gray_info.scans == 6 && progressive_gray.valid == 1 && progressive_gray.width == 9
+        && progressive_gray.height == 7 && surface_checksum(&progressive_gray.surface) == 370201457,
+        "six-scan progressive grayscale JPEG decodes deterministically");
+    let progressive_color_embedded: []u8 = _zag_read_file("tests/fixtures/progressive420.jpg");
+    let progressive_color_bytes: ArrayList[u8] = asset_copy_slice(progressive_color_embedded);
+    let progressive_color_info: JpegInfoResult = jpeg_probe(progressive_color_bytes.data[0..progressive_color_bytes.len]);
+    let progressive_color: JpegDecodeResult = jpeg_decode(progressive_color_bytes.data[0..progressive_color_bytes.len]);
+    failures = failures + asset_expect(progressive_color_info.valid == 1 && progressive_color_info.progressive == 1
+        && progressive_color_info.scans == 10 && progressive_color.valid == 1 && progressive_color.width == 17
+        && progressive_color.height == 9 && surface_checksum(&progressive_color.surface) == 544336024,
+        "ten-scan progressive 4:2:0 JPEG decodes deterministically");
+    progressive_color_bytes.data[648] = 48 as u8;
+    let invalid_refinement: JpegDecodeResult = jpeg_decode(progressive_color_bytes.data[0..progressive_color_bytes.len]);
+    failures = failures + asset_expect(invalid_refinement.valid == 0 && invalid_refinement.error == JpegError.BadScan,
+        "out-of-order progressive successive approximation is rejected");
+    jpeg_free(&invalid_refinement); progressive_color_bytes.data[648] = 16 as u8;
+    progressive_color_bytes.data[231] = 9 as u8;
+    let unknown_scan_component: JpegDecodeResult = jpeg_decode(progressive_color_bytes.data[0..progressive_color_bytes.len]);
+    failures = failures + asset_expect(unknown_scan_component.valid == 0 && unknown_scan_component.error == JpegError.BadScan,
+        "progressive scans cannot name a component absent from the frame");
+    jpeg_free(&unknown_scan_component); progressive_color_bytes.data[231] = 1 as u8;
+    let progressive_write_ok: i32 = _zag_write_file(".build/assets_progressive.jpg",
+        progressive_color_bytes.data[0..progressive_color_bytes.len]);
+    failures = failures + asset_expect(progressive_write_ok == 0, "progressive JPEG fixture is available to CLI validation");
+    let progressive_prefix: i32 = 0; let progressive_prefixes_rejected: i32 = 1;
+    while (progressive_prefix < progressive_color_bytes.len) {
+        let prefix_result: JpegDecodeResult = jpeg_decode(progressive_color_bytes.data[0..progressive_prefix]);
+        if (prefix_result.valid != 0) { progressive_prefixes_rejected = 0; }
+        jpeg_free(&prefix_result); progressive_prefix = progressive_prefix + 1;
+    }
+    failures = failures + asset_expect(progressive_prefixes_rejected == 1,
+        "every truncated progressive JPEG prefix is rejected without a surface");
+    let restart_jpeg_bytes: ArrayList[u8] = asset_hex_bytes("ffd8ffdb00430001010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101ffc0000b080008001001011100ffc40014000100000000000000000000000000000000ffc40014100100000000000000000000000000000000ffdd00040001ffda0008010100003f003fffd03fffd9");
+    let restart_jpeg: JpegDecodeResult = jpeg_decode(restart_jpeg_bytes.data[0..restart_jpeg_bytes.len]);
+    failures = failures + asset_expect(restart_jpeg.valid == 1 && restart_jpeg.width == 16
+        && restart_jpeg.height == 8 && restart_jpeg.surface.pixels.data[0] == 128
+        && restart_jpeg.surface.pixels.data[15 * 4] == 128, "JPEG restart interval resets entropy and DC state");
+    restart_jpeg_bytes.data[restart_jpeg_bytes.len - 5] = 210 as u8;
+    let wrong_restart_jpeg: JpegDecodeResult = jpeg_decode(restart_jpeg_bytes.data[0..restart_jpeg_bytes.len]);
+    failures = failures + asset_expect(wrong_restart_jpeg.valid == 0
+        && wrong_restart_jpeg.error == JpegError.Entropy, "out-of-sequence JPEG restart marker is rejected");
+
+    let raw: ArrayList[u8] = make[u8](12);
+    push[u8](&raw, 255 as u8); push[u8](&raw, 64 as u8); push[u8](&raw, 0 as u8); push[u8](&raw, 128 as u8);
+    push[u8](&raw, 10 as u8); push[u8](&raw, 20 as u8); push[u8](&raw, 30 as u8); push[u8](&raw, 255 as u8);
+    push[u8](&raw, 91 as u8); push[u8](&raw, 92 as u8); push[u8](&raw, 93 as u8); push[u8](&raw, 94 as u8);
+    let raw_decoded: RawPixelResult = raw_rgba8_decode(raw.data[0..raw.len], 2, 1, 12, 0);
+    failures = failures + asset_expect(raw_decoded.valid == 1 && raw_decoded.error == AssetError.None
+        && raw_decoded.source_bytes == 12 && raw_decoded.surface.width == 2 && raw_decoded.surface.height == 1,
+        "raw RGBA8 dimensions and padded stride decode");
+    failures = failures + asset_expect(raw_decoded.surface.pixels.data[0] == 128
+        && raw_decoded.surface.pixels.data[1] == 32 && raw_decoded.surface.pixels.data[2] == 0
+        && raw_decoded.surface.pixels.data[3] == 128 && raw_decoded.surface.pixels.data[4] == 10
+        && raw_decoded.surface.pixels.data[5] == 20 && raw_decoded.surface.pixels.data[6] == 30
+        && raw_decoded.surface.pixels.data[7] == 255, "straight RGBA8 becomes premultiplied renderer pixels");
+    failures = failures + asset_expect(surface_checksum(&raw_decoded.surface) == 144691024,
+        "raw RGBA8 decode matches deterministic golden");
+
+    let invalid_premultiplied: ArrayList[u8] = make[u8](4);
+    push[u8](&invalid_premultiplied, 200 as u8); push[u8](&invalid_premultiplied, 0 as u8);
+    push[u8](&invalid_premultiplied, 0 as u8); push[u8](&invalid_premultiplied, 100 as u8);
+    let invalid_raw: RawPixelResult = raw_rgba8_decode(
+        invalid_premultiplied.data[0..invalid_premultiplied.len], 1, 1, 4, 1);
+    failures = failures + asset_expect(invalid_raw.valid == 0
+        && invalid_raw.error == AssetError.InvalidPremultipliedData && invalid_raw.error_offset == 0,
+        "invalid premultiplied channels return typed error");
+    let short_raw: RawPixelResult = raw_rgba8_decode(invalid_premultiplied.data[0..3], 1, 1, 4, 0);
+    failures = failures + asset_expect(short_raw.valid == 0 && short_raw.error == AssetError.TruncatedData
+        && short_raw.error_offset == 3, "truncated raw pixels return typed error and offset");
+    let bad_stride: RawPixelResult = raw_rgba8_decode(invalid_premultiplied.data[0..4], 1, 1, 3, 0);
+    failures = failures + asset_expect(bad_stride.valid == 0 && bad_stride.error == AssetError.InvalidStride,
+        "undersized raw pixel stride is rejected");
+    let trailing_raw: RawPixelResult = raw_rgba8_decode(raw.data[0..raw.len], 1, 1, 4, 0);
+    failures = failures + asset_expect(trailing_raw.valid == 0 && trailing_raw.error == AssetError.TrailingData
+        && trailing_raw.error_offset == 4, "trailing raw pixel bytes are rejected at the expected offset");
+    let bad_dimensions: RawPixelResult = raw_rgba8_decode(invalid_premultiplied.data[0..4], 0, 1, 4, 0);
+    failures = failures + asset_expect(bad_dimensions.valid == 0
+        && bad_dimensions.error == AssetError.InvalidDimensions, "zero-sized raw pixel assets are rejected");
+    let missing_raw: RawPixelResult = raw_rgba8_load_file("missing.rgba", 1, 1, 4, 0);
+    failures = failures + asset_expect(missing_raw.valid == 0 && missing_raw.error == AssetError.Io,
+        "missing raw pixel file returns typed IO error");
+
+    failures = failures + asset_expect(asset_filter_case(0, 10, 20, 30, 15, 25, 35) == 1,
+        "PNG None filter reconstructs scanlines");
+    failures = failures + asset_expect(asset_filter_case(1, 10, 10, 10, 15, 10, 10) == 1,
+        "PNG Sub filter reconstructs scanlines");
+    failures = failures + asset_expect(asset_filter_case(2, 10, 20, 30, 5, 5, 5) == 1,
+        "PNG Up filter reconstructs scanlines");
+    failures = failures + asset_expect(asset_filter_case(3, 10, 15, 20, 10, 8, 8) == 1,
+        "PNG Average filter reconstructs scanlines");
+    failures = failures + asset_expect(asset_filter_case(4, 10, 10, 10, 5, 5, 5) == 1,
+        "PNG Paeth filter reconstructs scanlines");
+
+    let fixed_zlib: ArrayList[u8] = asset_hex_bytes("78014b4acc49cc4b4e4dd12d492dca4b2caad4cdc94ccf28d14d1a151e0cc20c8c4ccc2cac6cec1c9c5cdc3cbc7cfc028242c222a262e2129252e44901005755a29a");
+    let fixed_inflate: PngInflateResult = png_zlib_inflate(fixed_zlib.data[0..fixed_zlib.len], 495);
+    failures = failures + asset_expect(fixed_inflate.valid == 1 && len[u8](fixed_inflate.bytes) == 495
+        && fixed_inflate.bytes.data[0] == 98 && fixed_inflate.bytes.data[7] == 100
+        && fixed_inflate.bytes.data[487] == 19 && fixed_inflate.bytes.data[494] == 26,
+        "fixed-Huffman DEFLATE fixture decodes exactly");
+    let dynamic_zlib: ArrayList[u8] = asset_hex_bytes("78da1590db42c3300c4325dbb9a71d03b6b574f0ff9f89f29087288e251df442b354816e0596f9b9017e371aa49334a27be06f80397f584bf4b9045683e744f3ea6640bec26057f141ff76a33f50dbcccddd301c52e8a111c247ad8d3d012844507edabd1cd79ecd114d4f1939397faa334c073c2607ef457926dacb31ceec2492fe28058772f35dc9d46f9cc9deccc0ce125d25463ca65c8021e7a874829bdf8cb5413926f8ab352cd8edd8d57989978c89fd38c0b83ca9b7dcf8b614f7c5a56f2ae44acfb5388463c02abe50de4dd2ce0dbb4cead64b82a90cf1128cbea04295f40f6c66dae01696f2c26dbeedea0a9f28534d98728ceda9617a81665c5cae16dc9f283d25bb9d561753dd175b3590574487d23a536da7db28828f86e2af724230ff01661a09e4");
+    let dynamic_inflate: PngInflateResult = png_zlib_inflate(dynamic_zlib.data[0..dynamic_zlib.len], 500);
+    failures = failures + asset_expect(dynamic_inflate.valid == 1 && len[u8](dynamic_inflate.bytes) == 500
+        && dynamic_inflate.bytes.data[0] == 0 && dynamic_inflate.bytes.data[7] == 8
+        && dynamic_inflate.bytes.data[492] == 3 && dynamic_inflate.bytes.data[499] == 1,
+        "dynamic-Huffman DEFLATE fixture decodes exactly");
+
+    let png_surface: Surface = surface_new(2, 2);
+    png_surface.pixels.data[0] = 10 as u8; png_surface.pixels.data[1] = 20 as u8;
+    png_surface.pixels.data[2] = 30 as u8; png_surface.pixels.data[3] = 255 as u8;
+    png_surface.pixels.data[4] = 128 as u8; png_surface.pixels.data[5] = 0 as u8;
+    png_surface.pixels.data[6] = 0 as u8; png_surface.pixels.data[7] = 128 as u8;
+    png_surface.pixels.data[8] = 0 as u8; png_surface.pixels.data[9] = 0 as u8;
+    png_surface.pixels.data[10] = 0 as u8; png_surface.pixels.data[11] = 0 as u8;
+    png_surface.pixels.data[12] = 255 as u8; png_surface.pixels.data[13] = 0 as u8;
+    png_surface.pixels.data[14] = 64 as u8; png_surface.pixels.data[15] = 255 as u8;
+    let encoded_png: PngEncodeResult = png_encode_surface(&png_surface);
+    let decoded_png: PngResult = png_decode(encoded_png.bytes.data[0..encoded_png.bytes.len]);
+    failures = failures + asset_expect(encoded_png.valid == 1 && encoded_png.error == PngError.None
+        && encoded_png.bytes.len > 60 && encoded_png.bytes.data[0] == 137 && encoded_png.bytes.data[1] == 80,
+        "deterministic RGBA8 PNG encoder emits a bounded PNG stream");
+    failures = failures + asset_expect(decoded_png.valid == 1 && decoded_png.error == PngError.None
+        && decoded_png.width == 2 && decoded_png.height == 2
+        && surface_checksum(&decoded_png.surface) == surface_checksum(&png_surface),
+        "stored-DEFLATE PNG round trip preserves premultiplied renderer pixels");
+    let png_write_ok: i32 = _zag_write_file(".build/assets_roundtrip.png",
+        encoded_png.bytes.data[0..encoded_png.bytes.len]);
+    let loaded_png: PngResult = png_load_file(".build/assets_roundtrip.png");
+    failures = failures + asset_expect(png_write_ok == 0 && loaded_png.valid == 1
+        && surface_checksum(&loaded_png.surface) == surface_checksum(&png_surface),
+        "PNG binary filesystem loading preserves decoded pixels");
+    let bad_signature_png: PngResult = png_decode("not-a-png");
+    failures = failures + asset_expect(bad_signature_png.valid == 0
+        && bad_signature_png.error == PngError.BadSignature, "invalid PNG signature returns typed error");
+    let gray_raw: ArrayList[u8] = make[u8](2); push[u8](&gray_raw, 0 as u8); push[u8](&gray_raw, 100 as u8);
+    let gray_png_bytes: ArrayList[u8] = asset_make_png(1, 1, 0, &gray_raw);
+    let gray_png: PngResult = png_decode(gray_png_bytes.data[0..gray_png_bytes.len]);
+    failures = failures + asset_expect(gray_png.valid == 1 && gray_png.surface.pixels.data[0] == 100
+        && gray_png.surface.pixels.data[1] == 100 && gray_png.surface.pixels.data[2] == 100
+        && gray_png.surface.pixels.data[3] == 255, "8-bit grayscale PNG expands to opaque RGBA");
+    let rgb_raw: ArrayList[u8] = make[u8](4); push[u8](&rgb_raw, 0 as u8); push[u8](&rgb_raw, 10 as u8);
+    push[u8](&rgb_raw, 20 as u8); push[u8](&rgb_raw, 30 as u8);
+    let rgb_png_bytes: ArrayList[u8] = asset_make_png(1, 1, 2, &rgb_raw);
+    let rgb_png: PngResult = png_decode(rgb_png_bytes.data[0..rgb_png_bytes.len]);
+    failures = failures + asset_expect(rgb_png.valid == 1 && rgb_png.surface.pixels.data[0] == 10
+        && rgb_png.surface.pixels.data[1] == 20 && rgb_png.surface.pixels.data[2] == 30
+        && rgb_png.surface.pixels.data[3] == 255, "8-bit RGB PNG expands to opaque RGBA");
+    let gray_alpha_raw: ArrayList[u8] = make[u8](3); push[u8](&gray_alpha_raw, 0 as u8);
+    push[u8](&gray_alpha_raw, 200 as u8); push[u8](&gray_alpha_raw, 128 as u8);
+    let gray_alpha_bytes: ArrayList[u8] = asset_make_png(1, 1, 4, &gray_alpha_raw);
+    let gray_alpha_png: PngResult = png_decode(gray_alpha_bytes.data[0..gray_alpha_bytes.len]);
+    failures = failures + asset_expect(gray_alpha_png.valid == 1 && gray_alpha_png.surface.pixels.data[0] == 100
+        && gray_alpha_png.surface.pixels.data[1] == 100 && gray_alpha_png.surface.pixels.data[2] == 100
+        && gray_alpha_png.surface.pixels.data[3] == 128, "8-bit grayscale-alpha PNG premultiplies into RGBA");
+
+    let packed_gray_raw: ArrayList[u8] = make[u8](2); push[u8](&packed_gray_raw, 0 as u8);
+    push[u8](&packed_gray_raw, 170 as u8);
+    let no_metadata: ArrayList[u8] = make[u8](0);
+    let packed_gray_bytes: ArrayList[u8] = asset_make_png_with_metadata(8, 1, 1, 0, 0,
+        &packed_gray_raw, &no_metadata, &no_metadata);
+    let packed_gray_png: PngResult = png_decode(packed_gray_bytes.data[0..packed_gray_bytes.len]);
+    failures = failures + asset_expect(packed_gray_png.valid == 1
+        && packed_gray_png.surface.pixels.data[0] == 255 && packed_gray_png.surface.pixels.data[4] == 0
+        && packed_gray_png.surface.pixels.data[28] == 0, "packed 1-bit grayscale samples expand in MSB order");
+
+    let palette_raw: ArrayList[u8] = make[u8](2); push[u8](&palette_raw, 0 as u8); push[u8](&palette_raw, 27 as u8);
+    let palette_data: ArrayList[u8] = make[u8](12);
+    push[u8](&palette_data, 255 as u8); push[u8](&palette_data, 0 as u8); push[u8](&palette_data, 0 as u8);
+    push[u8](&palette_data, 0 as u8); push[u8](&palette_data, 255 as u8); push[u8](&palette_data, 0 as u8);
+    push[u8](&palette_data, 0 as u8); push[u8](&palette_data, 0 as u8); push[u8](&palette_data, 255 as u8);
+    push[u8](&palette_data, 255 as u8); push[u8](&palette_data, 255 as u8); push[u8](&palette_data, 255 as u8);
+    let palette_alpha: ArrayList[u8] = make[u8](4);
+    push[u8](&palette_alpha, 255 as u8); push[u8](&palette_alpha, 128 as u8);
+    push[u8](&palette_alpha, 0 as u8); push[u8](&palette_alpha, 255 as u8);
+    let palette_png_bytes: ArrayList[u8] = asset_make_png_with_metadata(4, 1, 2, 3, 0,
+        &palette_raw, &palette_data, &palette_alpha);
+    let palette_png: PngResult = png_decode(palette_png_bytes.data[0..palette_png_bytes.len]);
+    failures = failures + asset_expect(palette_png.valid == 1
+        && palette_png.surface.pixels.data[0] == 255 && palette_png.surface.pixels.data[3] == 255
+        && palette_png.surface.pixels.data[5] == 128 && palette_png.surface.pixels.data[7] == 128
+        && palette_png.surface.pixels.data[8] == 0 && palette_png.surface.pixels.data[11] == 0
+        && palette_png.surface.pixels.data[12] == 255 && palette_png.surface.pixels.data[15] == 255,
+        "packed palette PNG applies PLTE and tRNS into premultiplied RGBA");
+
+    let gray_trns_raw: ArrayList[u8] = make[u8](2); push[u8](&gray_trns_raw, 0 as u8);
+    push[u8](&gray_trns_raw, 165 as u8);
+    let gray_trns_data: ArrayList[u8] = make[u8](2); push[u8](&gray_trns_data, 0 as u8); push[u8](&gray_trns_data, 5 as u8);
+    let gray_trns_bytes: ArrayList[u8] = asset_make_png_with_metadata(2, 1, 4, 0, 0,
+        &gray_trns_raw, &no_metadata, &gray_trns_data);
+    let gray_trns_png: PngResult = png_decode(gray_trns_bytes.data[0..gray_trns_bytes.len]);
+    failures = failures + asset_expect(gray_trns_png.valid == 1
+        && gray_trns_png.surface.pixels.data[0] == 170 && gray_trns_png.surface.pixels.data[3] == 255
+        && gray_trns_png.surface.pixels.data[4] == 0 && gray_trns_png.surface.pixels.data[7] == 0,
+        "packed grayscale tRNS compares source samples before expansion");
+
+    let rgba16_raw: ArrayList[u8] = make[u8](9); push[u8](&rgba16_raw, 0 as u8);
+    push[u8](&rgba16_raw, 255 as u8); push[u8](&rgba16_raw, 255 as u8);
+    push[u8](&rgba16_raw, 128 as u8); push[u8](&rgba16_raw, 0 as u8);
+    push[u8](&rgba16_raw, 0 as u8); push[u8](&rgba16_raw, 0 as u8);
+    push[u8](&rgba16_raw, 128 as u8); push[u8](&rgba16_raw, 0 as u8);
+    let rgba16_bytes: ArrayList[u8] = asset_make_png_with_metadata(1, 1, 16, 6, 0,
+        &rgba16_raw, &no_metadata, &no_metadata);
+    let rgba16_png: PngResult = png_decode(rgba16_bytes.data[0..rgba16_bytes.len]);
+    failures = failures + asset_expect(rgba16_png.valid == 1
+        && rgba16_png.surface.pixels.data[0] == 128 && rgba16_png.surface.pixels.data[1] == 64
+        && rgba16_png.surface.pixels.data[2] == 0 && rgba16_png.surface.pixels.data[3] == 128,
+        "16-bit RGBA samples scale and premultiply deterministically");
+
+    let adam7_surface: Surface = surface_new(9, 9);
+    let adam7_y: t27 = 0;
+    while (adam7_y < 9) {
+        let adam7_x: t27 = 0;
+        while (adam7_x < 9) {
+            let adam7_offset: i32 = ((adam7_y * 9 + adam7_x) * 4) as i32;
+            adam7_surface.pixels.data[adam7_offset] = ((adam7_x * 27) % 256) as u8;
+            adam7_surface.pixels.data[adam7_offset + 1] = ((adam7_y * 27) % 256) as u8;
+            adam7_surface.pixels.data[adam7_offset + 2] = (((adam7_x + adam7_y) * 13) % 256) as u8;
+            adam7_surface.pixels.data[adam7_offset + 3] = 255 as u8;
+            adam7_x = adam7_x + 1;
+        }
+        adam7_y = adam7_y + 1;
+    }
+    let adam7_raw: ArrayList[u8] = asset_adam7_rgba_raw(&adam7_surface);
+    let adam7_bytes: ArrayList[u8] = asset_make_png_with_metadata(9, 9, 8, 6, 1,
+        &adam7_raw, &no_metadata, &no_metadata);
+    let adam7_png: PngResult = png_decode(adam7_bytes.data[0..adam7_bytes.len]);
+    failures = failures + asset_expect(adam7_png.valid == 1 && adam7_png.width == 9 && adam7_png.height == 9
+        && surface_checksum(&adam7_png.surface) == surface_checksum(&adam7_surface),
+        "Adam7 seven-pass reconstruction preserves deterministic RGBA pixels");
+    let bad_adam7_raw: ArrayList[u8] = asset_copy_bytes(&adam7_raw);
+    bad_adam7_raw.data[0] = 5 as u8;
+    let bad_adam7_bytes: ArrayList[u8] = asset_make_png_with_metadata(9, 9, 8, 6, 1,
+        &bad_adam7_raw, &no_metadata, &no_metadata);
+    let bad_adam7_png: PngResult = png_decode(bad_adam7_bytes.data[0..bad_adam7_bytes.len]);
+    failures = failures + asset_expect(bad_adam7_png.valid == 0 && bad_adam7_png.error == PngError.Filter,
+        "invalid filter in an Adam7 pass returns typed filter error");
+    let unsupported_interlace: ArrayList[u8] = asset_copy_bytes(&encoded_png.bytes);
+    unsupported_interlace.data[28] = 2 as u8;
+    asset_set_u32_be(&unsupported_interlace, 29, png_crc_chunk(unsupported_interlace.data[0..unsupported_interlace.len], 12, 16, 13));
+    let interlace_result: PngResult = png_decode(unsupported_interlace.data[0..unsupported_interlace.len]);
+    failures = failures + asset_expect(interlace_result.valid == 0
+        && interlace_result.error == PngError.UnsupportedInterlace, "illegal PNG interlace method returns typed error");
+
+    let apng_bytes: ArrayList[u8] = asset_apng_begin(3, 1, 4, 2);
+    let apng_frame1_raw: ArrayList[u8] = make[u8](13); push[u8](&apng_frame1_raw, 0 as u8);
+    let apng_pixel: i32 = 0;
+    while (apng_pixel < 3) {
+        push[u8](&apng_frame1_raw, 255 as u8); push[u8](&apng_frame1_raw, 0 as u8);
+        push[u8](&apng_frame1_raw, 0 as u8); push[u8](&apng_frame1_raw, 255 as u8);
+        apng_pixel = apng_pixel + 1;
+    }
+    let apng_frame1_data: ArrayList[u8] = png_zlib_store(&apng_frame1_raw);
+    asset_apng_control(&apng_bytes, 0, 3, 1, 0, 0, 1, 10, 0, 0);
+    png_append_chunk(&apng_bytes, "IDAT", &apng_frame1_data);
+
+    let apng_frame2_raw: ArrayList[u8] = make[u8](5); push[u8](&apng_frame2_raw, 0 as u8);
+    push[u8](&apng_frame2_raw, 0 as u8); push[u8](&apng_frame2_raw, 255 as u8);
+    push[u8](&apng_frame2_raw, 0 as u8); push[u8](&apng_frame2_raw, 128 as u8);
+    let apng_frame2_data: ArrayList[u8] = png_zlib_store(&apng_frame2_raw);
+    asset_apng_control(&apng_bytes, 1, 1, 1, 1, 0, 2, 0, 2, 1);
+    asset_apng_frame_data(&apng_bytes, 2, &apng_frame2_data);
+
+    let apng_frame3_raw: ArrayList[u8] = make[u8](5); push[u8](&apng_frame3_raw, 0 as u8);
+    push[u8](&apng_frame3_raw, 0 as u8); push[u8](&apng_frame3_raw, 0 as u8);
+    push[u8](&apng_frame3_raw, 255 as u8); push[u8](&apng_frame3_raw, 255 as u8);
+    let apng_frame3_data: ArrayList[u8] = png_zlib_store(&apng_frame3_raw);
+    asset_apng_control(&apng_bytes, 3, 1, 1, 2, 0, 3, 100, 1, 0);
+    asset_apng_frame_data(&apng_bytes, 4, &apng_frame3_data);
+
+    let apng_frame4_raw: ArrayList[u8] = make[u8](5); push[u8](&apng_frame4_raw, 0 as u8);
+    push[u8](&apng_frame4_raw, 0 as u8); push[u8](&apng_frame4_raw, 0 as u8);
+    push[u8](&apng_frame4_raw, 0 as u8); push[u8](&apng_frame4_raw, 0 as u8);
+    let apng_frame4_data: ArrayList[u8] = png_zlib_store(&apng_frame4_raw);
+    asset_apng_control(&apng_bytes, 5, 1, 1, 0, 0, 1, 4, 0, 1);
+    asset_apng_frame_data(&apng_bytes, 6, &apng_frame4_data);
+    asset_apng_end(&apng_bytes);
+
+    let animation: PngAnimationResult = png_decode_animation(apng_bytes.data[0..apng_bytes.len]);
+    failures = failures + asset_expect(animation.valid == 1 && animation.error == PngError.None
+        && animation.width == 3 && animation.height == 1 && animation.play_count == 2
+        && len[PngAnimationFrame](animation.frames) == 4, "APNG frame count, canvas, and play count parse");
+    failures = failures + asset_expect(animation.frames.data[0].delay_ms == 100
+        && animation.frames.data[1].delay_ms == 20 && animation.frames.data[1].delay_denominator == 100
+        && animation.frames.data[2].delay_ms == 30 && animation.frames.data[3].delay_ms == 250,
+        "APNG rational delays normalize denominator zero and deterministic milliseconds");
+    failures = failures + asset_expect(animation.frames.data[0].surface.pixels.data[0] == 255
+        && animation.frames.data[0].surface.pixels.data[4] == 255
+        && animation.frames.data[1].surface.pixels.data[4] == 127
+        && animation.frames.data[1].surface.pixels.data[5] == 128
+        && animation.frames.data[1].surface.pixels.data[7] == 255,
+        "APNG SOURCE and premultiplied OVER blending compose frames");
+    failures = failures + asset_expect(animation.frames.data[2].surface.pixels.data[4] == 255
+        && animation.frames.data[2].surface.pixels.data[5] == 0
+        && animation.frames.data[2].surface.pixels.data[8] == 0
+        && animation.frames.data[2].surface.pixels.data[10] == 255
+        && animation.frames.data[3].surface.pixels.data[4] == 255
+        && animation.frames.data[3].surface.pixels.data[11] == 0,
+        "APNG PREVIOUS restoration and BACKGROUND clearing affect following frames");
+    let apng_write_ok: i32 = _zag_write_file(".build/assets_animation.png",
+        apng_bytes.data[0..apng_bytes.len]);
+    let loaded_animation: PngAnimationResult = png_load_animation_file(".build/assets_animation.png");
+    failures = failures + asset_expect(apng_write_ok == 0 && loaded_animation.valid == 1
+        && len[PngAnimationFrame](loaded_animation.frames) == 4
+        && surface_checksum(&loaded_animation.frames.data[3].surface)
+            == surface_checksum(&animation.frames.data[3].surface),
+        "APNG binary filesystem loading preserves composed frames");
+
+    let canonical_encoded: PngEncodeResult = png_encode_animation(&animation);
+    let canonical_animation: PngAnimationResult = png_decode_animation(
+        canonical_encoded.bytes.data[0..canonical_encoded.bytes.len]);
+    let canonical_equal: i32 = canonical_encoded.valid == 1 && canonical_animation.valid == 1
+        && canonical_animation.play_count == animation.play_count
+        && len[PngAnimationFrame](canonical_animation.frames) == len[PngAnimationFrame](animation.frames);
+    let canonical_i: i32 = 0;
+    while (canonical_i < len[PngAnimationFrame](animation.frames) && canonical_equal == 1) {
+        if (surface_checksum(&canonical_animation.frames.data[canonical_i].surface)
+                != surface_checksum(&animation.frames.data[canonical_i].surface)
+            || canonical_animation.frames.data[canonical_i].delay_ms
+                != animation.frames.data[canonical_i].delay_ms) { canonical_equal = 0; }
+        canonical_i = canonical_i + 1;
+    }
+    failures = failures + asset_expect(canonical_equal == 1,
+        "canonical APNG encode preserves composed frames, timing, and play count");
+
+    let source2: Surface = surface_new(1, 1); source2.pixels.data[1] = 128 as u8; source2.pixels.data[3] = 128 as u8;
+    let source3: Surface = surface_new(1, 1); source3.pixels.data[2] = 255 as u8; source3.pixels.data[3] = 255 as u8;
+    let source4: Surface = surface_new(1, 1);
+    let encode_sources: ArrayList[PngAnimationSourceFrame] = make[PngAnimationSourceFrame](4);
+    push[PngAnimationSourceFrame](&encode_sources, PngAnimationSourceFrame{
+        .surface = animation.frames.data[0].surface, .x = 0, .y = 0,
+        .delay_numerator = 1, .delay_denominator = 10, .dispose = 0, .blend = 0 });
+    push[PngAnimationSourceFrame](&encode_sources, PngAnimationSourceFrame{
+        .surface = source2, .x = 1, .y = 0,
+        .delay_numerator = 2, .delay_denominator = 0, .dispose = 2, .blend = 1 });
+    push[PngAnimationSourceFrame](&encode_sources, PngAnimationSourceFrame{
+        .surface = source3, .x = 2, .y = 0,
+        .delay_numerator = 3, .delay_denominator = 100, .dispose = 1, .blend = 0 });
+    push[PngAnimationSourceFrame](&encode_sources, PngAnimationSourceFrame{
+        .surface = source4, .x = 0, .y = 0,
+        .delay_numerator = 1, .delay_denominator = 4, .dispose = 0, .blend = 1 });
+    let encode_spec: PngAnimationEncodeSpec = PngAnimationEncodeSpec{
+        .width = 3, .height = 1, .play_count = 2, .frames = encode_sources };
+    let encoded_animation: PngEncodeResult = png_encode_animation_frames(&encode_spec);
+    let encoded_animation_roundtrip: PngAnimationResult = png_decode_animation(
+        encoded_animation.bytes.data[0..encoded_animation.bytes.len]);
+    let controlled_equal: i32 = encoded_animation.valid == 1 && encoded_animation_roundtrip.valid == 1
+        && len[PngAnimationFrame](encoded_animation_roundtrip.frames) == 4;
+    let controlled_i: i32 = 0;
+    while (controlled_i < 4 && controlled_equal == 1) {
+        if (surface_checksum(&encoded_animation_roundtrip.frames.data[controlled_i].surface)
+            != surface_checksum(&animation.frames.data[controlled_i].surface)) { controlled_equal = 0; }
+        controlled_i = controlled_i + 1;
+    }
+    failures = failures + asset_expect(controlled_equal == 1
+        && encoded_animation_roundtrip.frames.data[1].dispose == 2
+        && encoded_animation_roundtrip.frames.data[2].dispose == 1,
+        "general APNG encoder preserves subrect blend and disposal controls");
+    let encoded_apng_write: i32 = _zag_write_file(".build/assets_animation_encoded.png",
+        encoded_animation.bytes.data[0..encoded_animation.bytes.len]);
+    failures = failures + asset_expect(encoded_apng_write == 0,
+        "general APNG encoder writes deterministic binary output");
+    encode_sources.data[0].x = 1;
+    let invalid_animation_encode: PngEncodeResult = png_encode_animation_frames(&encode_spec);
+    failures = failures + asset_expect(invalid_animation_encode.valid == 0
+        && invalid_animation_encode.error == PngError.BadAnimation,
+        "APNG encoder rejects a non-canvas default frame");
+    encode_sources.data[0].x = 0;
+    let static_animation: PngAnimationResult = png_decode_animation(encoded_png.bytes.data[0..encoded_png.bytes.len]);
+    failures = failures + asset_expect(static_animation.valid == 0
+        && static_animation.error == PngError.NotAnimated, "static PNG reports typed NotAnimated result");
+    let bad_sequence_apng: ArrayList[u8] = asset_copy_bytes(&apng_bytes);
+    let first_fdat: i32 = svg_find(bad_sequence_apng.data[0..bad_sequence_apng.len], "fdAT", 0);
+    asset_set_u32_be(&bad_sequence_apng, first_fdat + 4, 9);
+    let first_fdat_length: i32 = png_read_u32_be(bad_sequence_apng.data[0..bad_sequence_apng.len], first_fdat - 4) as i32;
+    asset_set_u32_be(&bad_sequence_apng, first_fdat + 4 + first_fdat_length,
+        png_crc_chunk(bad_sequence_apng.data[0..bad_sequence_apng.len], first_fdat,
+            first_fdat + 4, first_fdat_length));
+    let bad_sequence_result: PngAnimationResult = png_decode_animation(
+        bad_sequence_apng.data[0..bad_sequence_apng.len]);
+    failures = failures + asset_expect(bad_sequence_result.valid == 0
+        && bad_sequence_result.error == PngError.BadAnimation, "APNG sequence discontinuity fails closed");
+    let unsupported_depth: ArrayList[u8] = asset_copy_bytes(&encoded_png.bytes);
+    unsupported_depth.data[24] = 3 as u8;
+    asset_set_u32_be(&unsupported_depth, 29, png_crc_chunk(unsupported_depth.data[0..unsupported_depth.len], 12, 16, 13));
+    let depth_result: PngResult = png_decode(unsupported_depth.data[0..unsupported_depth.len]);
+    failures = failures + asset_expect(depth_result.valid == 0
+        && depth_result.error == PngError.UnsupportedFormat, "illegal PNG bit depth reports explicit unsupported format error");
+
+    let corrupted_png: ArrayList[u8] = asset_copy_bytes(&encoded_png.bytes);
+    corrupted_png.data[45] = ((corrupted_png.data[45] as t27 + 1) % 256) as u8;
+    let corrupt_result: PngResult = png_decode(corrupted_png.data[0..corrupted_png.len]);
+    failures = failures + asset_expect(corrupt_result.valid == 0 && corrupt_result.error == PngError.BadCrc,
+        "PNG chunk corruption returns a typed CRC error");
+    let truncation_safe: i32 = 1;
+    let cut: i32 = 0;
+    while (cut < encoded_png.bytes.len) {
+        let truncated_png: PngResult = png_decode(encoded_png.bytes.data[0..cut]);
+        if (truncated_png.valid != 0 || truncated_png.error == PngError.None) { truncation_safe = 0; }
+        png_free(&truncated_png);
+        cut = cut + 1;
+    }
+    failures = failures + asset_expect(truncation_safe == 1,
+        "every truncated encoder output fails closed without crashing");
+    let mutation_safe: i32 = 1;
+    let mutation: i32 = 0;
+    while (mutation < encoded_png.bytes.len) {
+        let original: u8 = encoded_png.bytes.data[mutation];
+        encoded_png.bytes.data[mutation] = (((original as t27) + 1) % 256) as u8;
+        let mutated_png: PngResult = png_decode(encoded_png.bytes.data[0..encoded_png.bytes.len]);
+        if (mutated_png.valid != 0 || mutated_png.error == PngError.None) { mutation_safe = 0; }
+        png_free(&mutated_png);
+        encoded_png.bytes.data[mutation] = original;
+        mutation = mutation + 1;
+    }
+    failures = failures + asset_expect(mutation_safe == 1,
+        "single-byte PNG mutation smoke-fuzz fails closed without crashing");
+    let source: []u8 = "<svg width=\"27\" height=\"27\"><rect x=\"0\" y=\"0\" width=\"27\" height=\"27\" fill=\"#112233\"/><circle cx=\"13\" cy=\"13\" r=\"7\" fill=\"#FF0000\"/><line x1=\"0\" y1=\"0\" x2=\"26\" y2=\"26\" fill=\"#00FF00\"/></svg>";
+    let parsed: SvgResult = svg_parse(source);
+    failures = failures + asset_expect(parsed.valid == 1 && parsed.error == AssetError.None
+        && parsed.document.width == 27 && parsed.document.height == 27
+        && len[SvgShape](parsed.document.shapes) == 3, "SVG document and supported shapes parse");
+    let rendered: Surface = svg_render(&parsed.document, 54, 54);
+    let background_offset: i32 = ((20 * 54 + 10) * 4);
+    let center_offset: i32 = ((26 * 54 + 26) * 4);
+    failures = failures + asset_expect(rendered.pixels.data[background_offset] == 17
+        && rendered.pixels.data[background_offset + 1] == 34
+        && rendered.pixels.data[background_offset + 2] == 51, "rectangle color scales into CPU surface");
+    failures = failures + asset_expect(rendered.pixels.data[center_offset] == 0
+        && rendered.pixels.data[center_offset + 1] == 255
+        && rendered.pixels.data[center_offset + 2] == 0, "ordered line rasterization composites over circle");
+    let checksum: t27 = surface_checksum(&rendered);
+    failures = failures + asset_expect(checksum == 111001599, "SVG CPU rasterization matches deterministic golden");
+
+    let path_valid: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0L10 0L10 10Z\" fill=\"#00FF00\"/></svg>");
+    let path_surface: Surface = svg_render(&path_valid.document, 27, 27);
+    let path_offset: i32 = ((9 * 27 + 9) * 4);
+    failures = failures + asset_expect(path_valid.valid == 1 && path_valid.error == AssetError.None
+        && len[SvgShape](path_valid.document.shapes) == 1, "SVG path with line segments parses");
+    failures = failures + asset_expect(path_surface.pixels.data[path_offset] == 0
+        && path_surface.pixels.data[path_offset + 1] > 0 && path_surface.pixels.data[path_offset + 2] == 0
+        && path_surface.pixels.data[path_offset + 3] > 0, "SVG path rasterizes via deterministic fill when closed");
+    surface_free(&path_surface); svg_free(&path_valid);
+
+    let curve_absolute: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 15 Q6 3 9 15 12 27 15 15 C18 9 18 21 21 15 22 12 23 12 24 15 Z\" fill=\"#3366CC\"/></svg>");
+    let curve_relative: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"m3 15 q3 -12 6 0 3 12 6 0 c3 -6 3 6 6 0 1 -3 2 -3 3 0 z\" fill=\"#3366CC\"/></svg>");
+    let absolute_curve_shape: SvgShape = get[SvgShape](curve_absolute.document.shapes, 0);
+    let absolute_curve_last: Point2D = absolute_curve_shape.points.data[len[Point2D](absolute_curve_shape.points) - 1];
+    failures = failures + asset_expect(curve_absolute.valid == 1 && curve_absolute.error == AssetError.None
+        && absolute_curve_shape.closed == 1 && len[Point2D](absolute_curve_shape.points) > 54
+        && absolute_curve_last.x == 24 && absolute_curve_last.y == 15,
+        "absolute Q/C commands flatten repeated parameter groups and preserve their endpoint");
+    failures = failures + asset_expect(asset_svg_path_points_equal(&curve_absolute, &curve_relative) == 1,
+        "relative q/c commands resolve each repeated group against the current balanced-ternary point");
+
+    let smooth_quadratic_absolute: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 15 Q6 3 9 15 T15 15 21 15 Z\" fill=\"#993366\"/></svg>");
+    let smooth_quadratic_relative: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"m3 15 q3 -12 6 0 t6 0 6 0 z\" fill=\"#993366\"/></svg>");
+    let smooth_quadratic_explicit: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 15 Q6 3 9 15 Q12 27 15 15 18 3 21 15 Z\" fill=\"#993366\"/></svg>");
+    failures = failures + asset_expect(asset_svg_path_points_equal(&smooth_quadratic_absolute,
+        &smooth_quadratic_relative) == 1 && asset_svg_path_points_equal(&smooth_quadratic_absolute,
+        &smooth_quadratic_explicit) == 1,
+        "T/t reflects Q/T controls across each current point for absolute, relative, and repeated groups");
+
+    let smooth_cubic_absolute: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 15 C6 3 6 27 9 15 S12 3 15 15 18 27 21 15 Z\" fill=\"#339966\"/></svg>");
+    let smooth_cubic_relative: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"m3 15 c3 -12 3 12 6 0 s3 -12 6 0 3 12 6 0 z\" fill=\"#339966\"/></svg>");
+    let smooth_cubic_explicit: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 15 C6 3 6 27 9 15 C12 3 12 3 15 15 18 27 18 27 21 15 Z\" fill=\"#339966\"/></svg>");
+    failures = failures + asset_expect(asset_svg_path_points_equal(&smooth_cubic_absolute,
+        &smooth_cubic_relative) == 1 && asset_svg_path_points_equal(&smooth_cubic_absolute,
+        &smooth_cubic_explicit) == 1,
+        "S/s reflects only the prior C/S second control for absolute, relative, and repeated groups");
+
+    let smooth_reset_quadratic: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 15 Q6 3 9 15 L12 15 T18 15 Z\" fill=\"#663399\"/></svg>");
+    let smooth_reset_quadratic_explicit: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 15 Q6 3 9 15 L12 15 Q12 15 18 15 Z\" fill=\"#663399\"/></svg>");
+    let smooth_reset_cubic: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 15 C6 3 6 27 9 15 H12 S15 15 18 15 Z\" fill=\"#663399\"/></svg>");
+    let smooth_reset_cubic_explicit: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 15 C6 3 6 27 9 15 H12 C12 15 15 15 18 15 Z\" fill=\"#663399\"/></svg>");
+    let smooth_cross_family: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 15 Q6 3 9 15 S12 15 15 15 T21 15 Z\" fill=\"#663399\"/></svg>");
+    let smooth_cross_family_explicit: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 15 Q6 3 9 15 C9 15 12 15 15 15 Q15 15 21 15 Z\" fill=\"#663399\"/></svg>");
+    failures = failures + asset_expect(asset_svg_path_points_equal(&smooth_reset_quadratic,
+        &smooth_reset_quadratic_explicit) == 1 && asset_svg_path_points_equal(&smooth_reset_cubic,
+        &smooth_reset_cubic_explicit) == 1 && asset_svg_path_points_equal(&smooth_cross_family,
+        &smooth_cross_family_explicit) == 1,
+        "line commands and incompatible curve families reset smooth-control reflection authority");
+
+    let smooth_quadratic_surface: Surface = svg_render(&smooth_quadratic_absolute.document, 27, 27);
+    let smooth_cubic_surface: Surface = svg_render(&smooth_cubic_absolute.document, 27, 27);
+    let smooth_reset_surface: Surface = svg_render(&smooth_reset_quadratic.document, 27, 27);
+    let smooth_quadratic_checksum: t27 = surface_checksum(&smooth_quadratic_surface);
+    let smooth_cubic_checksum: t27 = surface_checksum(&smooth_cubic_surface);
+    let smooth_reset_checksum: t27 = surface_checksum(&smooth_reset_surface);
+    failures = failures + asset_expect(smooth_quadratic_checksum == 304676728
+        && smooth_cubic_checksum == 514385331 && smooth_reset_checksum == 967901106,
+        "smooth quadratic, cubic, and reset paths match exact deterministic raster goldens");
+
+    let arc_small_sweep: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 15 A12 9 0 0 1 21 15 Z\" fill=\"#996633\"/></svg>");
+    let arc_small_sweep_relative: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"m3 15 a12 9 0 0 1 18 0 z\" fill=\"#996633\"/></svg>");
+    let arc_small_reverse: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 15 A12 9 0 0 0 21 15 Z\" fill=\"#996633\"/></svg>");
+    let arc_large_sweep: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 15 A12 9 0 1 1 21 15 Z\" fill=\"#996633\"/></svg>");
+    let arc_large_reverse: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 15 A12 9 0 1 0 21 15 Z\" fill=\"#996633\"/></svg>");
+    let arc_small_shape: SvgShape = get[SvgShape](arc_small_sweep.document.shapes, 0);
+    let arc_small_endpoint: Point2D = arc_small_shape.points.data[len[Point2D](arc_small_shape.points) - 1];
+    failures = failures + asset_expect(arc_small_sweep.valid == 1 && arc_small_shape.closed == 1
+        && len[Point2D](arc_small_shape.points) == 28 && arc_small_endpoint.x == 21 && arc_small_endpoint.y == 15
+        && asset_svg_path_points_equal(&arc_small_sweep, &arc_small_sweep_relative) == 1,
+        "A/a preserves its exact endpoint and resolves relative endpoints into the same flattened arc");
+
+    let arc_diagonal: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 6 A15 9 0 0 1 21 18 Z\" fill=\"#996633\"/></svg>");
+    let arc_diagonal_relative: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"m3 6 a15 9 0 0 1 18 12 z\" fill=\"#996633\"/></svg>");
+    failures = failures + asset_expect(asset_svg_path_points_equal(&arc_diagonal, &arc_diagonal_relative) == 1
+        && get[SvgShape](arc_diagonal.document.shapes, 0).points.data[27].x == 21
+        && get[SvgShape](arc_diagonal.document.shapes, 0).points.data[27].y == 18,
+        "axis-aligned ellipses support diagonal endpoint chords without leaving integer geometry");
+
+    let arc_repeated: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 15 A9 9 0 0 1 21 15 9 9 0 0 1 3 15 Z\" fill=\"#996633\"/></svg>");
+    let arc_repeated_relative: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"m3 15 a9 9 0 0 1 18 0 9 9 0 0 1 -18 0 z\" fill=\"#996633\"/></svg>");
+    failures = failures + asset_expect(asset_svg_path_points_equal(&arc_repeated, &arc_repeated_relative) == 1
+        && len[Point2D](get[SvgShape](arc_repeated.document.shapes, 0).points) == 55,
+        "A/a accepts complete repeated seven-parameter groups with per-endpoint relative resolution");
+
+    let arc_corrected_radius: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 15 A3 3 0 0 1 21 15 Z\" fill=\"#996633\"/></svg>");
+    let arc_explicit_radius: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 15 A9 9 0 0 1 21 15 Z\" fill=\"#996633\"/></svg>");
+    failures = failures + asset_expect(asset_svg_path_points_equal(&arc_corrected_radius, &arc_explicit_radius) == 1,
+        "undersized SVG radii expand deterministically to admit the endpoint chord");
+
+    let arc_zero_radius: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 3 A0 9 0 0 1 21 3 L21 21 Z\" fill=\"#996633\"/></svg>");
+    let arc_zero_radius_line: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 3 L21 3 L21 21 Z\" fill=\"#996633\"/></svg>");
+    let arc_same_endpoint: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M3 3 L21 3 A9 9 0 1 1 21 3 L21 21 Z\" fill=\"#996633\"/></svg>");
+    failures = failures + asset_expect(asset_svg_path_points_equal(&arc_zero_radius, &arc_zero_radius_line) == 1
+        && asset_svg_path_points_equal(&arc_same_endpoint, &arc_zero_radius_line) == 1,
+        "zero radii become lines and identical arc endpoints add no geometry");
+
+    let arc_small_surface: Surface = svg_render(&arc_small_sweep.document, 27, 27);
+    let arc_small_reverse_surface: Surface = svg_render(&arc_small_reverse.document, 27, 27);
+    let arc_large_surface: Surface = svg_render(&arc_large_sweep.document, 27, 27);
+    let arc_large_reverse_surface: Surface = svg_render(&arc_large_reverse.document, 27, 27);
+    let arc_small_checksum: t27 = surface_checksum(&arc_small_surface);
+    let arc_small_reverse_checksum: t27 = surface_checksum(&arc_small_reverse_surface);
+    let arc_large_checksum: t27 = surface_checksum(&arc_large_surface);
+    let arc_large_reverse_checksum: t27 = surface_checksum(&arc_large_reverse_surface);
+    failures = failures + asset_expect(arc_small_checksum == 531631109
+        && arc_small_reverse_checksum == 157169267 && arc_large_checksum == 570351381
+        && arc_large_reverse_checksum == 281726135,
+        "large-arc and sweep choices match exact deterministic arc raster goldens");
+
+    let line_command_path: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M1 1 10 1 H20 18 V20 18 h-3 -3 v-3 -3 Z\" fill=\"#112233\"/></svg>");
+    let line_command_shape: SvgShape = get[SvgShape](line_command_path.document.shapes, 0);
+    let line_command_last: Point2D = line_command_shape.points.data[len[Point2D](line_command_shape.points) - 1];
+    failures = failures + asset_expect(line_command_path.valid == 1 && line_command_shape.closed == 1
+        && len[Point2D](line_command_shape.points) == 10
+        && line_command_last.x == 12 && line_command_last.y == 12,
+        "M/L-compatible repeated pairs and absolute/relative H/V commands retain their existing semantics");
+
+    let curve_surface: Surface = svg_render(&curve_absolute.document, 27, 27);
+    let curve_scaled_surface: Surface = svg_render(&curve_absolute.document, 54, 54);
+    let curve_scaled_again: Surface = svg_render(&curve_absolute.document, 54, 54);
+    let curve_checksum: t27 = surface_checksum(&curve_surface);
+    let curve_scaled_checksum: t27 = surface_checksum(&curve_scaled_surface);
+    failures = failures + asset_expect(curve_checksum == 939273415 && curve_scaled_checksum == 651287912
+        && curve_scaled_checksum == surface_checksum(&curve_scaled_again),
+        "SVG curve scaling and CPU rasterization match exact deterministic goldens");
+
+    let truncated_quadratic: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 Q1 2 3\" fill=\"#000000\"/></svg>");
+    let truncated_cubic: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 C1 2 3 4 5\" fill=\"#000000\"/></svg>");
+    let nonnumeric_curve: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 Qx 2 3 4\" fill=\"#000000\"/></svg>");
+    let overflow_curve: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 C999999999999999999999 0 1 1 2 2\" fill=\"#000000\"/></svg>");
+    let relative_overflow_curve: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M19683 0 q1 0 0 0\" fill=\"#000000\"/></svg>");
+    let truncated_line: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 L\" fill=\"#000000\"/></svg>");
+    failures = failures + asset_expect(truncated_quadratic.valid == 0
+        && truncated_quadratic.error == AssetError.InvalidPath && truncated_cubic.valid == 0
+        && truncated_cubic.error == AssetError.InvalidPath && nonnumeric_curve.valid == 0
+        && nonnumeric_curve.error == AssetError.InvalidPath && overflow_curve.valid == 0
+        && overflow_curve.error == AssetError.InvalidPath && relative_overflow_curve.valid == 0
+        && relative_overflow_curve.error == AssetError.InvalidPath && truncated_line.valid == 0
+        && truncated_line.error == AssetError.InvalidPath,
+        "truncated, nonnumeric, overflowing curve and line groups return typed path errors");
+
+    let truncated_smooth_quadratic: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 T1\" fill=\"#000000\"/></svg>");
+    let truncated_smooth_cubic: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 S1 2 3\" fill=\"#000000\"/></svg>");
+    let nonnumeric_smooth: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 Sx 2 3 4\" fill=\"#000000\"/></svg>");
+    let relative_overflow_smooth: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M19683 0 t1 0\" fill=\"#000000\"/></svg>");
+    let reflected_quadratic_overflow: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 Q-19683 0 19683 0 T0 0\" fill=\"#000000\"/></svg>");
+    let reflected_cubic_overflow: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 C0 0 -19683 0 19683 0 S0 0 0 0\" fill=\"#000000\"/></svg>");
+    failures = failures + asset_expect(truncated_smooth_quadratic.valid == 0
+        && truncated_smooth_quadratic.error == AssetError.InvalidPath && truncated_smooth_cubic.valid == 0
+        && truncated_smooth_cubic.error == AssetError.InvalidPath && nonnumeric_smooth.valid == 0
+        && nonnumeric_smooth.error == AssetError.InvalidPath && relative_overflow_smooth.valid == 0
+        && relative_overflow_smooth.error == AssetError.InvalidPath && reflected_quadratic_overflow.valid == 0
+        && reflected_quadratic_overflow.error == AssetError.InvalidPath && reflected_cubic_overflow.valid == 0
+        && reflected_cubic_overflow.error == AssetError.InvalidPath,
+        "truncated, nonnumeric, endpoint-overflow, and reflected-control-overflow T/S paths fail closed");
+
+    let truncated_arc: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 A9 9 0 0 1 18\" fill=\"#000000\"/></svg>");
+    let truncated_repeated_arc: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 A9 9 0 0 1 18 0 9 9 0 0 1 0\" fill=\"#000000\"/></svg>");
+    let negative_radius_arc: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 A-9 9 0 0 1 18 0\" fill=\"#000000\"/></svg>");
+    let bad_large_flag_arc: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 A9 9 0 2 1 18 0\" fill=\"#000000\"/></svg>");
+    let bad_sweep_flag_arc: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 A9 9 0 0 2 18 0\" fill=\"#000000\"/></svg>");
+    let joined_flag_arc: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 A9 9 0 01 18 0\" fill=\"#000000\"/></svg>");
+    let rotated_arc: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 A9 9 45 0 1 18 0\" fill=\"#000000\"/></svg>");
+    let overflow_arc: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 A999999999999999 9 0 0 1 18 0\" fill=\"#000000\"/></svg>");
+    failures = failures + asset_expect(truncated_arc.valid == 0 && truncated_arc.error == AssetError.InvalidPath
+        && truncated_repeated_arc.valid == 0 && truncated_repeated_arc.error == AssetError.InvalidPath
+        && negative_radius_arc.valid == 0 && negative_radius_arc.error == AssetError.InvalidPath
+        && bad_large_flag_arc.valid == 0 && bad_large_flag_arc.error == AssetError.InvalidPath
+        && bad_sweep_flag_arc.valid == 0 && bad_sweep_flag_arc.error == AssetError.InvalidPath
+        && joined_flag_arc.valid == 0 && joined_flag_arc.error == AssetError.InvalidPath
+        && rotated_arc.valid == 0 && rotated_arc.error == AssetError.InvalidPath
+        && overflow_arc.valid == 0 && overflow_arc.error == AssetError.InvalidPath,
+        "arc truncation, negative radii, non-binary flags, nonzero rotation, and overflow fail closed");
+
+    let decimal_curve: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 Q1.5 2 3 4\" fill=\"#000000\"/></svg>");
+    let multiple_subpath: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 L3 0 M6 0 L9 0\" fill=\"#000000\"/></svg>");
+    let nonterminal_close: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><path d=\"M0 0 L3 0 L3 3 Z L6 6\" fill=\"#000000\"/></svg>");
+    failures = failures + asset_expect(decimal_curve.valid == 0 && decimal_curve.error == AssetError.InvalidPath
+        && multiple_subpath.valid == 0 && multiple_subpath.error == AssetError.InvalidPath
+        && nonterminal_close.valid == 0 && nonterminal_close.error == AssetError.InvalidPath,
+        "unsupported decimal, multiple-subpath, and nonterminal-close syntax fails closed");
+
+    let segment_data: ArrayList[u8] = make[u8](4096);
+    asset_append_ascii(&segment_data, "M0 0 C0 27 27 27 27 0 s");
+    let segment_group: i32 = 0;
+    while (segment_group < 210) {
+        asset_append_ascii(&segment_data, "27 27 27 0 ");
+        segment_group = segment_group + 1;
+    }
+    let bounded_shape: SvgShape = SvgShape{ .kind = SvgShapeKind.Path, .x = 0, .y = 0, .w = 0, .h = 0,
+        .x2 = 0, .y2 = 0, .radius = 0, .color = color_rgba(0, 0, 0, 255),
+        .points = make[Point2D](0), .closed = 0 };
+    let bounded_ok: i32 = 1;
+    let bounded_parse: i32 = svg_parse_path(segment_data.data[0..segment_data.len], &bounded_shape, &bounded_ok);
+    failures = failures + asset_expect(bounded_parse == 0 && bounded_ok == 0
+        && len[Point2D](bounded_shape.points) == 0 && segment_data.len < 4096,
+        "repeated smooth cubic groups reject the 4096-point ceiling without publishing partial geometry");
+
+    let arc_segment_data: ArrayList[u8] = make[u8](4096);
+    asset_append_ascii(&arc_segment_data, "M0 0 A");
+    let arc_segment_group: i32 = 0; let arc_to_right: i32 = 1;
+    while (arc_segment_group < 160) {
+        if (arc_to_right == 1) { asset_append_ascii(&arc_segment_data, "9 9 0 0 1 18 0 "); arc_to_right = 0; }
+        else { asset_append_ascii(&arc_segment_data, "9 9 0 0 1 0 0 "); arc_to_right = 1; }
+        arc_segment_group = arc_segment_group + 1;
+    }
+    let arc_bounded_shape: SvgShape = SvgShape{ .kind = SvgShapeKind.Path, .x = 0, .y = 0, .w = 0, .h = 0,
+        .x2 = 0, .y2 = 0, .radius = 0, .color = color_rgba(0, 0, 0, 255),
+        .points = make[Point2D](0), .closed = 0 };
+    let arc_bounded_ok: i32 = 1;
+    let arc_bounded_parse: i32 = svg_parse_path(arc_segment_data.data[0..arc_segment_data.len],
+        &arc_bounded_shape, &arc_bounded_ok);
+    failures = failures + asset_expect(arc_bounded_parse == 0 && arc_bounded_ok == 0
+        && len[Point2D](arc_bounded_shape.points) == 0 && arc_segment_data.len < 4096,
+        "repeated arcs reject the shared 4096-point ceiling without publishing partial geometry");
+
+    surface_free(&arc_small_surface); surface_free(&arc_small_reverse_surface);
+    surface_free(&arc_large_surface); surface_free(&arc_large_reverse_surface);
+    surface_free(&smooth_quadratic_surface); surface_free(&smooth_cubic_surface); surface_free(&smooth_reset_surface);
+    surface_free(&curve_surface); surface_free(&curve_scaled_surface); surface_free(&curve_scaled_again);
+    svg_free(&smooth_quadratic_relative); svg_free(&smooth_quadratic_explicit);
+    svg_free(&smooth_cubic_absolute); svg_free(&smooth_cubic_relative); svg_free(&smooth_cubic_explicit);
+    svg_free(&smooth_reset_quadratic); svg_free(&smooth_reset_quadratic_explicit);
+    svg_free(&smooth_reset_cubic); svg_free(&smooth_reset_cubic_explicit);
+    svg_free(&smooth_cross_family); svg_free(&smooth_cross_family_explicit);
+    svg_free(&smooth_quadratic_absolute);
+    failures = failures + asset_expect(smooth_quadratic_absolute.valid == 0
+        && len[SvgShape](smooth_quadratic_absolute.document.shapes) == 0,
+        "smooth curve cleanup releases reflected path geometry");
+    svg_free(&curve_relative); svg_free(&line_command_path); svg_free(&truncated_quadratic); svg_free(&truncated_cubic);
+    svg_free(&nonnumeric_curve); svg_free(&overflow_curve); svg_free(&relative_overflow_curve); svg_free(&truncated_line);
+    svg_free(&truncated_smooth_quadratic); svg_free(&truncated_smooth_cubic); svg_free(&nonnumeric_smooth);
+    svg_free(&relative_overflow_smooth); svg_free(&reflected_quadratic_overflow); svg_free(&reflected_cubic_overflow);
+    svg_free(&arc_small_sweep_relative); svg_free(&arc_diagonal); svg_free(&arc_diagonal_relative);
+    svg_free(&arc_small_reverse); svg_free(&arc_large_sweep); svg_free(&arc_large_reverse);
+    svg_free(&arc_repeated); svg_free(&arc_repeated_relative); svg_free(&arc_corrected_radius); svg_free(&arc_explicit_radius);
+    svg_free(&arc_zero_radius); svg_free(&arc_zero_radius_line); svg_free(&arc_same_endpoint);
+    svg_free(&arc_small_sweep);
+    failures = failures + asset_expect(arc_small_sweep.valid == 0
+        && len[SvgShape](arc_small_sweep.document.shapes) == 0,
+        "arc cleanup releases flattened endpoint geometry");
+    svg_free(&truncated_arc); svg_free(&truncated_repeated_arc); svg_free(&negative_radius_arc);
+    svg_free(&bad_large_flag_arc); svg_free(&bad_sweep_flag_arc); svg_free(&joined_flag_arc);
+    svg_free(&rotated_arc); svg_free(&overflow_arc);
+    svg_free(&decimal_curve); svg_free(&multiple_subpath); svg_free(&nonterminal_close);
+    free[u8](&segment_data); free[Point2D](&bounded_shape.points);
+    free[u8](&arc_segment_data); free[Point2D](&arc_bounded_shape.points);
+    svg_free(&curve_absolute);
+    failures = failures + asset_expect(curve_absolute.valid == 0 && curve_absolute.document.width == 0
+        && curve_absolute.document.height == 0 && len[SvgShape](curve_absolute.document.shapes) == 0,
+        "SVG curve document cleanup releases retained shapes and resets owned geometry");
+
+    let missing: SvgResult = svg_parse("<svg><rect width=\"1\" height=\"1\" fill=\"#000000\"/></svg>");
+    failures = failures + asset_expect(missing.valid == 0 && missing.error == AssetError.MissingSize,
+        "missing viewport size returns typed error");
+    let bad_color: SvgResult = svg_parse("<svg width=\"1\" height=\"1\"><rect width=\"1\" height=\"1\" fill=\"red\"/></svg>");
+    failures = failures + asset_expect(bad_color.valid == 0 && bad_color.error == AssetError.InvalidColor,
+        "unsupported color syntax returns typed error");
+    let bad_number: SvgResult = svg_parse("<svg width=\"27\" height=\"27\"><circle cx=\"x\" cy=\"1\" r=\"1\" fill=\"#000000\"/></svg>");
+    failures = failures + asset_expect(bad_number.valid == 0 && bad_number.error == AssetError.InvalidNumber,
+        "malformed geometry returns typed error");
+
+    raw_pixel_free(&raw_decoded); raw_pixel_free(&invalid_raw); raw_pixel_free(&short_raw);
+    raw_pixel_free(&bad_stride); raw_pixel_free(&trailing_raw); raw_pixel_free(&bad_dimensions);
+    raw_pixel_free(&missing_raw);
+    free[u8](&fixed_zlib); free[u8](&fixed_inflate.bytes);
+    free[u8](&dynamic_zlib); free[u8](&dynamic_inflate.bytes);
+    surface_free(&png_surface); png_encode_free(&encoded_png); png_free(&decoded_png); png_free(&loaded_png);
+    png_free(&bad_signature_png);
+    free[u8](&gray_raw); free[u8](&gray_png_bytes); png_free(&gray_png);
+    free[u8](&rgb_raw); free[u8](&rgb_png_bytes); png_free(&rgb_png);
+    free[u8](&gray_alpha_raw); free[u8](&gray_alpha_bytes); png_free(&gray_alpha_png);
+    free[u8](&packed_gray_raw); free[u8](&packed_gray_bytes); png_free(&packed_gray_png);
+    free[u8](&palette_raw); free[u8](&palette_data); free[u8](&palette_alpha);
+    free[u8](&palette_png_bytes); png_free(&palette_png);
+    free[u8](&gray_trns_raw); free[u8](&gray_trns_data); free[u8](&gray_trns_bytes); png_free(&gray_trns_png);
+    free[u8](&rgba16_raw); free[u8](&rgba16_bytes); png_free(&rgba16_png); free[u8](&no_metadata);
+    surface_free(&adam7_surface); free[u8](&adam7_raw); free[u8](&adam7_bytes); png_free(&adam7_png);
+    free[u8](&bad_adam7_raw); free[u8](&bad_adam7_bytes); png_free(&bad_adam7_png);
+    free[u8](&unsupported_interlace); png_free(&interlace_result);
+    free[u8](&apng_frame1_raw); free[u8](&apng_frame1_data);
+    free[u8](&apng_frame2_raw); free[u8](&apng_frame2_data);
+    free[u8](&apng_frame3_raw); free[u8](&apng_frame3_data);
+    free[u8](&apng_frame4_raw); free[u8](&apng_frame4_data); free[u8](&apng_bytes);
+    png_animation_free(&animation); png_animation_free(&loaded_animation); png_animation_free(&static_animation);
+    png_encode_free(&canonical_encoded); png_animation_free(&canonical_animation);
+    surface_free(&source2); surface_free(&source3); surface_free(&source4);
+    free[PngAnimationSourceFrame](&encode_sources); png_encode_free(&encoded_animation);
+    png_animation_free(&encoded_animation_roundtrip); png_encode_free(&invalid_animation_encode);
+    free[u8](&bad_sequence_apng); png_animation_free(&bad_sequence_result);
+    free[u8](&unsupported_depth); png_free(&depth_result);
+    free[u8](&corrupted_png); png_free(&corrupt_result);
+    jpeg_free(&jpeg_decoded); jpeg_free(&progressive_decode_pending); jpeg_free(&loaded_jpeg); jpeg_free(&gray_jpeg); jpeg_free(&y420_jpeg);
+    jpeg_free(&baseline_multiscan);
+    jpeg_free(&progressive_gray); jpeg_free(&progressive_color);
+    jpeg_free(&restart_jpeg); jpeg_free(&wrong_restart_jpeg);
+    free[u8](&jpeg_bytes); free[u8](&gray_jpeg_bytes); free[u8](&y420_jpeg_bytes); free[u8](&restart_jpeg_bytes);
+    free[u8](&baseline_multiscan_bytes);
+    free[u8](&progressive_gray_bytes); free[u8](&progressive_color_bytes);
+    free[u8](&raw); free[u8](&invalid_premultiplied);
+    surface_free(&rendered); svg_free(&parsed); svg_free(&missing); svg_free(&bad_color); svg_free(&bad_number);
+    if (failures != 0) {
+        _zag_print("svg_checksum="); _zag_println(_zag_i64_to_str(checksum as i64));
+        _zag_print("svg_curve_checksum="); _zag_println(_zag_i64_to_str(curve_checksum as i64));
+        _zag_print("svg_curve_scaled_checksum="); _zag_println(_zag_i64_to_str(curve_scaled_checksum as i64));
+        _zag_print("svg_smooth_quadratic_checksum="); _zag_println(_zag_i64_to_str(smooth_quadratic_checksum as i64));
+        _zag_print("svg_smooth_cubic_checksum="); _zag_println(_zag_i64_to_str(smooth_cubic_checksum as i64));
+        _zag_print("svg_smooth_reset_checksum="); _zag_println(_zag_i64_to_str(smooth_reset_checksum as i64));
+        _zag_print("svg_arc_small_checksum="); _zag_println(_zag_i64_to_str(arc_small_checksum as i64));
+        _zag_print("svg_arc_small_reverse_checksum="); _zag_println(_zag_i64_to_str(arc_small_reverse_checksum as i64));
+        _zag_print("svg_arc_large_checksum="); _zag_println(_zag_i64_to_str(arc_large_checksum as i64));
+        _zag_print("svg_arc_large_reverse_checksum="); _zag_println(_zag_i64_to_str(arc_large_reverse_checksum as i64));
+        return 1;
+    }
+    _zag_println("assets_test: ok"); return 0;
+}

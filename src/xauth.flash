@@ -1,0 +1,51 @@
+// Pure-Flash parser for the binary Xauthority record format.
+
+struct XAuthRecord {
+    family: t27,
+    address: []u8,
+    display_number: []u8,
+    protocol_name: []u8,
+    data: []u8,
+    valid: i32,
+}
+
+fn xauth_u16_be(input: []u8, offset: i32) t27 {
+    if (offset < 0 || offset + 2 > input.len) { return 0; }
+    return (input[offset] as t27) * 256 + input[offset + 1] as t27;
+}
+
+fn xauth_parse(input: []u8, display_number: []u8) XAuthRecord {
+    let bad: XAuthRecord = XAuthRecord{ .family = 0, .address = "", .display_number = "", .protocol_name = "", .data = "", .valid = 0 };
+    let off: i32 = 0;
+    while (off + 2 <= input.len) {
+        let family: t27 = xauth_u16_be(input, off); off = off + 2;
+        if (off + 2 > input.len) { return bad; }
+        let address_len: i32 = xauth_u16_be(input, off) as i32; off = off + 2;
+        if (off + address_len + 2 > input.len) { return bad; }
+        let address: []u8 = input[off..off + address_len]; off = off + address_len;
+        let number_len: i32 = xauth_u16_be(input, off) as i32; off = off + 2;
+        if (off + number_len + 2 > input.len) { return bad; }
+        let number: []u8 = input[off..off + number_len]; off = off + number_len;
+        let name_len: i32 = xauth_u16_be(input, off) as i32; off = off + 2;
+        if (off + name_len + 2 > input.len) { return bad; }
+        let name: []u8 = input[off..off + name_len]; off = off + name_len;
+        let data_len: i32 = xauth_u16_be(input, off) as i32; off = off + 2;
+        if (off + data_len > input.len) { return bad; }
+        let data: []u8 = input[off..off + data_len]; off = off + data_len;
+        let number_matches: i32 = @strEq(number, display_number);
+        if (number.len == 0 && @strEq(display_number, "0") == 1) { number_matches = 1; }
+        if (number_matches == 1 && @strEq(name, "MIT-MAGIC-COOKIE-1") == 1) {
+            return XAuthRecord{ .family = family, .address = address, .display_number = number,
+                .protocol_name = name, .data = data, .valid = 1 };
+        }
+    }
+    return bad;
+}
+
+fn xauth_find(path: []u8, display_number: []u8) XAuthRecord {
+    let input: []u8 = _zag_read_file(path);
+    if (input.len < 0) {
+        return XAuthRecord{ .family = 0, .address = "", .display_number = "", .protocol_name = "", .data = "", .valid = 0 };
+    }
+    return xauth_parse(input, display_number);
+}

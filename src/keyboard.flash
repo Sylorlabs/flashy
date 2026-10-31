@@ -1,0 +1,617 @@
+// Shared keyboard translation at the native protocol boundary. Protocol codes,
+// keysyms, Unicode scalars, and state stay in balanced-ternary t27 values; byte
+// storage is created only for validated UTF-8 text handed to the UI layer.
+
+enum KeyboardModifier { None, Shift, Control, Alt, Meta, CapsLock, NumLock }
+
+enum KeyboardStatus {
+    Ok,
+    EmptyInput,
+    NoBindings,
+    InputTooLarge,
+    InvalidLimit,
+    TooManyEntries,
+    Malformed,
+    InvalidName,
+    InvalidCode,
+    DuplicateName,
+    DuplicateCode,
+    MissingCode,
+    DuplicateKey,
+    UnknownSymbol,
+    InvalidUnicode,
+    UnknownCode,
+    InvalidState,
+    InvalidModifiers,
+}
+
+struct KeyboardRawKey {
+    code: t27,
+    state: t27,
+    serial: t27,
+    time: t27,
+}
+
+struct KeyboardSymbol {
+    // raw is an X11-compatible keysym identity when the bounded symbol has one.
+    raw: t27,
+    codepoint: t27,
+    key: Key,
+    modifier: KeyboardModifier,
+    status: KeyboardStatus,
+    valid: i32,
+}
+
+struct KeyboardBinding {
+    protocol_code: t27,
+    base: KeyboardSymbol,
+    shifted: KeyboardSymbol,
+    key: Key,
+    modifier: KeyboardModifier,
+}
+
+struct KeyboardMap {
+    entries: ArrayList[KeyboardBinding],
+    max_entries: t27,
+    status: KeyboardStatus,
+    valid: i32,
+}
+
+struct KeyboardUtf8Result {
+    text: TextBuffer,
+    status: KeyboardStatus,
+    valid: i32,
+}
+
+struct KeyboardTranslation {
+    raw: KeyboardRawKey,
+    symbol: KeyboardSymbol,
+    modifiers: KeyModifiers,
+    text: TextBuffer,
+    status: KeyboardStatus,
+    valid: i32,
+}
+
+struct KeyboardParser {
+    input: []u8,
+    offset: i32,
+    status: KeyboardStatus,
+}
+
+struct KeyboardCodeName {
+    identity: t27,
+    code: t27,
+    bound: i32,
+}
+
+struct KeyboardParsedName {
+    identity: t27,
+    valid: i32,
+}
+
+struct KeyboardToken {
+    value: []u8,
+    valid: i32,
+}
+
+fn keyboard_symbol_bad(status: KeyboardStatus) KeyboardSymbol {
+    return KeyboardSymbol{ .raw = 0, .codepoint = 0, .key = Key.Unknown,
+        .modifier = KeyboardModifier.None, .status = status, .valid = 0 };
+}
+
+fn keyboard_symbol_value(raw: t27, codepoint: t27, key: Key,
+    modifier: KeyboardModifier) KeyboardSymbol {
+    return KeyboardSymbol{ .raw = raw, .codepoint = codepoint, .key = key,
+        .modifier = modifier, .status = KeyboardStatus.Ok, .valid = 1 };
+}
+
+fn keyboard_symbol_key(raw: t27, key: Key) KeyboardSymbol {
+    return keyboard_symbol_value(raw, 0, key, KeyboardModifier.None);
+}
+
+fn keyboard_symbol_modifier(raw: t27, modifier: KeyboardModifier) KeyboardSymbol {
+    return keyboard_symbol_value(raw, 0, Key.Unknown, modifier);
+}
+
+fn keyboard_unicode_scalar_valid(codepoint: t27) i32 {
+    if (codepoint < 0 || codepoint > 1114111) { return 0; }
+    if (codepoint >= 55296 && codepoint <= 57343) { return 0; }
+    return 1;
+}
+
+pub fn keyboard_utf8_encode(codepoint: t27) KeyboardUtf8Result {
+    let result: KeyboardUtf8Result = KeyboardUtf8Result{ .text = text_buffer_empty(),
+        .status = KeyboardStatus.InvalidUnicode, .valid = 0 };
+    if (keyboard_unicode_scalar_valid(codepoint) == 0) { return result; }
+    let bytes: ArrayList[u8] = make[u8](4);
+    if (codepoint <= 127) {
+        push[u8](&bytes, codepoint as u8);
+    } else if (codepoint <= 2047) {
+        push[u8](&bytes, (192 + codepoint / 64) as u8);
+        push[u8](&bytes, (128 + codepoint % 64) as u8);
+    } else if (codepoint <= 65535) {
+        push[u8](&bytes, (224 + codepoint / 4096) as u8);
+        push[u8](&bytes, (128 + (codepoint / 64) % 64) as u8);
+        push[u8](&bytes, (128 + codepoint % 64) as u8);
+    } else {
+        push[u8](&bytes, (240 + codepoint / 262144) as u8);
+        push[u8](&bytes, (128 + (codepoint / 4096) % 64) as u8);
+        push[u8](&bytes, (128 + (codepoint / 64) % 64) as u8);
+        push[u8](&bytes, (128 + codepoint % 64) as u8);
+    }
+    result.text = text_buffer_take(&bytes);
+    result.status = KeyboardStatus.Ok;
+    result.valid = 1;
+    return result;
+}
+
+pub fn keyboard_utf8_result_free(result: *KeyboardUtf8Result) void {
+    text_buffer_free(&result.*.text);
+    result.*.valid = 0;
+}
+
+fn keyboard_ascii_key(codepoint: t27) Key {
+    if (codepoint == 32) { return Key.Space; }
+    if (codepoint == 65 || codepoint == 97) { return Key.A; }
+    return Key.Unknown;
+}
+
+// Decode the deterministic portion of the X11 keysym space. Locale-dependent
+// legacy keysyms are deliberately rejected instead of guessed.
+pub fn keyboard_symbol_from_x11(keysym: t27) KeyboardSymbol {
+    if ((keysym >= 32 && keysym <= 126) || (keysym >= 160 && keysym <= 255)) {
+        return keyboard_symbol_value(keysym, keysym, keyboard_ascii_key(keysym), KeyboardModifier.None);
+    }
+    if (keysym >= 16777216 && keysym <= 17891327) {
+        let codepoint: t27 = keysym - 16777216;
+        if (keyboard_unicode_scalar_valid(codepoint) == 0) {
+            return keyboard_symbol_bad(KeyboardStatus.InvalidUnicode);
+        }
+        return keyboard_symbol_value(keysym, codepoint, keyboard_ascii_key(codepoint), KeyboardModifier.None);
+    }
+    if (keysym == 65288) { return keyboard_symbol_key(keysym, Key.Backspace); }
+    if (keysym == 65289) { return keyboard_symbol_key(keysym, Key.Tab); }
+    if (keysym == 65293) { return keyboard_symbol_key(keysym, Key.Enter); }
+    if (keysym == 65360) { return keyboard_symbol_key(keysym, Key.Home); }
+    if (keysym == 65361) { return keyboard_symbol_key(keysym, Key.ArrowLeft); }
+    if (keysym == 65362) { return keyboard_symbol_key(keysym, Key.ArrowUp); }
+    if (keysym == 65363) { return keyboard_symbol_key(keysym, Key.ArrowRight); }
+    if (keysym == 65364) { return keyboard_symbol_key(keysym, Key.ArrowDown); }
+    if (keysym == 65367) { return keyboard_symbol_key(keysym, Key.End); }
+    if (keysym == 65535) { return keyboard_symbol_key(keysym, Key.Delete); }
+    if (keysym == 65505 || keysym == 65506) {
+        return keyboard_symbol_modifier(keysym, KeyboardModifier.Shift);
+    }
+    if (keysym == 65507 || keysym == 65508) {
+        return keyboard_symbol_modifier(keysym, KeyboardModifier.Control);
+    }
+    if (keysym == 65509) { return keyboard_symbol_modifier(keysym, KeyboardModifier.CapsLock); }
+    if (keysym == 65511 || keysym == 65512) {
+        return keyboard_symbol_modifier(keysym, KeyboardModifier.Meta);
+    }
+    if (keysym == 65513 || keysym == 65514) {
+        return keyboard_symbol_modifier(keysym, KeyboardModifier.Alt);
+    }
+    if (keysym == 65515 || keysym == 65516) {
+        return keyboard_symbol_modifier(keysym, KeyboardModifier.Meta);
+    }
+    if (keysym == 65407) { return keyboard_symbol_modifier(keysym, KeyboardModifier.NumLock); }
+    return keyboard_symbol_bad(KeyboardStatus.UnknownSymbol);
+}
+
+fn keyboard_modifiers_valid(modifiers: KeyModifiers) i32 {
+    if ((modifiers.shift != 0 && modifiers.shift != 1)
+        || (modifiers.control != 0 && modifiers.control != 1)
+        || (modifiers.alt != 0 && modifiers.alt != 1)
+        || (modifiers.meta != 0 && modifiers.meta != 1)) { return 0; }
+    return 1;
+}
+
+pub fn keyboard_translate_symbol(raw: KeyboardRawKey, symbol: KeyboardSymbol,
+    modifiers: KeyModifiers) KeyboardTranslation {
+    let result: KeyboardTranslation = KeyboardTranslation{ .raw = raw, .symbol = symbol,
+        .modifiers = modifiers, .text = text_buffer_empty(), .status = KeyboardStatus.Ok, .valid = 0 };
+    if (raw.state != 0 && raw.state != 1) {
+        result.status = KeyboardStatus.InvalidState; return result;
+    }
+    if (keyboard_modifiers_valid(modifiers) == 0) {
+        result.status = KeyboardStatus.InvalidModifiers; return result;
+    }
+    if (symbol.valid == 0) { result.status = symbol.status; return result; }
+    result.valid = 1;
+    if (raw.state == 0 || symbol.codepoint == 0 || modifiers.control != 0
+        || modifiers.alt != 0 || modifiers.meta != 0) { return result; }
+    let encoded: KeyboardUtf8Result = keyboard_utf8_encode(symbol.codepoint);
+    if (encoded.valid == 0) {
+        result.valid = 0; result.status = encoded.status; return result;
+    }
+    result.text = encoded.text;
+    return result;
+}
+
+pub fn keyboard_translation_free(translation: *KeyboardTranslation) void {
+    text_buffer_free(&translation.*.text);
+    translation.*.valid = 0;
+}
+
+fn keyboard_map_empty(max_entries: t27) KeyboardMap {
+    return KeyboardMap{
+        .entries = ArrayList[KeyboardBinding]{ .data = null as *KeyboardBinding, .len = 0, .cap = 0 },
+        .max_entries = max_entries, .status = KeyboardStatus.Ok, .valid = 0,
+    };
+}
+
+fn keyboard_map_fail(map: *KeyboardMap, status: KeyboardStatus) void {
+    map.*.entries.len = 0;
+    map.*.status = status;
+    map.*.valid = 0;
+}
+
+pub fn keyboard_map_free(map: *KeyboardMap) void {
+    if (map.*.entries.cap > 0) { free[KeyboardBinding](&map.*.entries); }
+    map.*.entries.data = null as *KeyboardBinding;
+    map.*.entries.len = 0;
+    map.*.entries.cap = 0;
+    map.*.max_entries = 0;
+    map.*.valid = 0;
+}
+
+pub fn keyboard_map_lookup(map: *KeyboardMap, protocol_code: t27) KeyboardBinding {
+    let missing_status: KeyboardStatus = KeyboardStatus.UnknownCode;
+    if (map.*.valid == 0) { missing_status = map.*.status; }
+    let empty: KeyboardSymbol = keyboard_symbol_bad(missing_status);
+    let missing: KeyboardBinding = KeyboardBinding{ .protocol_code = protocol_code,
+        .base = empty, .shifted = empty, .key = Key.Unknown, .modifier = KeyboardModifier.None };
+    if (map.*.valid == 0) { return missing; }
+    let i: i32 = 0;
+    while (i < len[KeyboardBinding](map.*.entries)) {
+        let binding: KeyboardBinding = get[KeyboardBinding](map.*.entries, i);
+        if (binding.protocol_code == protocol_code) { return binding; }
+        i = i + 1;
+    }
+    return missing;
+}
+
+pub fn keyboard_map_translate(map: *KeyboardMap, raw: KeyboardRawKey,
+    modifiers: KeyModifiers) KeyboardTranslation {
+    let binding: KeyboardBinding = keyboard_map_lookup(map, raw.code);
+    if (binding.base.valid == 0) {
+        return KeyboardTranslation{ .raw = raw, .symbol = binding.base, .modifiers = modifiers,
+            .text = text_buffer_empty(), .status = binding.base.status, .valid = 0 };
+    }
+    let selected: KeyboardSymbol = binding.base;
+    if (modifiers.shift != 0) { selected = binding.shifted; }
+    return keyboard_translate_symbol(raw, selected, modifiers);
+}
+
+pub fn keyboard_map_translate_press(map: *KeyboardMap, protocol_code: t27,
+    modifiers: KeyModifiers) KeyboardTranslation {
+    let raw: KeyboardRawKey = KeyboardRawKey{ .code = protocol_code, .state = 1,
+        .serial = 0, .time = 0 };
+    return keyboard_map_translate(map, raw, modifiers);
+}
+
+fn keyboard_is_space(byte: t27) i32 {
+    if (byte == 32 || byte == 9 || byte == 10 || byte == 13) { return 1; }
+    return 0;
+}
+
+fn keyboard_parser_skip_space(parser: *KeyboardParser) void {
+    while (parser.*.offset < parser.*.input.len
+        && keyboard_is_space(parser.*.input[parser.*.offset] as t27) == 1) {
+        parser.*.offset = parser.*.offset + 1;
+    }
+}
+
+fn keyboard_parser_take(parser: *KeyboardParser, byte: t27) i32 {
+    if (parser.*.offset >= parser.*.input.len
+        || parser.*.input[parser.*.offset] as t27 != byte) { return 0; }
+    parser.*.offset = parser.*.offset + 1;
+    return 1;
+}
+
+fn keyboard_parser_match(parser: *KeyboardParser, value: []u8) i32 {
+    if (parser.*.offset + value.len > parser.*.input.len) { return 0; }
+    let i: i32 = 0;
+    while (i < value.len) {
+        if (parser.*.input[parser.*.offset + i] != value[i]) { return 0; }
+        i = i + 1;
+    }
+    parser.*.offset = parser.*.offset + value.len;
+    return 1;
+}
+
+fn keyboard_name_digit(byte: t27) t27 {
+    if (byte >= 65 && byte <= 90) { return byte - 64; }
+    if (byte >= 48 && byte <= 57) { return byte - 21; }
+    if (byte == 95) { return 37; }
+    return -1;
+}
+
+fn keyboard_parser_name(parser: *KeyboardParser) KeyboardParsedName {
+    let bad: KeyboardParsedName = KeyboardParsedName{ .identity = 0, .valid = 0 };
+    if (keyboard_parser_take(parser, 60) == 0) { return bad; }
+    let identity: t27 = 0;
+    let count: t27 = 0;
+    while (parser.*.offset < parser.*.input.len
+        && parser.*.input[parser.*.offset] as t27 != 62) {
+        let byte: t27 = parser.*.input[parser.*.offset] as t27;
+        let digit: t27 = keyboard_name_digit(byte);
+        if (digit < 0 || count >= 4) { return bad; }
+        // 81 is 3^4: protocol name bytes become a collision-free bounded t27
+        // identity without making binary representation an internal model.
+        identity = identity * 81 + digit;
+        count = count + 1;
+        parser.*.offset = parser.*.offset + 1;
+    }
+    if (count == 0 || keyboard_parser_take(parser, 62) == 0) { return bad; }
+    return KeyboardParsedName{ .identity = identity, .valid = 1 };
+}
+
+fn keyboard_parser_decimal(parser: *KeyboardParser) t27 {
+    let value: t27 = 0;
+    let digits: t27 = 0;
+    while (parser.*.offset < parser.*.input.len) {
+        let byte: t27 = parser.*.input[parser.*.offset] as t27;
+        if (byte < 48 || byte > 57) { break; }
+        if (digits >= 5) { parser.*.status = KeyboardStatus.InvalidCode; return -1; }
+        value = value * 10 + byte - 48;
+        digits = digits + 1;
+        parser.*.offset = parser.*.offset + 1;
+    }
+    if (digits == 0 || value < 1 || value > 65535) {
+        parser.*.status = KeyboardStatus.InvalidCode; return -1;
+    }
+    return value;
+}
+
+fn keyboard_parser_token(parser: *KeyboardParser) KeyboardToken {
+    let start: i32 = parser.*.offset;
+    while (parser.*.offset < parser.*.input.len) {
+        let byte: t27 = parser.*.input[parser.*.offset] as t27;
+        if (keyboard_is_space(byte) == 1 || byte == 44 || byte == 93) { break; }
+        if (parser.*.offset - start >= 32) {
+            return KeyboardToken{ .value = "", .valid = 0 };
+        }
+        parser.*.offset = parser.*.offset + 1;
+    }
+    if (parser.*.offset == start) { return KeyboardToken{ .value = "", .valid = 0 }; }
+    return KeyboardToken{ .value = parser.*.input[start..parser.*.offset], .valid = 1 };
+}
+
+fn keyboard_hex_digit(byte: t27) t27 {
+    if (byte >= 48 && byte <= 57) { return byte - 48; }
+    if (byte >= 65 && byte <= 70) { return byte - 55; }
+    return -1;
+}
+
+fn keyboard_named_punctuation(token: []u8) t27 {
+    if (@strEq(token, "space") == 1) { return 32; }
+    if (@strEq(token, "exclam") == 1) { return 33; }
+    if (@strEq(token, "quotedbl") == 1) { return 34; }
+    if (@strEq(token, "numbersign") == 1) { return 35; }
+    if (@strEq(token, "dollar") == 1) { return 36; }
+    if (@strEq(token, "percent") == 1) { return 37; }
+    if (@strEq(token, "ampersand") == 1) { return 38; }
+    if (@strEq(token, "apostrophe") == 1) { return 39; }
+    if (@strEq(token, "parenleft") == 1) { return 40; }
+    if (@strEq(token, "parenright") == 1) { return 41; }
+    if (@strEq(token, "asterisk") == 1) { return 42; }
+    if (@strEq(token, "plus") == 1) { return 43; }
+    if (@strEq(token, "comma") == 1) { return 44; }
+    if (@strEq(token, "minus") == 1) { return 45; }
+    if (@strEq(token, "period") == 1) { return 46; }
+    if (@strEq(token, "slash") == 1) { return 47; }
+    if (@strEq(token, "colon") == 1) { return 58; }
+    if (@strEq(token, "semicolon") == 1) { return 59; }
+    if (@strEq(token, "less") == 1) { return 60; }
+    if (@strEq(token, "equal") == 1) { return 61; }
+    if (@strEq(token, "greater") == 1) { return 62; }
+    if (@strEq(token, "question") == 1) { return 63; }
+    if (@strEq(token, "at") == 1) { return 64; }
+    if (@strEq(token, "bracketleft") == 1) { return 91; }
+    if (@strEq(token, "backslash") == 1) { return 92; }
+    if (@strEq(token, "bracketright") == 1) { return 93; }
+    if (@strEq(token, "asciicircum") == 1) { return 94; }
+    if (@strEq(token, "underscore") == 1) { return 95; }
+    if (@strEq(token, "grave") == 1) { return 96; }
+    if (@strEq(token, "braceleft") == 1) { return 123; }
+    if (@strEq(token, "bar") == 1) { return 124; }
+    if (@strEq(token, "braceright") == 1) { return 125; }
+    if (@strEq(token, "asciitilde") == 1) { return 126; }
+    return -1;
+}
+
+fn keyboard_symbol_from_token(token: []u8) KeyboardSymbol {
+    if (token.len == 1) {
+        let codepoint: t27 = token[0] as t27;
+        if (codepoint >= 33 && codepoint <= 126 && codepoint != 44 && codepoint != 93) {
+            return keyboard_symbol_value(codepoint, codepoint, keyboard_ascii_key(codepoint), KeyboardModifier.None);
+        }
+    }
+    if (token.len >= 5 && token.len <= 7 && token[0] as t27 == 85) {
+        let codepoint: t27 = 0;
+        let i: i32 = 1;
+        while (i < token.len) {
+            let digit: t27 = keyboard_hex_digit(token[i] as t27);
+            if (digit < 0) { return keyboard_symbol_bad(KeyboardStatus.InvalidUnicode); }
+            codepoint = codepoint * 16 + digit;
+            i = i + 1;
+        }
+        if (keyboard_unicode_scalar_valid(codepoint) == 0) {
+            return keyboard_symbol_bad(KeyboardStatus.InvalidUnicode);
+        }
+        return keyboard_symbol_value(16777216 + codepoint, codepoint,
+            keyboard_ascii_key(codepoint), KeyboardModifier.None);
+    }
+    let punctuation: t27 = keyboard_named_punctuation(token);
+    if (punctuation >= 0) {
+        return keyboard_symbol_value(punctuation, punctuation, keyboard_ascii_key(punctuation), KeyboardModifier.None);
+    }
+    if (@strEq(token, "BackSpace") == 1) { return keyboard_symbol_from_x11(65288); }
+    if (@strEq(token, "Tab") == 1) { return keyboard_symbol_from_x11(65289); }
+    if (@strEq(token, "Return") == 1 || @strEq(token, "Enter") == 1) {
+        return keyboard_symbol_from_x11(65293);
+    }
+    if (@strEq(token, "Home") == 1) { return keyboard_symbol_from_x11(65360); }
+    if (@strEq(token, "Left") == 1) { return keyboard_symbol_from_x11(65361); }
+    if (@strEq(token, "Up") == 1) { return keyboard_symbol_from_x11(65362); }
+    if (@strEq(token, "Right") == 1) { return keyboard_symbol_from_x11(65363); }
+    if (@strEq(token, "Down") == 1) { return keyboard_symbol_from_x11(65364); }
+    if (@strEq(token, "End") == 1) { return keyboard_symbol_from_x11(65367); }
+    if (@strEq(token, "Delete") == 1) { return keyboard_symbol_from_x11(65535); }
+    if (@strEq(token, "Shift_L") == 1) { return keyboard_symbol_from_x11(65505); }
+    if (@strEq(token, "Shift_R") == 1) { return keyboard_symbol_from_x11(65506); }
+    if (@strEq(token, "Control_L") == 1) { return keyboard_symbol_from_x11(65507); }
+    if (@strEq(token, "Control_R") == 1) { return keyboard_symbol_from_x11(65508); }
+    if (@strEq(token, "Caps_Lock") == 1) { return keyboard_symbol_from_x11(65509); }
+    if (@strEq(token, "Alt_L") == 1) { return keyboard_symbol_from_x11(65513); }
+    if (@strEq(token, "Alt_R") == 1) { return keyboard_symbol_from_x11(65514); }
+    if (@strEq(token, "Super_L") == 1) { return keyboard_symbol_from_x11(65515); }
+    if (@strEq(token, "Super_R") == 1) { return keyboard_symbol_from_x11(65516); }
+    if (@strEq(token, "Num_Lock") == 1) { return keyboard_symbol_from_x11(65407); }
+    return keyboard_symbol_bad(KeyboardStatus.UnknownSymbol);
+}
+
+fn keyboard_code_name_find(names: *ArrayList[KeyboardCodeName], identity: t27) i32 {
+    let i: i32 = 0;
+    while (i < len[KeyboardCodeName](names.*)) {
+        if (get[KeyboardCodeName](names.*, i).identity == identity) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn keyboard_code_find(names: *ArrayList[KeyboardCodeName], code: t27) i32 {
+    let i: i32 = 0;
+    while (i < len[KeyboardCodeName](names.*)) {
+        if (get[KeyboardCodeName](names.*, i).code == code) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn keyboard_parser_code_declaration(parser: *KeyboardParser,
+    names: *ArrayList[KeyboardCodeName], max_entries: t27) KeyboardStatus {
+    let name: KeyboardParsedName = keyboard_parser_name(parser);
+    if (name.valid == 0) { return KeyboardStatus.InvalidName; }
+    keyboard_parser_skip_space(parser);
+    if (keyboard_parser_take(parser, 61) == 0) { return KeyboardStatus.Malformed; }
+    keyboard_parser_skip_space(parser);
+    let code: t27 = keyboard_parser_decimal(parser);
+    if (code < 0) { return parser.*.status; }
+    if (keyboard_code_name_find(names, name.identity) >= 0) { return KeyboardStatus.DuplicateName; }
+    if (keyboard_code_find(names, code) >= 0) { return KeyboardStatus.DuplicateCode; }
+    if (len[KeyboardCodeName](names.*) as t27 >= max_entries) { return KeyboardStatus.TooManyEntries; }
+    push[KeyboardCodeName](names, KeyboardCodeName{
+        .identity = name.identity, .code = code, .bound = 0 });
+    return KeyboardStatus.Ok;
+}
+
+fn keyboard_parser_symbol(parser: *KeyboardParser) KeyboardSymbol {
+    keyboard_parser_skip_space(parser);
+    let token: KeyboardToken = keyboard_parser_token(parser);
+    if (token.valid == 0) { return keyboard_symbol_bad(KeyboardStatus.Malformed); }
+    return keyboard_symbol_from_token(token.value);
+}
+
+fn keyboard_parser_key_declaration(parser: *KeyboardParser,
+    names: *ArrayList[KeyboardCodeName], map: *KeyboardMap) KeyboardStatus {
+    if (keyboard_parser_match(parser, "key") == 0) { return KeyboardStatus.Malformed; }
+    if (parser.*.offset >= parser.*.input.len
+        || keyboard_is_space(parser.*.input[parser.*.offset] as t27) == 0) {
+        return KeyboardStatus.Malformed;
+    }
+    keyboard_parser_skip_space(parser);
+    let name: KeyboardParsedName = keyboard_parser_name(parser);
+    if (name.valid == 0) { return KeyboardStatus.InvalidName; }
+    let name_index: i32 = keyboard_code_name_find(names, name.identity);
+    if (name_index < 0) { return KeyboardStatus.MissingCode; }
+    if (names.*.data[name_index].bound != 0) { return KeyboardStatus.DuplicateKey; }
+    keyboard_parser_skip_space(parser);
+    if (keyboard_parser_take(parser, 123) == 0) { return KeyboardStatus.Malformed; }
+    keyboard_parser_skip_space(parser);
+    if (keyboard_parser_take(parser, 91) == 0) { return KeyboardStatus.Malformed; }
+    let base: KeyboardSymbol = keyboard_parser_symbol(parser);
+    if (base.valid == 0) { return base.status; }
+    keyboard_parser_skip_space(parser);
+    if (keyboard_parser_take(parser, 44) == 0) { return KeyboardStatus.Malformed; }
+    let shifted: KeyboardSymbol = keyboard_parser_symbol(parser);
+    if (shifted.valid == 0) { return shifted.status; }
+    keyboard_parser_skip_space(parser);
+    if (keyboard_parser_take(parser, 93) == 0) { return KeyboardStatus.Malformed; }
+    keyboard_parser_skip_space(parser);
+    if (keyboard_parser_take(parser, 125) == 0) { return KeyboardStatus.Malformed; }
+    if (base.key != Key.Unknown && shifted.key != Key.Unknown && base.key != shifted.key) {
+        return KeyboardStatus.Malformed;
+    }
+    if (base.modifier != KeyboardModifier.None && shifted.modifier != KeyboardModifier.None
+        && base.modifier != shifted.modifier) { return KeyboardStatus.Malformed; }
+    if (len[KeyboardBinding](map.*.entries) as t27 >= map.*.max_entries) {
+        return KeyboardStatus.TooManyEntries;
+    }
+    let key: Key = base.key;
+    if (key == Key.Unknown) { key = shifted.key; }
+    let modifier: KeyboardModifier = base.modifier;
+    if (modifier == KeyboardModifier.None) { modifier = shifted.modifier; }
+    push[KeyboardBinding](&map.*.entries, KeyboardBinding{
+        .protocol_code = names.*.data[name_index].code, .base = base, .shifted = shifted,
+        .key = key, .modifier = modifier });
+    names.*.data[name_index].bound = 1;
+    return KeyboardStatus.Ok;
+}
+
+// Parse only the deliberately bounded XKB-text interchange subset documented
+// by this grammar:
+//   <NAME> = decimal
+//   key <NAME> { [ base, shifted ] }
+// Names contain one to four ASCII uppercase letters, digits, or underscores.
+// Symbols are semantic names, named ASCII punctuation, an unambiguous direct
+// printable ASCII token, or U followed by four to six uppercase hexadecimal
+// digits. Full XKB rules/types/includes and compose processing are out of scope.
+pub fn keyboard_map_parse_xkb_subset(input: []u8, max_entries: t27) KeyboardMap {
+    let map: KeyboardMap = keyboard_map_empty(max_entries);
+    if (max_entries < 1 || max_entries > 256) {
+        map.status = KeyboardStatus.InvalidLimit; return map;
+    }
+    if (input.len == 0) { map.status = KeyboardStatus.EmptyInput; return map; }
+    if (input.len > 16384) { map.status = KeyboardStatus.InputTooLarge; return map; }
+    map.entries = make[KeyboardBinding](max_entries as i32);
+    let names: ArrayList[KeyboardCodeName] = make[KeyboardCodeName](max_entries as i32);
+    let parser: KeyboardParser = KeyboardParser{ .input = input, .offset = 0,
+        .status = KeyboardStatus.Ok };
+    let statements: t27 = 0;
+    keyboard_parser_skip_space(&parser);
+    while (parser.offset < input.len && map.status == KeyboardStatus.Ok) {
+        let status: KeyboardStatus = KeyboardStatus.Malformed;
+        if (input[parser.offset] as t27 == 60) {
+            status = keyboard_parser_code_declaration(&parser, &names, max_entries);
+        } else {
+            status = keyboard_parser_key_declaration(&parser, &names, &map);
+        }
+        if (status != KeyboardStatus.Ok) { keyboard_map_fail(&map, status); break; }
+        statements = statements + 1;
+        let statement_end: i32 = parser.offset;
+        keyboard_parser_skip_space(&parser);
+        let separated: i32 = 0;
+        if (parser.offset > statement_end) { separated = 1; }
+        if (parser.offset < input.len && input[parser.offset] as t27 == 59) {
+            parser.offset = parser.offset + 1;
+            separated = 1;
+            keyboard_parser_skip_space(&parser);
+        }
+        if (parser.offset < input.len && separated == 0) {
+            keyboard_map_fail(&map, KeyboardStatus.Malformed); break;
+        }
+    }
+    if (names.cap > 0) { free[KeyboardCodeName](&names); }
+    if (map.status != KeyboardStatus.Ok) { return map; }
+    if (statements == 0) {
+        keyboard_map_fail(&map, KeyboardStatus.EmptyInput); return map;
+    }
+    if (len[KeyboardBinding](map.entries) == 0) {
+        keyboard_map_fail(&map, KeyboardStatus.NoBindings); return map;
+    }
+    map.valid = 1;
+    return map;
+}

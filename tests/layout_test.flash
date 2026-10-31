@@ -1,0 +1,207 @@
+@import("../src/core.flash")
+@import("../src/layout.flash")
+
+fn layout_expect(ok: i32, message: []u8) i32 {
+    if (ok == 0) { _zag_print("FAIL "); _zag_println(message); return 1; }
+    return 0;
+}
+
+fn main() i32 {
+    let failures: i32 = 0;
+
+    let wrapped: Ui = ui_new(240, 180);
+    ui_begin(&wrapped);
+    let row_style: Style = theme_surface(); row_style.layout = LayoutKind.Row; row_style.padding = 8;
+    row_style.gap = 8; row_style.wrap = 1;
+    let row: i32 = ui_node(&wrapped, 1, NodeKind.Panel, -1, rect(0, 0, 200, 120), row_style,
+        semantics(Role.Group, "", "", "row"), "", Action{ .id = 0 });
+    let child_style: Style = style_default(); child_style.width = length_px(80); child_style.height = length_px(32);
+    child_style.margin = 4;
+    let first: i32 = ui_node(&wrapped, 2, NodeKind.Panel, row, rect(0, 0, 1, 1), child_style,
+        semantics(Role.Group, "", "", "first"), "", Action{ .id = 0 });
+    let second: i32 = ui_node(&wrapped, 3, NodeKind.Panel, row, rect(0, 0, 1, 1), child_style,
+        semantics(Role.Group, "", "", "second"), "", Action{ .id = 0 });
+    let third: i32 = ui_node(&wrapped, 4, NodeKind.Panel, row, rect(0, 0, 1, 1), child_style,
+        semantics(Role.Group, "", "", "third"), "", Action{ .id = 0 });
+    ui_end(&wrapped); ui_layout(&wrapped);
+    failures = failures + layout_expect(wrapped.nodes.data[first].bounds.x == 12
+        && wrapped.nodes.data[first].bounds.y == 12, "row applies padding and margin");
+    failures = failures + layout_expect(wrapped.nodes.data[second].bounds.x == 108
+        && wrapped.nodes.data[second].bounds.y == 12, "row applies deterministic gap");
+    failures = failures + layout_expect(wrapped.nodes.data[third].bounds.x == 12
+        && wrapped.nodes.data[third].bounds.y == 60, "row wrapping advances by line extent");
+    failures = failures + layout_expect(ui_check(&wrapped, 1).errors == 0,
+        "wrapped row passes strict structural checks");
+    ui_free(&wrapped);
+
+    let stack_ui: Ui = ui_new(240, 140);
+    ui_begin(&stack_ui);
+    let stack_style: Style = theme_surface(); stack_style.layout = LayoutKind.Stack; stack_style.padding = 10;
+    stack_style.align = AlignKind.Center;
+    let stack: i32 = ui_node(&stack_ui, 10, NodeKind.Panel, -1, rect(0, 0, 200, 100), stack_style,
+        semantics(Role.Group, "", "", "stack"), "", Action{ .id = 0 });
+    let percent_style: Style = style_default(); percent_style.width = length_percent(50); percent_style.height = length_px(20);
+    let percent_child: i32 = ui_node(&stack_ui, 11, NodeKind.Panel, stack, rect(0, 0, 3, 3), percent_style,
+        semantics(Role.Group, "", "", "percent"), "", Action{ .id = 0 });
+    ui_end(&stack_ui); ui_layout(&stack_ui);
+    failures = failures + layout_expect(stack_ui.nodes.data[percent_child].bounds.w == 90
+        && stack_ui.nodes.data[percent_child].bounds.h == 20
+        && stack_ui.nodes.data[percent_child].bounds.x == 55
+        && stack_ui.nodes.data[percent_child].bounds.y == 40, "typed percent sizing centers in stack content box");
+    ui_free(&stack_ui);
+
+    let grid_ui: Ui = ui_new(240, 140);
+    ui_begin(&grid_ui);
+    let grid_style: Style = theme_surface(); grid_style.layout = LayoutKind.Grid; grid_style.padding = 8;
+    grid_style.gap = 4; grid_style.columns = 2; grid_style.align = AlignKind.Stretch;
+    let grid: i32 = ui_node(&grid_ui, 20, NodeKind.Grid, -1, rect(0, 0, 220, 120), grid_style,
+        semantics(Role.Grid, "", "", "grid"), "", Action{ .id = 0 });
+    let cell_style: Style = style_default(); cell_style.margin = 4;
+    let cell0: i32 = ui_node(&grid_ui, 21, NodeKind.Panel, grid, rect(0, 0, 1, 1), cell_style,
+        semantics(Role.Cell, "", "", "c0"), "", Action{ .id = 0 });
+    let cell1: i32 = ui_node(&grid_ui, 22, NodeKind.Panel, grid, rect(0, 0, 1, 1), cell_style,
+        semantics(Role.Cell, "", "", "c1"), "", Action{ .id = 0 });
+    let cell2: i32 = ui_node(&grid_ui, 23, NodeKind.Panel, grid, rect(0, 0, 1, 1), cell_style,
+        semantics(Role.Cell, "", "", "c2"), "", Action{ .id = 0 });
+    let cell3: i32 = ui_node(&grid_ui, 24, NodeKind.Panel, grid, rect(0, 0, 1, 1), cell_style,
+        semantics(Role.Cell, "", "", "c3"), "", Action{ .id = 0 });
+    ui_end(&grid_ui); ui_layout(&grid_ui);
+    failures = failures + layout_expect(grid_ui.nodes.data[cell0].bounds.x == 12
+        && grid_ui.nodes.data[cell0].bounds.y == 12 && grid_ui.nodes.data[cell0].bounds.w == 92
+        && grid_ui.nodes.data[cell0].bounds.h == 42, "grid stretch resolves first cell");
+    failures = failures + layout_expect(grid_ui.nodes.data[cell1].bounds.x == 116
+        && grid_ui.nodes.data[cell2].bounds.y == 66, "grid assigns deterministic rows and columns");
+    failures = failures + layout_expect(ui_check(&grid_ui, 1).errors == 0,
+        "grid passes strict structural checks");
+    ui_free(&grid_ui);
+
+    let invalid: Ui = ui_new(100, 100);
+    ui_begin(&invalid);
+    let invalid_style: Style = style_default(); invalid_style.width = length_percent(140);
+    invalid_style.min_w = 80; invalid_style.max_w = 40;
+    let _invalid_node: i32 = ui_node(&invalid, 30, NodeKind.Panel, -1, rect(0, 0, 40, 40), invalid_style,
+        semantics(Role.Group, "", "", "invalid"), "", Action{ .id = 0 });
+    ui_end(&invalid);
+    failures = failures + layout_expect(ui_check(&invalid, 0).invalid_geometry == 1,
+        "checker rejects invalid typed lengths and constraints");
+    ui_free(&invalid);
+
+    let maximum: t27 = flashy_t27_max();
+    let minimum: t27 = (0 as t27) - maximum;
+    let arithmetic: t27 = 0;
+    let mirrored_arithmetic: t27 = 0;
+    let rejected_arithmetic: t27 = 27;
+    failures = failures + layout_expect(layout_add_checked(maximum, 1, &arithmetic) == 0
+        && layout_add_checked(minimum, -1, &arithmetic) == 0
+        && layout_mul_checked(maximum, 2, &arithmetic) == 0
+        && layout_sub_checked(0, minimum, &arithmetic) == 1 && arithmetic == maximum
+        && layout_mul_checked(minimum, -1, &arithmetic) == 1 && arithmetic == maximum
+        && layout_mul_checked(-1, minimum, &mirrored_arithmetic) == 1 && mirrored_arithmetic == maximum
+        && layout_mul_checked(maximum, -1, &arithmetic) == 1 && arithmetic == minimum
+        && layout_mul_checked(-1, maximum, &mirrored_arithmetic) == 1 && mirrored_arithmetic == minimum
+        && layout_mul_checked(minimum, -2, &rejected_arithmetic) == 0
+        && layout_mul_checked(-2, minimum, &rejected_arithmetic) == 0 && rejected_arithmetic == 27,
+        "balanced-t27 layout arithmetic is commutative at signed boundaries and rejects overflow");
+    failures = failures + layout_expect(rect_intersects(rect(maximum - 2, 0, 6, 10),
+            rect(maximum - 1, 0, 2, 10)) == 1
+        && rect_intersects(rect(maximum - 1, 0, 1, 1), rect(maximum, 0, 1, 1)) == 0
+        && rect_intersects(rect(minimum, 0, 1, 1), rect(maximum, 0, 1, 1)) == 0
+        && rect_intersects(rect(0, 0, -1, 1), rect(0, 0, 1, 1)) == 0,
+        "half-open intersections remain exact when positive endpoints exceed t27");
+
+    let percent_extreme: Ui = ui_new(maximum, 100);
+    ui_begin(&percent_extreme);
+    let extreme_stack_style: Style = style_default(); extreme_stack_style.layout = LayoutKind.Stack;
+    let extreme_stack: i32 = ui_node(&percent_extreme, 40, NodeKind.Panel, -1,
+        rect(0, 0, maximum, 100), extreme_stack_style,
+        semantics(Role.Group, "", "", "extreme-stack"), "", Action{ .id = 0 });
+    let extreme_percent_style: Style = style_default(); extreme_percent_style.width = length_percent(100);
+    extreme_percent_style.height = length_px(20);
+    let extreme_percent: i32 = ui_node(&percent_extreme, 41, NodeKind.Panel, extreme_stack,
+        rect(0, 0, 1, 1), extreme_percent_style,
+        semantics(Role.Group, "", "", "extreme-percent"), "", Action{ .id = 0 });
+    ui_end(&percent_extreme); ui_layout(&percent_extreme);
+    failures = failures + layout_expect(percent_extreme.nodes.data[extreme_percent].bounds.w == maximum
+        && percent_extreme.nodes.data[extreme_percent].bounds.x == 0
+        && ui_check(&percent_extreme, 1).errors == 0,
+        "maximum balanced-t27 percentage resolves without a widened intermediate");
+    ui_free(&percent_extreme);
+
+    let hidden_overflow: Ui = ui_new(maximum, 40);
+    ui_begin(&hidden_overflow);
+    let overflow_parent: i32 = ui_node(&hidden_overflow, 50, NodeKind.Panel, -1,
+        rect(0, 0, maximum, 40), style_default(),
+        semantics(Role.Group, "", "", "overflow-parent"), "", Action{ .id = 0 });
+    let _overflow_first: i32 = ui_node(&hidden_overflow, 51, NodeKind.Panel, overflow_parent,
+        rect(maximum - 2, 0, 6, 10), style_default(),
+        semantics(Role.Group, "", "", "overflow-first"), "", Action{ .id = 0 });
+    let _overflow_second: i32 = ui_node(&hidden_overflow, 52, NodeKind.Panel, overflow_parent,
+        rect(maximum - 1, 0, 2, 10), style_default(),
+        semantics(Role.Group, "", "", "overflow-second"), "", Action{ .id = 0 });
+    ui_end(&hidden_overflow);
+    let overflow_report: CheckReport = ui_check(&hidden_overflow, 0);
+    failures = failures + layout_expect(overflow_report.clipped == 2
+        && overflow_report.invalid_geometry == 2 && overflow_report.overlaps == 1,
+        "endpoint overflow cannot hide clipping or a sibling overlap from the checker");
+    ui_free(&hidden_overflow);
+
+    let exhausted_row: Ui = ui_new(maximum, 40);
+    ui_begin(&exhausted_row);
+    let exhausted_style: Style = style_default(); exhausted_style.layout = LayoutKind.Row;
+    let exhausted_parent: i32 = ui_node(&exhausted_row, 60, NodeKind.Panel, -1,
+        rect(0, 0, maximum, 40), exhausted_style,
+        semantics(Role.Group, "", "", "exhausted-row"), "", Action{ .id = 0 });
+    let maximum_child_style: Style = style_default(); maximum_child_style.width = length_px(maximum);
+    maximum_child_style.height = length_px(20);
+    let _maximum_child: i32 = ui_node(&exhausted_row, 61, NodeKind.Panel, exhausted_parent,
+        rect(0, 0, 1, 1), maximum_child_style,
+        semantics(Role.Group, "", "", "maximum-child"), "", Action{ .id = 0 });
+    let trailing_child_style: Style = style_default(); trailing_child_style.width = length_px(1);
+    trailing_child_style.height = length_px(20);
+    let trailing_child: i32 = ui_node(&exhausted_row, 62, NodeKind.Panel, exhausted_parent,
+        rect(0, 0, 1, 1), trailing_child_style,
+        semantics(Role.Group, "", "", "trailing-child"), "", Action{ .id = 0 });
+    ui_end(&exhausted_row); ui_layout(&exhausted_row);
+    let exhausted_report: CheckReport = ui_check(&exhausted_row, 0);
+    failures = failures + layout_expect(exhausted_row.nodes.data[trailing_child].bounds.w == -1
+        && exhausted_report.invalid_geometry >= 1 && exhausted_report.clipped >= 1,
+        "row cursor exhaustion produces a deterministic invalid rect instead of wrapping t27");
+    ui_free(&exhausted_row);
+
+    let bad_spacing: Ui = ui_new(100, 100);
+    ui_begin(&bad_spacing);
+    let invalid_columns_style: Style = style_default(); invalid_columns_style.layout = LayoutKind.Grid;
+    invalid_columns_style.columns = 0;
+    let invalid_columns: i32 = ui_node(&bad_spacing, 70, NodeKind.Grid, -1,
+        rect(0, 0, 40, 40), invalid_columns_style,
+        semantics(Role.Grid, "", "", "invalid-columns"), "", Action{ .id = 0 });
+    let invalid_columns_child: i32 = ui_node(&bad_spacing, 71, NodeKind.Panel, invalid_columns,
+        rect(0, 0, 1, 1), style_default(),
+        semantics(Role.Cell, "", "", "invalid-columns-child"), "", Action{ .id = 0 });
+    let row_gap_style: Style = style_default(); row_gap_style.layout = LayoutKind.Grid;
+    row_gap_style.columns = 1; row_gap_style.gap = maximum;
+    let row_gap_grid: i32 = ui_node(&bad_spacing, 72, NodeKind.Grid, -1,
+        rect(50, 0, 40, 40), row_gap_style,
+        semantics(Role.Grid, "", "", "row-gap-grid"), "", Action{ .id = 0 });
+    let _row_gap_first: i32 = ui_node(&bad_spacing, 73, NodeKind.Panel, row_gap_grid,
+        rect(0, 0, 1, 1), style_default(), semantics(Role.Cell, "", "", "r0"), "", Action{ .id = 0 });
+    let _row_gap_second: i32 = ui_node(&bad_spacing, 74, NodeKind.Panel, row_gap_grid,
+        rect(0, 0, 1, 1), style_default(), semantics(Role.Cell, "", "", "r1"), "", Action{ .id = 0 });
+    let _row_gap_third: i32 = ui_node(&bad_spacing, 75, NodeKind.Panel, row_gap_grid,
+        rect(0, 0, 1, 1), style_default(), semantics(Role.Cell, "", "", "r2"), "", Action{ .id = 0 });
+    let negative_spacing_style: Style = style_default(); negative_spacing_style.layout = LayoutKind.Row;
+    negative_spacing_style.gap = -1;
+    let _negative_spacing: i32 = ui_node(&bad_spacing, 76, NodeKind.Panel, -1,
+        rect(0, 50, 40, 40), negative_spacing_style,
+        semantics(Role.Group, "", "", "negative-spacing"), "", Action{ .id = 0 });
+    ui_end(&bad_spacing); ui_layout(&bad_spacing);
+    let spacing_report: CheckReport = ui_check(&bad_spacing, 0);
+    failures = failures + layout_expect(bad_spacing.nodes.data[invalid_columns_child].bounds.w == -1
+        && spacing_report.invalid_geometry >= 3,
+        "invalid columns, negative spacing, and derived row-gap overflow fail closed without allocation");
+    ui_free(&bad_spacing);
+
+    if (failures != 0) { return 1; }
+    _zag_println("layout_test: ok");
+    return 0;
+}

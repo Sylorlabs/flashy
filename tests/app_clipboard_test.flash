@@ -1,0 +1,949 @@
+@import("../src/flashy.flash")
+
+fn app_clipboard_expect(ok: i32, message: []u8) i32 {
+    if (ok == 0) { _zag_print("FAIL "); _zag_println(message); return 1; }
+    return 0;
+}
+
+fn app_clipboard_owner_reply(sequence: t27, owner: t27) WireBuffer {
+    let out: WireBuffer = wire_new(32);
+    wire_push_u8(&out, 1); wire_push_u8(&out, 0);
+    wire_push_u16_le(&out, sequence); wire_push_u32_le(&out, 0);
+    wire_push_u32_le(&out, owner);
+    while (len[u8](out.bytes) < 32) { wire_push_u8(&out, 0); }
+    return out;
+}
+
+fn app_clipboard_selection_request(owner: t27, requestor: t27,
+    selection: t27, target: t27, property: t27, timestamp: t27,
+    sequence: t27) WireBuffer {
+    let out: WireBuffer = wire_new(32);
+    wire_push_u8(&out, 30); wire_push_u8(&out, 0);
+    wire_push_u16_le(&out, sequence); wire_push_u32_le(&out, timestamp);
+    wire_push_u32_le(&out, owner); wire_push_u32_le(&out, requestor);
+    wire_push_u32_le(&out, selection); wire_push_u32_le(&out, target);
+    wire_push_u32_le(&out, property);
+    while (len[u8](out.bytes) < 32) { wire_push_u8(&out, 0); }
+    return out;
+}
+
+fn app_clipboard_send(fd: i64, input: *WireBuffer) i32 {
+    let expected: i64 = len[u8](input.*.bytes) as i64;
+    let sent: LinuxWriteAllResult = linux_send_wire_all(fd, input);
+    wire_free(input);
+    if (sent.complete != 0 && sent.written == expected) { return 1; }
+    return 0;
+}
+
+fn app_clipboard_fork() i64 {
+    return _zag_raw_syscall(57, 0, 0, 0, 0, 0, 0);
+}
+
+fn app_clipboard_child_exit(code: i32) void {
+    let _exited: i64 = _zag_raw_syscall(60, code as i64, 0, 0, 0, 0, 0);
+}
+
+fn app_clipboard_wait_child(pid: i64) i32 {
+    let status: LinuxByteBuffer = linux_buffer_new(4); status.len = 4;
+    let waited: i64 = _zag_raw_syscall(61, pid,
+        status.words.data as i64, 0, 0, 0, 0);
+    let raw: i64 = linux_buffer_u32(&status, 0);
+    linux_buffer_free(&status);
+    if (waited == pid && raw % 128 == 0 && (raw / 256) % 256 == 0) { return 1; }
+    return 0;
+}
+
+// mode 1 returns invalid UTF-8, mode 2 exceeds a four-byte caller limit, and
+// mode 3 deliberately keeps the transfer writer open past the read deadline.
+fn app_clipboard_wayland_remote_peer(fd: i64, offer_id: t27,
+    mode: i32) i32 {
+    let received: WaylandNativeFrameReceive =
+        wayland_receive_frame_with_fd(fd, 1000);
+    let frame: WaylandFrame = wayland_decode(&received.input, 0);
+    let mime: WireString = wire_read_string(&received.input,
+        frame.payload_offset, frame.size as i32);
+    let ok: i32 = received.valid != 0 && received.fd_count == 1
+        && received.received_fd >= 0 && frame.valid != 0
+        && frame.object_id == offer_id && frame.opcode == 1
+        && frame.size == 40
+        && frame.size == len[u8](received.input.bytes) as t27
+        && mime.valid != 0 && mime.next_offset == frame.size as i32
+        && @strEq(mime.value, wayland_clipboard_text_mime()) != 0;
+    if (ok != 0 && mode == 1) {
+        let invalid: LinuxByteBuffer = linux_buffer_new(2);
+        linux_buffer_set_byte(&invalid, 0, 192);
+        linux_buffer_set_byte(&invalid, 1, 128); invalid.len = 2;
+        let wrote: LinuxPipeWriteResult = linux_pipe_write_buffer_all_until(
+            received.received_fd, &invalid, linux_monotonic_ms() + 1000);
+        if (wrote.complete == 0 || wrote.written != 2) { ok = 0; }
+        linux_buffer_free(&invalid);
+    } else if (ok != 0 && mode == 2) {
+        let oversized: LinuxByteBuffer = linux_buffer_new(5);
+        let oversized_i: i32 = 0;
+        while (oversized_i < 5) {
+            linux_buffer_set_byte(&oversized, oversized_i, 'x');
+            oversized_i = oversized_i + 1;
+        }
+        oversized.len = 5;
+        let wrote: LinuxPipeWriteResult = linux_pipe_write_buffer_all_until(
+            received.received_fd, &oversized, linux_monotonic_ms() + 1000);
+        if (wrote.complete == 0 || wrote.written != 5) { ok = 0; }
+        linux_buffer_free(&oversized);
+    } else if (ok != 0 && mode == 3) {
+        let _held_open: i32 = linux_poll_readable(fd, 100);
+    } else if (ok != 0) { ok = 0; }
+    if (received.received_fd >= 0) {
+        let _closed_transfer: i64 = linux_close(received.received_fd);
+        received.received_fd = 0 - 1; received.has_fd = 0;
+    }
+    wayland_native_frame_free(&received);
+    return ok;
+}
+
+fn app_clipboard_wayland_process_no_fd(
+    connection: *WaylandNativeConnection, input: *WireBuffer) i32 {
+    let handled: i32 = wayland_native_clipboard_process_frame(
+        connection, input, 0 - 1, 0, 1);
+    wire_free(input); return handled;
+}
+
+fn app_clipboard_service_peer(fd: i64) i32 {
+    let change_and_barrier: WireBuffer = linux_receive_exact(fd, 40, 1000);
+    let change: X11Request = x11_decode_request(&change_and_barrier, 0);
+    let change_barrier: X11Request = x11_decode_request(&change_and_barrier, 32);
+    let first_ok: i32 = change_and_barrier.error == 0
+        && change.valid == 1 && change.opcode == 18
+        && change_barrier.valid == 1 && change_barrier.opcode == 23
+        && wire_read_u32_le(&change_and_barrier, 4) == 200
+        && wire_read_u32_le(&change_and_barrier, 8) == 300
+        && wire_read_u32_le(&change_and_barrier, 12) == 201
+        && @strEq(change_and_barrier.bytes.data[24..29], "owned") == 1;
+    wire_free(&change_and_barrier);
+    if (first_ok == 0) { return 1; }
+    let change_reply: WireBuffer = app_clipboard_owner_reply(4, 100);
+    if (app_clipboard_send(fd, &change_reply) == 0) { return 2; }
+
+    let notify_and_barrier: WireBuffer = linux_receive_exact(fd, 52, 1000);
+    let notify: X11Request = x11_decode_request(&notify_and_barrier, 0);
+    let notify_barrier: X11Request = x11_decode_request(&notify_and_barrier, 44);
+    let second_ok: i32 = notify_and_barrier.error == 0
+        && notify.valid == 1 && notify.opcode == 25
+        && notify_barrier.valid == 1 && notify_barrier.opcode == 23
+        && wire_read_u32_le(&notify_and_barrier, 4) == 200
+        && wire_read_u32_le(&notify_and_barrier, 8) == 0
+        && wire_read_u8(&notify_and_barrier, 12) == 31
+        && wire_read_u32_le(&notify_and_barrier, 20) == 200
+        && wire_read_u32_le(&notify_and_barrier, 24) == 202
+        && wire_read_u32_le(&notify_and_barrier, 28) == 201
+        && wire_read_u32_le(&notify_and_barrier, 32) == 300;
+    wire_free(&notify_and_barrier);
+    if (second_ok == 0) { return 3; }
+    let notify_reply: WireBuffer = app_clipboard_owner_reply(6, 100);
+    if (app_clipboard_send(fd, &notify_reply) == 0) { return 4; }
+    return 0;
+}
+
+fn app_clipboard_build_field(window: *Window, value: []u8) i32 {
+    ui_begin(&window.*.ui);
+    let root: i32 = ui_node(&window.*.ui, 1, NodeKind.Root, -1,
+        rect(0, 0, window.*.width, window.*.height), theme_surface(),
+        semantics(Role.Window, "Clipboard", "", "clipboard"), "", Action{ .id = 0 });
+    let field: i32 = ui_text_field_control(&window.*.ui, 2, root,
+        rect(8, 8, window.*.width - 16, 44), "Editor", value, 1);
+    ui_end(&window.*.ui); return field;
+}
+
+fn main() i32 {
+    let failures: i32 = 0;
+
+    let headless: App = app_new(BackendKind.Headless);
+    let reader_index: i32 = app_open_window(&headless, 10, "Reader", 160, 80);
+    let owner_index: i32 = app_open_window(&headless, 20, "Owner", 160, 80);
+    let invalid_read: ClipboardReadResult = app_clipboard_read(&headless, -1,
+        ClipboardKind.Clipboard, 0, 0, 64);
+    failures = failures + app_clipboard_expect(
+        app_clipboard_copy(&headless, -1, ClipboardKind.Clipboard,
+            "x", 0, 0) == ClipboardStatus.InvalidWindow
+        && invalid_read.status == ClipboardStatus.InvalidWindow
+        && app_clipboard_release(&headless, -1, ClipboardKind.Clipboard,
+            0, 0) == ClipboardStatus.InvalidWindow
+        && app_clipboard_copy_selection(&headless, -1,
+            ClipboardKind.Clipboard, 0, 0) == ClipboardStatus.InvalidWindow
+        && app_clipboard_paste_focused_text_field(&headless, -1,
+            ClipboardKind.Clipboard, 0, 0) == ClipboardStatus.InvalidWindow,
+        "every public clipboard operation rejects an invalid window identity");
+    clipboard_read_result_free(&invalid_read);
+    let shared_copy: ClipboardStatus = app_clipboard_copy(&headless, owner_index,
+        ClipboardKind.Clipboard, "shared", 0, 0);
+    let shared_read: ClipboardReadResult = app_clipboard_read(&headless, reader_index,
+        ClipboardKind.Clipboard, 0, 0, 64);
+    let wrong_release: ClipboardStatus = app_clipboard_release(&headless,
+        reader_index, ClipboardKind.Clipboard, 0, 0);
+    let owner_release: ClipboardStatus = app_clipboard_release(&headless,
+        owner_index, ClipboardKind.Clipboard, 0, 0);
+    failures = failures + app_clipboard_expect(shared_copy == ClipboardStatus.Ok
+        && shared_read.valid == 1 && shared_read.status == ClipboardStatus.Ok
+        && @strEq(text_buffer_view(&shared_read.text), "shared") == 1
+        && wrong_release == ClipboardStatus.NotOwner
+        && owner_release == ClipboardStatus.Ok,
+        "headless clipboard is global but release authority is the stable owner index");
+    clipboard_read_result_free(&shared_read);
+
+    let primary_copy: ClipboardStatus = app_clipboard_copy(&headless, owner_index,
+        ClipboardKind.Primary, "primary", 0, 0);
+    let primary_read: ClipboardReadResult = app_clipboard_read(&headless,
+        reader_index, ClipboardKind.Primary, 0, 0, 64);
+    let clipboard_after_primary: ClipboardReadResult = app_clipboard_read(&headless,
+        reader_index, ClipboardKind.Clipboard, 0, 0, 64);
+    let alias_copy: ClipboardStatus = app_clipboard_copy(&headless, owner_index,
+        ClipboardKind.Clipboard, "alias", 0, 0);
+    let alias_generation: t27 = headless.headless_clipboard.generation;
+    let alias_read: ClipboardReadResult = app_clipboard_read(&headless,
+        reader_index, ClipboardKind.Clipboard, 0, 0, 64);
+    let result_alias_copy: ClipboardStatus = app_clipboard_copy(&headless,
+        owner_index, ClipboardKind.Clipboard,
+        text_buffer_view(&alias_read.text), 0, 0);
+    clipboard_read_result_free(&alias_read);
+    let internal_alias_copy: ClipboardStatus = app_clipboard_copy(&headless,
+        owner_index, ClipboardKind.Clipboard,
+        text_buffer_view(&headless.headless_clipboard.text), 0, 0);
+    let alias_after_free: ClipboardReadResult = app_clipboard_read(&headless,
+        reader_index, ClipboardKind.Clipboard, 0, 0, 64);
+    failures = failures + app_clipboard_expect(primary_copy == ClipboardStatus.Ok
+        && primary_read.valid == 1
+        && @strEq(text_buffer_view(&primary_read.text), "primary") == 1
+        && clipboard_after_primary.status == ClipboardStatus.NoSelection
+        && alias_copy == ClipboardStatus.Ok && alias_generation == 2
+        && result_alias_copy == ClipboardStatus.Ok
+        && internal_alias_copy == ClipboardStatus.Ok
+        && headless.headless_clipboard.generation == 4
+        && alias_after_free.valid == 1
+        && @strEq(text_buffer_view(&alias_after_free.text), "alias") == 1,
+        "PRIMARY is independent and result/internal aliases are copied before slot replacement");
+    clipboard_read_result_free(&primary_read);
+    clipboard_read_result_free(&clipboard_after_primary);
+    clipboard_read_result_free(&alias_after_free);
+
+    headless.headless_clipboard.generation = -7;
+    let empty_copy: ClipboardStatus = app_clipboard_copy(&headless, owner_index,
+        ClipboardKind.Clipboard, "", 0, 0);
+    let empty_read: ClipboardReadResult = app_clipboard_read(&headless, reader_index,
+        ClipboardKind.Clipboard, 0, 0, 64);
+    let owner_window: *Window = app_window(&headless, owner_index);
+    owner_window.*.key = 999;
+    let mutable_key_release: ClipboardStatus = app_clipboard_release(&headless,
+        owner_index, ClipboardKind.Clipboard, 0, 0);
+    headless.headless_clipboard.generation = flashy_t27_max();
+    let wrapped_copy: ClipboardStatus = app_clipboard_copy(&headless, owner_index,
+        ClipboardKind.Clipboard, "closing", 0, 0);
+    let invalid_timestamp: ClipboardStatus = app_clipboard_copy(&headless,
+        owner_index, ClipboardKind.Clipboard, "bad", 4294967296, 0);
+    let closed_owner: i32 = app_close_window(&headless, owner_index);
+    let after_close: ClipboardReadResult = app_clipboard_read(&headless,
+        reader_index, ClipboardKind.Clipboard, 0, 0, 64);
+    let closed_read: ClipboardReadResult = app_clipboard_read(&headless,
+        owner_index, ClipboardKind.Clipboard, 0, 0, 64);
+    let closed_copy_selection: ClipboardStatus = app_clipboard_copy_selection(
+        &headless, owner_index, ClipboardKind.Clipboard, 0, 0);
+    let closed_paste: ClipboardStatus = app_clipboard_paste_focused_text_field(
+        &headless, owner_index, ClipboardKind.Clipboard, 0, 0);
+    failures = failures + app_clipboard_expect(empty_copy == ClipboardStatus.Ok
+        && empty_read.valid == 1 && len[u8](text_buffer_view(&empty_read.text)) == 0
+        && mutable_key_release == ClipboardStatus.Ok
+        && wrapped_copy == ClipboardStatus.Ok
+        && headless.headless_clipboard.generation == 1
+        && invalid_timestamp == ClipboardStatus.InvalidArgument
+        && closed_owner == 1 && after_close.status == ClipboardStatus.NoSelection
+        && app_clipboard_copy(&headless, owner_index, ClipboardKind.Clipboard,
+            "closed", 0, 0) == ClipboardStatus.InvalidWindow
+        && closed_read.status == ClipboardStatus.InvalidWindow
+        && app_clipboard_release(&headless, owner_index, ClipboardKind.Clipboard,
+            0, 0) == ClipboardStatus.InvalidWindow
+        && closed_copy_selection == ClipboardStatus.InvalidWindow
+        && closed_paste == ClipboardStatus.InvalidWindow,
+        "empty text, generation normalization, mutable keys, timestamp bounds, and owner close are deterministic");
+    clipboard_read_result_free(&empty_read); clipboard_read_result_free(&after_close);
+    clipboard_read_result_free(&closed_read);
+    let post_close_copy: ClipboardStatus = app_clipboard_copy(&headless,
+        reader_index, ClipboardKind.Clipboard, "after-close", 0, 0);
+    let post_close_generation: t27 = headless.headless_clipboard.generation;
+    let post_close_release: ClipboardStatus = app_clipboard_release(&headless,
+        reader_index, ClipboardKind.Clipboard, 0, 0);
+    failures = failures + app_clipboard_expect(post_close_copy == ClipboardStatus.Ok
+        && post_close_generation == 2
+        && post_close_release == ClipboardStatus.Ok,
+        "generation advances across owner-close cleanup and later ownership");
+    app_shutdown(&headless);
+    failures = failures + app_clipboard_expect(
+        headless.headless_clipboard.text.bytes.cap == 0
+        && headless.headless_primary.text.bytes.cap == 0,
+        "shutdown reclaims both headless slots unconditionally");
+
+    let editor: App = app_new(BackendKind.Headless);
+    let editor_index: i32 = app_open_window(&editor, 30, "Editor", 180, 80);
+    let editor_window: *Window = app_window(&editor, editor_index);
+    let editor_field: i32 = app_clipboard_build_field(editor_window, "hello world");
+    let editor_locator: Locator = locate_key(&editor_window.*.ui, 2);
+    let no_focus_copy: ClipboardStatus = app_clipboard_copy_selection(&editor,
+        editor_index, ClipboardKind.Clipboard, 0, 0);
+    let no_focus_paste: ClipboardStatus = app_clipboard_paste_focused_text_field(
+        &editor, editor_index, ClipboardKind.Clipboard, 0, 0);
+    let _editor_focus: i32 = locator_focus(&editor_window.*.ui, editor_locator);
+    let collapsed_copy: ClipboardStatus = app_clipboard_copy_selection(&editor,
+        editor_index, ClipboardKind.Clipboard, 0, 0);
+    editor_window.*.ui.nodes.data[editor_field].style.enabled = 0;
+    let disabled_copy: ClipboardStatus = app_clipboard_copy_selection(&editor,
+        editor_index, ClipboardKind.Clipboard, 0, 0);
+    let disabled_paste: ClipboardStatus = app_clipboard_paste_focused_text_field(
+        &editor, editor_index, ClipboardKind.Clipboard, 0, 0);
+    editor_window.*.ui.nodes.data[editor_field].style.enabled = 1;
+    editor_window.*.ui.nodes.data[editor_field].selection_start = 99;
+    editor_window.*.ui.nodes.data[editor_field].selection_end = 100;
+    let corrupt_copy: ClipboardStatus = app_clipboard_copy_selection(&editor,
+        editor_index, ClipboardKind.Clipboard, 0, 0);
+    let corrupt_paste: ClipboardStatus = app_clipboard_paste_focused_text_field(
+        &editor, editor_index, ClipboardKind.Clipboard, 0, 0);
+    editor_window.*.ui.nodes.data[editor_field].caret = 11;
+    editor_window.*.ui.nodes.data[editor_field].selection_start = 11;
+    editor_window.*.ui.nodes.data[editor_field].selection_end = 11;
+    let _editor_selection: i32 = locator_set_selection(
+        &editor_window.*.ui, editor_locator, 0, 5);
+    let selection_copy: ClipboardStatus = app_clipboard_copy_selection(&editor,
+        editor_index, ClipboardKind.Clipboard, 0, 0);
+    let _editor_fill: i32 = locator_fill(&editor_window.*.ui, editor_locator, "bye");
+    let _replace_selection: i32 = locator_set_selection(
+        &editor_window.*.ui, editor_locator, 0, 3);
+    let pasted: ClipboardStatus = app_clipboard_paste_focused_text_field(&editor,
+        editor_index, ClipboardKind.Clipboard, 0, 0);
+    failures = failures + app_clipboard_expect(editor_field >= 0
+        && no_focus_copy == ClipboardStatus.NoFocusedTextField
+        && no_focus_paste == ClipboardStatus.NoFocusedTextField
+        && collapsed_copy == ClipboardStatus.NoSelection
+        && disabled_copy == ClipboardStatus.NoFocusedTextField
+        && disabled_paste == ClipboardStatus.NoFocusedTextField
+        && corrupt_copy == ClipboardStatus.EditRejected
+        && corrupt_paste == ClipboardStatus.EditRejected
+        && selection_copy == ClipboardStatus.Ok && pasted == ClipboardStatus.Ok
+        && @strEq(editor_window.*.ui.nodes.data[editor_field].text, "hello") == 1,
+        "focused TextField selection copy and paste preserve owned UTF-8 text");
+
+    let oversized: ArrayList[u8] = make[u8]((clipboard_max_bytes() + 1) as i32);
+    let oversized_i: t27 = 0;
+    while (oversized_i <= clipboard_max_bytes()) {
+        push[u8](&oversized, 97 as u8); oversized_i = oversized_i + 1;
+    }
+    let oversized_index: i32 = app_open_window(&editor, 31, "Oversized", 180, 80);
+    let oversized_window: *Window = app_window(&editor, oversized_index);
+    let oversized_field: i32 = app_clipboard_build_field(
+        oversized_window, oversized.data[0..oversized.len]);
+    oversized_window.*.ui.focused_node = oversized_field;
+    oversized_window.*.ui.nodes.data[oversized_field].caret = oversized.len as t27;
+    oversized_window.*.ui.nodes.data[oversized_field].selection_start = 0;
+    oversized_window.*.ui.nodes.data[oversized_field].selection_end = oversized.len as t27;
+    let oversized_copy: ClipboardStatus = app_clipboard_copy_selection(&editor,
+        oversized_index, ClipboardKind.Clipboard, 0, 0);
+    let preserved_clipboard: ClipboardReadResult = app_clipboard_read(&editor,
+        editor_index, ClipboardKind.Clipboard, 0, 0, clipboard_max_bytes());
+    failures = failures + app_clipboard_expect(
+        oversized_copy == ClipboardStatus.TooLarge
+        && preserved_clipboard.valid == 1
+        && @strEq(text_buffer_view(&preserved_clipboard.text), "hello") == 1,
+        "selection byte range is bounded before allocation and prior clipboard stays fail-atomic");
+    free[u8](&oversized); clipboard_read_result_free(&preserved_clipboard);
+
+    let full: ArrayList[u8] = make[u8](text_field_max_bytes() as i32);
+    let full_i: t27 = 0;
+    while (full_i < text_field_max_bytes()) {
+        push[u8](&full, 98 as u8); full_i = full_i + 1;
+    }
+    let full_index: i32 = app_open_window(&editor, 32, "Full", 180, 80);
+    let full_window: *Window = app_window(&editor, full_index);
+    let full_field: i32 = app_clipboard_build_field(
+        full_window, full.data[0..full.len]);
+    let _full_focus: i32 = ui_set_focus(&full_window.*.ui, full_field);
+    let overflow_paste: ClipboardStatus = app_clipboard_paste_focused_text_field(
+        &editor, full_index, ClipboardKind.Clipboard, 0, 0);
+    failures = failures + app_clipboard_expect(
+        overflow_paste == ClipboardStatus.EditRejected
+        && len[u8](full_window.*.ui.nodes.data[full_field].text)
+            == text_field_max_bytes() as i32
+        && full_window.*.ui.nodes.data[full_field].text[0] == (98 as u8)
+        && full_window.*.ui.nodes.data[full_field].text[
+            text_field_max_bytes() as i32 - 1] == (98 as u8),
+        "paste overflow preserves the full TextField atomically");
+    free[u8](&full);
+    app_shutdown(&editor);
+
+    let unsupported: App = app_new(BackendKind.Headless);
+    let unsupported_index: i32 = app_open_window(&unsupported, 40, "Wayland", 100, 60);
+    let unsupported_window: *Window = app_window(&unsupported, unsupported_index);
+    unsupported.backend.active = BackendKind.Wayland;
+    unsupported_window.*.backend = BackendKind.Wayland;
+    let unsupported_read: ClipboardReadResult = app_clipboard_read(&unsupported,
+        unsupported_index, ClipboardKind.Clipboard, 0, 0, 64);
+    failures = failures + app_clipboard_expect(
+        app_clipboard_copy(&unsupported, unsupported_index,
+            ClipboardKind.Clipboard, "x", 0, 0) == ClipboardStatus.Unsupported
+        && unsupported_read.status == ClipboardStatus.Unsupported
+        && app_clipboard_release(&unsupported, unsupported_index,
+            ClipboardKind.Clipboard, 0, 0) == ClipboardStatus.Unsupported,
+        "Wayland clipboard is Unsupported when the optional manager is unavailable");
+    clipboard_read_result_free(&unsupported_read); app_shutdown(&unsupported);
+
+    let wayland_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + app_clipboard_expect(wayland_peer.ok == 1,
+        "public Wayland clipboard fake compositor opens");
+    if (wayland_peer.ok == 1) {
+        let wayland_app: App = app_new(BackendKind.Headless);
+        let wayland_owner_index: i32 = app_open_window(
+            &wayland_app, 45, "Wayland owner", 120, 70);
+        let wayland_reader_index: i32 = app_open_window(
+            &wayland_app, 46, "Wayland reader", 120, 70);
+        let wayland_owner: *Window = app_window(
+            &wayland_app, wayland_owner_index);
+        let wayland_reader: *Window = app_window(
+            &wayland_app, wayland_reader_index);
+        wayland_disconnect(&wayland_app.wayland);
+        wayland_app.wayland = wayland_empty_connection();
+        wayland_app.backend.active = BackendKind.Wayland;
+        wayland_app.backend.connected = 1;
+        wayland_app.backend.deterministic = 0;
+        wayland_owner.*.backend = BackendKind.Wayland;
+        wayland_owner.*.wayland_native.surface_id = 70;
+        wayland_reader.*.backend = BackendKind.Wayland;
+        wayland_reader.*.wayland_native.surface_id = 71;
+        wayland_app.wayland.fd = wayland_peer.first;
+        wayland_app.wayland.connected = 1;
+        wayland_app.wayland.registry_ready = 1;
+        wayland_app.wayland.seat_id = 7;
+        wayland_app.wayland.seat_version = 3;
+        wayland_app.wayland.seat_has_keyboard = 1;
+        wayland_app.wayland.keyboard_focus_surface = 70;
+        let _wayland_owner_registered: i32 =
+            wayland_connection_register_surface(&wayland_app.wayland, 70);
+        let _wayland_reader_registered: i32 =
+            wayland_connection_register_surface(&wayland_app.wayland, 71);
+        wayland_app.wayland.clipboard_manager_id = 8;
+        wayland_app.wayland.clipboard_device_id = 9;
+        wayland_app.wayland.clipboard_state =
+            wayland_clipboard_state_new(8, 9, 7);
+        wayland_app.wayland.clipboard_available = 1;
+        wayland_app.wayland.clipboard_order = 1;
+        wayland_app.wayland.clipboard_serial = WaylandNativeClipboardSerial{
+            .value = 0, .seat_id = 7, .surface_id = 70,
+            .order = 1, .valid = 1 };
+        wayland_app.wayland.next_id = 100;
+
+        let primary_wayland_read: ClipboardReadResult = app_clipboard_read(
+            &wayland_app, wayland_owner_index, ClipboardKind.Primary,
+            123, 100, 64);
+        failures = failures + app_clipboard_expect(
+            app_clipboard_copy(&wayland_app, wayland_owner_index,
+                ClipboardKind.Primary, "primary", 123, 100)
+                == ClipboardStatus.Unsupported
+            && primary_wayland_read.status == ClipboardStatus.Unsupported
+            && app_clipboard_release(&wayland_app, wayland_owner_index,
+                ClipboardKind.Primary, 123, 100)
+                == ClipboardStatus.Unsupported
+            && app_clipboard_status_from_wayland(
+                wayland_native_clipboard_status_from_error(
+                    WaylandClipboardError.TransferFailed))
+                == ClipboardStatus.TransportFailed
+            && linux_poll_readable(wayland_peer.second, 0) == 0,
+            "Wayland Primary stays Unsupported and typed receive construction failures map through App");
+        clipboard_read_result_free(&primary_wayland_read);
+
+        let public_valid_zero: WaylandNativeClipboardSerial =
+            wayland_app.wayland.clipboard_serial;
+        wayland_app.wayland.clipboard_serial =
+            wayland_native_empty_clipboard_serial();
+        let no_serial_public_read: ClipboardReadResult = app_clipboard_read(
+            &wayland_app, wayland_owner_index, ClipboardKind.Clipboard,
+            1, 100, 64);
+        failures = failures + app_clipboard_expect(
+            app_clipboard_copy(&wayland_app, wayland_owner_index,
+                ClipboardKind.Clipboard, "no-serial", 1, 100)
+                == ClipboardStatus.OwnershipRejected
+            && no_serial_public_read.status == ClipboardStatus.OwnershipRejected
+            && wayland_app.wayland.next_id == 100
+            && linux_poll_readable(wayland_peer.second, 0) == 0,
+            "public serial.valid false rejects copy/read before wire while numeric zero remains representable");
+        clipboard_read_result_free(&no_serial_public_read);
+        wayland_app.wayland.clipboard_serial = public_valid_zero;
+
+        let wayland_first_copy: ClipboardStatus = app_clipboard_copy(
+            &wayland_app, wayland_owner_index, ClipboardKind.Clipboard,
+            "first", 4294967295, 1000);
+        let first_create: WireBuffer = wayland_receive_frame(
+            wayland_peer.second, 100);
+        let first_offer: WireBuffer = wayland_receive_frame(
+            wayland_peer.second, 100);
+        let first_select: WireBuffer = wayland_receive_frame(
+            wayland_peer.second, 100);
+        wire_free(&first_create); wire_free(&first_offer); wire_free(&first_select);
+        let first_source_identity: WaylandClipboardIdentity =
+            wayland_app.wayland.clipboard_published_identity;
+        let wayland_second_copy: ClipboardStatus = app_clipboard_copy(
+            &wayland_app, wayland_owner_index, ClipboardKind.Clipboard,
+            "second", 7, 1000);
+        let second_create: WireBuffer = wayland_receive_frame(
+            wayland_peer.second, 100);
+        let second_offer: WireBuffer = wayland_receive_frame(
+            wayland_peer.second, 100);
+        let second_select: WireBuffer = wayland_receive_frame(
+            wayland_peer.second, 100);
+        wire_free(&second_create); wire_free(&second_offer); wire_free(&second_select);
+        let second_source_identity: WaylandClipboardIdentity =
+            wayland_app.wayland.clipboard_published_identity;
+        let unfocused_local: ClipboardReadResult = app_clipboard_read(
+            &wayland_app, wayland_reader_index, ClipboardKind.Clipboard,
+            8, 100, 64);
+        let focused_local: ClipboardReadResult = app_clipboard_read(
+            &wayland_app, wayland_owner_index, ClipboardKind.Clipboard,
+            8, 100, 64);
+        let wrong_wayland_release: ClipboardStatus = app_clipboard_release(
+            &wayland_app, wayland_reader_index, ClipboardKind.Clipboard,
+            8, 100);
+        failures = failures + app_clipboard_expect(
+            wayland_first_copy == ClipboardStatus.Ok
+            && wayland_second_copy == ClipboardStatus.Ok
+            && unfocused_local.status == ClipboardStatus.OwnershipRejected
+            && focused_local.valid != 0
+            && @strEq(text_buffer_view(&focused_local.text), "second") != 0
+            && wrong_wayland_release == ClipboardStatus.NotOwner
+            && linux_poll_readable(wayland_peer.second, 0) == 0,
+            "public Wayland copy accepts serial zero, self-read requires focus, and owner identity is exact");
+        clipboard_read_result_free(&unfocused_local);
+        clipboard_read_result_free(&focused_local);
+
+        let wayland_field: i32 = app_clipboard_build_field(
+            wayland_owner, "draft");
+        let wayland_field_locator: Locator = locate_key(
+            &wayland_owner.*.ui, 2);
+        let _wayland_field_focus: i32 = locator_focus(
+            &wayland_owner.*.ui, wayland_field_locator);
+        let _wayland_field_selection: i32 = locator_set_selection(
+            &wayland_owner.*.ui, wayland_field_locator, 0, 5);
+        let saved_public_serial: WaylandNativeClipboardSerial =
+            wayland_app.wayland.clipboard_serial;
+        wayland_app.wayland.clipboard_serial =
+            wayland_native_empty_clipboard_serial();
+        let failed_wayland_copy_selection: ClipboardStatus =
+            app_clipboard_copy_selection(&wayland_app,
+                wayland_owner_index, ClipboardKind.Clipboard, 8, 100);
+        let failed_wayland_paste: ClipboardStatus =
+            app_clipboard_paste_focused_text_field(&wayland_app,
+                wayland_owner_index, ClipboardKind.Clipboard, 8, 100);
+        wayland_app.wayland.clipboard_serial = saved_public_serial;
+        let selection_failure_preserved: ClipboardReadResult =
+            app_clipboard_read(&wayland_app, wayland_owner_index,
+                ClipboardKind.Clipboard, 8, 100, 64);
+        failures = failures + app_clipboard_expect(
+            failed_wayland_copy_selection == ClipboardStatus.OwnershipRejected
+            && failed_wayland_paste == ClipboardStatus.OwnershipRejected
+            && wayland_field >= 0
+            && @strEq(wayland_owner.*.ui.nodes.data[wayland_field].text,
+                "draft") != 0
+            && selection_failure_preserved.valid != 0
+            && @strEq(text_buffer_view(&selection_failure_preserved.text),
+                "second") != 0
+            && linux_poll_readable(wayland_peer.second, 0) == 0,
+            "Wayland copy-selection/paste failures preserve both local clipboard and TextField atomically");
+        clipboard_read_result_free(&selection_failure_preserved);
+
+        let wayland_invalid_utf8: ArrayList[u8] = make[u8](2);
+        push[u8](&wayland_invalid_utf8, 192 as u8);
+        push[u8](&wayland_invalid_utf8, 128 as u8);
+        let wayland_too_large: ArrayList[u8] = make[u8](
+            (clipboard_max_bytes() + 1) as i32);
+        let wayland_large_i: t27 = 0;
+        while (wayland_large_i <= clipboard_max_bytes()) {
+            push[u8](&wayland_too_large, 'x');
+            wayland_large_i = wayland_large_i + 1;
+        }
+        let public_invalid_utf8: ClipboardStatus = app_clipboard_copy(
+            &wayland_app, wayland_owner_index, ClipboardKind.Clipboard,
+            wayland_invalid_utf8.data[0..2], 8, 100);
+        let public_too_large: ClipboardStatus = app_clipboard_copy(
+            &wayland_app, wayland_owner_index, ClipboardKind.Clipboard,
+            wayland_too_large.data[0..len[u8](wayland_too_large)], 8, 100);
+        let public_timeout: ClipboardStatus = app_clipboard_copy(
+            &wayland_app, wayland_owner_index, ClipboardKind.Clipboard,
+            "timeout", 8, 0);
+        let timeout_preserved: ClipboardReadResult = app_clipboard_read(
+            &wayland_app, wayland_owner_index, ClipboardKind.Clipboard,
+            8, 100, 64);
+        failures = failures + app_clipboard_expect(
+            public_invalid_utf8 == ClipboardStatus.InvalidUtf8
+            && public_too_large == ClipboardStatus.TooLarge
+            && public_timeout == ClipboardStatus.Timeout
+            && wayland_app.wayland.next_id == 102
+            && wayland_app.wayland.clipboard_callback_obligations == 2
+            && timeout_preserved.valid != 0
+            && @strEq(text_buffer_view(&timeout_preserved.text), "second") != 0
+            && linux_poll_readable(wayland_peer.second, 0) == 0,
+            "Wayland validation/zero-deadline statuses are typed and preserve prior publication");
+        free[u8](&wayland_invalid_utf8); free[u8](&wayland_too_large);
+        clipboard_read_result_free(&timeout_preserved);
+
+        let saved_next_id: t27 = wayland_app.wayland.next_id;
+        wayland_app.wayland.next_id = wayland_native_max_client_object_id();
+        let public_resource_limit: ClipboardStatus = app_clipboard_copy(
+            &wayland_app, wayland_owner_index, ClipboardKind.Clipboard,
+            "never", 9, 100);
+        failures = failures + app_clipboard_expect(
+            public_resource_limit == ClipboardStatus.ResourceLimit
+            && wayland_app.wayland.next_id
+                == wayland_native_max_client_object_id()
+            && linux_poll_readable(wayland_peer.second, 0) == 0,
+            "public Wayland copy maps missing source/callback ID pair to pre-transport ResourceLimit");
+        wayland_app.wayland.next_id = saved_next_id;
+
+        // Owner release is unconditional: remove all focus/serial authority and
+        // still observe only source.destroy + display.sync on the wire.
+        wayland_app.wayland.clipboard_serial =
+            wayland_native_empty_clipboard_serial();
+        wayland_app.wayland.keyboard_focus_surface = 0;
+        let public_release: ClipboardStatus = app_clipboard_release(
+            &wayland_app, wayland_owner_index, ClipboardKind.Clipboard,
+            10, 1000);
+        let released_destroy: WireBuffer = wayland_receive_frame(
+            wayland_peer.second, 100);
+        let released_barrier: WireBuffer = wayland_receive_frame(
+            wayland_peer.second, 100);
+        let released_destroy_frame: WaylandFrame = wayland_decode(
+            &released_destroy, 0);
+        let released_barrier_frame: WaylandFrame = wayland_decode(
+            &released_barrier, 0);
+        failures = failures + app_clipboard_expect(
+            public_release == ClipboardStatus.Ok
+            && released_destroy_frame.valid != 0
+            && released_destroy_frame.object_id == 101
+            && released_destroy_frame.opcode == 1
+            && released_barrier_frame.valid != 0
+            && released_barrier_frame.object_id == 1
+            && released_barrier_frame.opcode == 0
+            && wire_read_u32_le(&released_barrier,
+                released_barrier_frame.payload_offset) == 102
+            && linux_poll_readable(wayland_peer.second, 0) == 0,
+            "public release needs no focus serial and never emits set_selection(NULL)");
+        wire_free(&released_destroy); wire_free(&released_barrier);
+
+        // Closing the stable owner must additionally schedule the older first
+        // generation; the already-scheduled second generation is not resent.
+        let public_closed: i32 = app_close_window(
+            &wayland_app, wayland_owner_index);
+        let older_destroy: WireBuffer = wayland_receive_frame(
+            wayland_peer.second, 100);
+        let older_barrier: WireBuffer = wayland_receive_frame(
+            wayland_peer.second, 100);
+        let older_destroy_frame: WaylandFrame = wayland_decode(
+            &older_destroy, 0);
+        let older_barrier_frame: WaylandFrame = wayland_decode(
+            &older_barrier, 0);
+        let every_owner_source_destroying: i32 = 1;
+        let owner_source_i: i32 = 0;
+        while (owner_source_i < len[WaylandNativeClipboardSourceRecord](
+            wayland_app.wayland.clipboard_sources)) {
+            if (wayland_app.wayland.clipboard_sources.data[
+                    owner_source_i].owner_surface_id == 70
+                && (wayland_app.wayland.clipboard_sources.data[
+                    owner_source_i].destroy_sent == 0
+                    || wayland_app.wayland.clipboard_sources.data[
+                    owner_source_i].destroy_barrier_sent == 0)) {
+                every_owner_source_destroying = 0;
+            }
+            owner_source_i = owner_source_i + 1;
+        }
+        failures = failures + app_clipboard_expect(
+            public_closed == 1 && older_destroy_frame.valid != 0
+            && older_destroy_frame.object_id == 100
+            && older_destroy_frame.opcode == 1
+            && older_destroy_frame.size == 8
+            && older_barrier_frame.valid != 0
+            && older_barrier_frame.object_id == 1
+            && older_barrier_frame.opcode == 0
+            && wire_read_u32_le(&older_barrier,
+                older_barrier_frame.payload_offset) == 103
+            && every_owner_source_destroying != 0
+            && wayland_app.wayland.clipboard_published_kind
+                == WaylandNativeClipboardAuthorityKind.None
+            && linux_poll_readable(wayland_peer.second, 0) == 0,
+            "public owner close emits older destroy100/sync103 without resending destroy101/sync102");
+        wire_free(&older_destroy); wire_free(&older_barrier);
+
+        let post_close_pipe: LinuxFdPair = linux_pipe_cloexec();
+        let post_close_send: WireBuffer = wayland_clipboard_source_send_event(
+            100, wayland_clipboard_text_mime());
+        let post_close_serviced: i32 = wayland_native_clipboard_process_frame(
+            &wayland_app.wayland, &post_close_send,
+            post_close_pipe.second, 1, 1);
+        let post_close_bytes: WireBuffer = linux_receive_exact(
+            post_close_pipe.first, 5, 100);
+        let _post_close_read_closed: i64 = linux_close(post_close_pipe.first);
+        let first_done: WireBuffer = wayland_u32_request(103, 0, 1);
+        let first_committed: i32 =
+            wayland_native_clipboard_process_callback_frame(
+                &wayland_app.wayland, &first_done, 0 - 1, 0, 1);
+        let second_after_first_index: i32 =
+            wayland_native_clipboard_source_index(
+                &wayland_app.wayland, second_source_identity);
+        let second_after_first_exact: i32 = 0;
+        if (second_after_first_index >= 0
+            && @strEq(wayland_app.wayland.clipboard_sources.data[
+                second_after_first_index].text.data[0..
+                    len[u8](wayland_app.wayland.clipboard_sources.data[
+                        second_after_first_index].text)], "second") != 0) {
+            second_after_first_exact = 1;
+        }
+        failures = failures + app_clipboard_expect(
+            post_close_pipe.ok != 0 && post_close_serviced == 1
+            && post_close_bytes.error == 0
+            && @strEq(post_close_bytes.bytes.data[0..
+                len[u8](post_close_bytes.bytes)], "first") != 0
+            && first_committed == 1
+            && wayland_native_clipboard_source_index(
+                &wayland_app.wayland, first_source_identity) < 0
+            && second_after_first_exact != 0,
+            "callback103 frees only source100 while source101 keeps exact second-generation bytes");
+        wire_free(&post_close_send); wire_free(&post_close_bytes);
+        wire_free(&first_done);
+        let second_done: WireBuffer = wayland_u32_request(102, 0, 1);
+        let second_committed: i32 =
+            wayland_native_clipboard_process_callback_frame(
+                &wayland_app.wayland, &second_done, 0 - 1, 0, 1);
+        failures = failures + app_clipboard_expect(second_committed == 1
+            && wayland_native_clipboard_source_index(
+                &wayland_app.wayland, second_source_identity) < 0,
+            "callback102 independently frees only the second source generation");
+        wire_free(&second_done);
+        app_shutdown(&wayland_app);
+        let _wayland_peer_closed: i64 = linux_close(wayland_peer.second);
+    }
+
+    // Public Wayland reads preserve the exact typed result from the native
+    // absolute-deadline pipe reader rather than collapsing remote failures.
+    let remote_wayland_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + app_clipboard_expect(remote_wayland_peer.ok == 1,
+        "public remote Wayland clipboard fake compositor opens");
+    if (remote_wayland_peer.ok == 1) {
+        let remote_wayland: App = app_new(BackendKind.Headless);
+        let remote_window_index: i32 = app_open_window(
+            &remote_wayland, 47, "Wayland remote", 120, 70);
+        let remote_window: *Window = app_window(
+            &remote_wayland, remote_window_index);
+        wayland_disconnect(&remote_wayland.wayland);
+        remote_wayland.wayland = wayland_empty_connection();
+        remote_wayland.backend.active = BackendKind.Wayland;
+        remote_wayland.backend.connected = 1;
+        remote_wayland.backend.deterministic = 0;
+        remote_window.*.backend = BackendKind.Wayland;
+        remote_window.*.wayland_native.surface_id = 80;
+        remote_wayland.wayland.fd = remote_wayland_peer.first;
+        remote_wayland.wayland.connected = 1;
+        remote_wayland.wayland.registry_ready = 1;
+        remote_wayland.wayland.seat_id = 7;
+        remote_wayland.wayland.seat_version = 3;
+        remote_wayland.wayland.seat_has_keyboard = 1;
+        remote_wayland.wayland.keyboard_focus_surface = 80;
+        let _remote_surface_registered: i32 =
+            wayland_connection_register_surface(&remote_wayland.wayland, 80);
+        remote_wayland.wayland.clipboard_manager_id = 8;
+        remote_wayland.wayland.clipboard_device_id = 9;
+        remote_wayland.wayland.clipboard_state =
+            wayland_clipboard_state_new(8, 9, 7);
+        remote_wayland.wayland.clipboard_available = 1;
+        remote_wayland.wayland.clipboard_order = 1;
+        remote_wayland.wayland.clipboard_serial =
+            WaylandNativeClipboardSerial{ .value = 0, .seat_id = 7,
+                .surface_id = 80, .order = 1, .valid = 1 };
+        remote_wayland.wayland.next_id = 100;
+        let public_offer_id: t27 = wayland_server_new_id_min() + 20;
+        let public_offer: WireBuffer = wayland_clipboard_data_offer_event(
+            9, public_offer_id);
+        let public_mime: WireBuffer = wayland_clipboard_offer_mime_event(
+            public_offer_id, wayland_clipboard_text_mime());
+        let public_select: WireBuffer = wayland_clipboard_selection_event(
+            9, public_offer_id);
+        let public_offer_processed: i32 =
+            app_clipboard_wayland_process_no_fd(
+                &remote_wayland.wayland, &public_offer)
+            && app_clipboard_wayland_process_no_fd(
+                &remote_wayland.wayland, &public_mime)
+            && app_clipboard_wayland_process_no_fd(
+                &remote_wayland.wayland, &public_select);
+        let public_selection: WaylandNativePendingEvent =
+            wayland_connection_take_pending_event(&remote_wayland.wayland);
+        let public_selection_applied: i32 =
+            wayland_native_clipboard_apply_transition(
+                &remote_wayland.wayland, &public_selection.clipboard);
+        wayland_native_pending_event_free(&public_selection);
+
+        let invalid_child: i64 = app_clipboard_fork();
+        if (invalid_child == 0) {
+            let _closed_app_end: i64 = linux_close(remote_wayland_peer.first);
+            let child_ok: i32 = app_clipboard_wayland_remote_peer(
+                remote_wayland_peer.second, public_offer_id, 1);
+            let _closed_peer_end: i64 = linux_close(remote_wayland_peer.second);
+            app_clipboard_child_exit(1 - child_ok); return 1 - child_ok;
+        }
+        let public_invalid: ClipboardReadResult = app_clipboard_read(
+            &remote_wayland, remote_window_index, ClipboardKind.Clipboard,
+            0, 1000, 64);
+        let invalid_child_ok: i32 = app_clipboard_wait_child(invalid_child);
+
+        let large_child: i64 = app_clipboard_fork();
+        if (large_child == 0) {
+            let _closed_app_end: i64 = linux_close(remote_wayland_peer.first);
+            let child_ok: i32 = app_clipboard_wayland_remote_peer(
+                remote_wayland_peer.second, public_offer_id, 2);
+            let _closed_peer_end: i64 = linux_close(remote_wayland_peer.second);
+            app_clipboard_child_exit(1 - child_ok); return 1 - child_ok;
+        }
+        let public_large: ClipboardReadResult = app_clipboard_read(
+            &remote_wayland, remote_window_index, ClipboardKind.Clipboard,
+            0, 1000, 4);
+        let large_child_ok: i32 = app_clipboard_wait_child(large_child);
+
+        let timeout_child: i64 = app_clipboard_fork();
+        if (timeout_child == 0) {
+            let _closed_app_end: i64 = linux_close(remote_wayland_peer.first);
+            let child_ok: i32 = app_clipboard_wayland_remote_peer(
+                remote_wayland_peer.second, public_offer_id, 3);
+            let _closed_peer_end: i64 = linux_close(remote_wayland_peer.second);
+            app_clipboard_child_exit(1 - child_ok); return 1 - child_ok;
+        }
+        let public_timed_out: ClipboardReadResult = app_clipboard_read(
+            &remote_wayland, remote_window_index, ClipboardKind.Clipboard,
+            0, 20, 64);
+        let timeout_child_ok: i32 = app_clipboard_wait_child(timeout_child);
+        failures = failures + app_clipboard_expect(
+            public_offer_processed != 0 && public_selection_applied != 0
+            && invalid_child > 0 && invalid_child_ok != 0
+            && public_invalid.status == ClipboardStatus.InvalidUtf8
+            && large_child > 0 && large_child_ok != 0
+            && public_large.status == ClipboardStatus.TooLarge
+            && timeout_child > 0 && timeout_child_ok != 0
+            && public_timed_out.status == ClipboardStatus.Timeout
+            && remote_wayland.wayland.connected != 0
+            && remote_wayland.wayland.clipboard_published_kind
+                == WaylandNativeClipboardAuthorityKind.Remote
+            && linux_poll_readable(remote_wayland_peer.second, 0) == 0,
+            "public remote Wayland read preserves InvalidUtf8, TooLarge, and Timeout without losing selection");
+        clipboard_read_result_free(&public_invalid);
+        clipboard_read_result_free(&public_large);
+        clipboard_read_result_free(&public_timed_out);
+        app_shutdown(&remote_wayland);
+        let _remote_wayland_peer_closed: i64 = linux_close(
+            remote_wayland_peer.second);
+    }
+
+    let peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + app_clipboard_expect(peer.ok == 1,
+        "public X11 clipboard fake peer opens");
+    if (peer.ok == 1) {
+        let x11_app: App = app_new(BackendKind.Headless);
+        let x11_index: i32 = app_open_window(&x11_app, 50, "X11", 120, 70);
+        let x11_window: *Window = app_window(&x11_app, x11_index);
+        x11_app.backend.active = BackendKind.X11;
+        x11_app.backend.connected = 1; x11_app.backend.deterministic = 0;
+        x11_window.*.backend = BackendKind.X11;
+        x11_window.*.native.window_id = 100; x11_window.*.native.live = 0;
+        x11_app.x11.fd = peer.first; x11_app.x11.connected = 1;
+        x11_app.x11.authenticated = 1;
+        x11_app.x11.setup.valid = 1;
+        x11_app.x11.setup.maximum_request_length = 65535;
+        x11_app.x11.utf8_string_atom = 201;
+        x11_app.x11.clipboard_selection_atom = 202;
+        x11_app.x11.clipboard_property_atom = 203;
+        let _x11_live: i32 = x11_connection_register_window(&x11_app.x11, 100);
+        let copy_reply: WireBuffer = app_clipboard_owner_reply(2, 100);
+        let _copy_reply_sent: i32 = app_clipboard_send(peer.second, &copy_reply);
+        let x11_copy: ClipboardStatus = app_clipboard_copy(&x11_app, x11_index,
+            ClipboardKind.Clipboard, "owned", 1, 100);
+        let copy_requests: WireBuffer = linux_receive_exact(peer.second, 24, 100);
+
+        let request_wire: WireBuffer = app_clipboard_selection_request(
+            100, 200, 202, 201, 300, 1, 2);
+        let request_event: X11Event = x11_decode_event(&request_wire, 0);
+        let _request_queued: i32 = x11_note_event(&x11_app.x11, request_event);
+        wire_free(&request_wire);
+        let service_peer: i64 = app_clipboard_fork();
+        if (service_peer == 0) {
+            let _child_connection_closed: i64 = linux_close(peer.first);
+            let child_status: i32 = app_clipboard_service_peer(peer.second);
+            let _child_peer_closed: i64 = linux_close(peer.second);
+            app_clipboard_child_exit(child_status); return child_status;
+        }
+        let serviced: i32 = app_poll(&x11_app, 0);
+        let service_peer_ok: i32 = app_clipboard_wait_child(service_peer);
+
+        let no_selection_reply: WireBuffer = app_clipboard_owner_reply(7, 0);
+        let _no_selection_sent: i32 = app_clipboard_send(
+            peer.second, &no_selection_reply);
+        let no_selection: ClipboardReadResult = app_clipboard_read(&x11_app,
+            x11_index, ClipboardKind.Primary, 2, 100, 64);
+        let no_selection_request: WireBuffer = linux_receive_exact(peer.second, 8, 100);
+        failures = failures + app_clipboard_expect(x11_copy == ClipboardStatus.Ok
+            && x11_decode_request(&copy_requests, 0).opcode == 22
+            && x11_decode_request(&copy_requests, 16).opcode == 23
+            && service_peer > 0 && service_peer_ok == 1 && serviced == 1
+            && x11_app.x11.authenticated == 1 && x11_app.running == 1
+            && no_selection.status == ClipboardStatus.NoSelection
+            && x11_decode_request(&no_selection_request, 0).opcode == 23
+            && wire_read_u32_le(&no_selection_request, 4) == 1,
+            "public X11 copy, poll-zero reactive service, and NoSelection stay typed and live");
+        wire_free(&copy_requests); wire_free(&no_selection_request);
+        clipboard_read_result_free(&no_selection);
+
+        let release_preflight: WireBuffer = app_clipboard_owner_reply(9, 100);
+        let release_verify: WireBuffer = app_clipboard_owner_reply(11, 0);
+        let release_ungrab: WireBuffer = app_clipboard_owner_reply(13, 0);
+        let _release_replies_sent: i32 = app_clipboard_send(
+            peer.second, &release_preflight)
+            && app_clipboard_send(peer.second, &release_verify)
+            && app_clipboard_send(peer.second, &release_ungrab);
+        let released: ClipboardStatus = app_clipboard_release(&x11_app,
+            x11_index, ClipboardKind.Clipboard, 1, 100);
+        let release_requests: WireBuffer = linux_receive_exact(peer.second, 48, 100);
+        let released_again: ClipboardStatus = app_clipboard_release(&x11_app,
+            x11_index, ClipboardKind.Clipboard, 1, 100);
+        failures = failures + app_clipboard_expect(released == ClipboardStatus.Ok
+            && x11_decode_request(&release_requests, 0).opcode == 36
+            && x11_decode_request(&release_requests, 4).opcode == 23
+            && x11_decode_request(&release_requests, 12).opcode == 22
+            && x11_decode_request(&release_requests, 28).opcode == 23
+            && x11_decode_request(&release_requests, 36).opcode == 37
+            && x11_decode_request(&release_requests, 40).opcode == 23
+            && released_again == ClipboardStatus.NotOwner,
+            "public X11 release maps the bounded server-grab transaction and local NotOwner state");
+        wire_free(&release_requests);
+
+        let malformed: WireBuffer = app_clipboard_selection_request(
+            0, 200, 202, 201, 300, 3, 14);
+        let _malformed_sent: i32 = app_clipboard_send(peer.second, &malformed);
+        let terminal_poll: i32 = app_poll(&x11_app, 100);
+        let after_terminal: ClipboardReadResult = app_clipboard_read(&x11_app,
+            x11_index, ClipboardKind.Clipboard, 3, 100, 64);
+        let terminal_invalid_utf8: ArrayList[u8] = make[u8](2);
+        push[u8](&terminal_invalid_utf8, 192 as u8);
+        push[u8](&terminal_invalid_utf8, 128 as u8);
+        let terminal_copy: ClipboardStatus = app_clipboard_copy(&x11_app,
+            x11_index, ClipboardKind.Clipboard,
+            terminal_invalid_utf8.data[0..2], 3, 100);
+        failures = failures + app_clipboard_expect(terminal_poll == 0
+            && x11_app.x11.authenticated == 0
+            && x11_app.backend.connected == 0 && x11_app.running == 0
+            && len[u8](x11_app.error) > 0
+            && after_terminal.status == ClipboardStatus.TransportFailed
+            && terminal_copy == ClipboardStatus.TransportFailed,
+            "malformed X11 selection frame retires App state and later calls report transport failure");
+        free[u8](&terminal_invalid_utf8);
+        clipboard_read_result_free(&after_terminal);
+        app_shutdown(&x11_app);
+        let _peer_closed: i64 = linux_close(peer.second);
+    }
+
+    if (failures != 0) { return 1; }
+    _zag_println("app_clipboard_test: ok"); return 0;
+}

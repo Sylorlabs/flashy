@@ -1,0 +1,850 @@
+// Deterministic local automation framing. Semantic identifiers remain t9/t27;
+// u8 storage is confined to the UTF-8 and AF_UNIX stream boundary.
+
+enum AutomationCommand {
+    Click, Focus, Fill, Type, Press, AssertText, AssertFocus, AssertVisible,
+    DoubleClick, Hover, Blur, Scroll, Select, SelectAll, AssertEnabled,
+    AssertValue, AssertSelectedText, AssertSelection, AssertGeometry,
+    AssertNoLayoutViolations, AssertAction
+}
+
+enum AutomationLocatorKind { RoleName, TestId, Key, Text, State }
+
+enum AutomationResponseStatus {
+    Ok, Missing, Ambiguous, InvalidRequest, UnsupportedCommand,
+    ActionFailed, AssertionFailed, TransportClosed
+}
+
+enum AutomationTransportStatus {
+    Ready, Timeout, PeerClosed, Truncated, Oversized, Malformed,
+    IoError, WriteFailed, Closed
+}
+
+struct AutomationLocatorSpec {
+    kind: AutomationLocatorKind,
+    role: Role,
+    text: []u8,
+    number: t27,
+}
+
+struct AutomationRequest {
+    request_id: t27,
+    command: AutomationCommand,
+    locator: AutomationLocatorSpec,
+    argument: []u8,
+    key: Key,
+    parameter0: t27,
+    parameter1: t27,
+    parameter2: t27,
+    parameter3: t27,
+}
+
+struct AutomationResponse {
+    request_id: t27,
+    status: AutomationResponseStatus,
+    matches: t27,
+    valid: i32,
+}
+
+struct AutomationProtocolConnection {
+    fd: i64,
+    active: i32,
+    terminal_status: AutomationTransportStatus,
+    received_frames: t27,
+    sent_frames: t27,
+}
+
+struct AutomationExactRead {
+    wire: WireBuffer,
+    status: AutomationTransportStatus,
+    complete: i32,
+}
+
+struct AutomationFrameReceive {
+    payload: WireBuffer,
+    status: AutomationTransportStatus,
+    valid: i32,
+}
+
+struct AutomationCommandDecode { value: AutomationCommand, valid: i32 }
+struct AutomationLocatorKindDecode { value: AutomationLocatorKind, valid: i32 }
+struct AutomationRoleDecode { value: Role, valid: i32 }
+struct AutomationKeyDecode { value: Key, valid: i32 }
+struct AutomationStatusDecode { value: AutomationResponseStatus, valid: i32 }
+
+fn automation_protocol_version() t27 { return 2; }
+fn automation_message_request() t27 { return 1; }
+fn automation_message_response() t27 { return 2; }
+fn automation_request_header_bytes() i32 { return 51; }
+fn automation_response_bytes() i32 { return 15; }
+fn automation_protocol_max_frame_bytes() i32 { return 4096; }
+fn automation_protocol_max_field_bytes() i32 { return 1024; }
+fn automation_t27_max() t27 { return flashy_t27_max(); }
+
+fn automation_locator_role(role: Role, name: []u8) AutomationLocatorSpec {
+    return AutomationLocatorSpec{ .kind = AutomationLocatorKind.RoleName,
+        .role = role, .text = name, .number = 0 };
+}
+
+fn automation_locator_test_id(test_id: []u8) AutomationLocatorSpec {
+    return AutomationLocatorSpec{ .kind = AutomationLocatorKind.TestId,
+        .role = Role.None, .text = test_id, .number = 0 };
+}
+
+fn automation_locator_key(key: t27) AutomationLocatorSpec {
+    return AutomationLocatorSpec{ .kind = AutomationLocatorKind.Key,
+        .role = Role.None, .text = "", .number = key };
+}
+
+fn automation_locator_text(value: []u8) AutomationLocatorSpec {
+    return AutomationLocatorSpec{ .kind = AutomationLocatorKind.Text,
+        .role = Role.None, .text = value, .number = 0 };
+}
+
+fn automation_locator_state(value: t27) AutomationLocatorSpec {
+    return AutomationLocatorSpec{ .kind = AutomationLocatorKind.State,
+        .role = Role.None, .text = "", .number = value };
+}
+
+fn automation_request(request_id: t27, command: AutomationCommand,
+    locator: AutomationLocatorSpec, argument: []u8, key: Key) AutomationRequest {
+    return AutomationRequest{ .request_id = request_id, .command = command,
+        .locator = locator, .argument = argument, .key = key,
+        .parameter0 = 0, .parameter1 = 0, .parameter2 = 0, .parameter3 = 0 };
+}
+
+fn automation_request_parameters(request_id: t27, command: AutomationCommand,
+    locator: AutomationLocatorSpec, argument: []u8, key: Key,
+    parameter0: t27, parameter1: t27, parameter2: t27,
+    parameter3: t27) AutomationRequest {
+    let request: AutomationRequest = automation_request(
+        request_id, command, locator, argument, key);
+    request.parameter0 = parameter0; request.parameter1 = parameter1;
+    request.parameter2 = parameter2; request.parameter3 = parameter3;
+    return request;
+}
+
+fn automation_response_empty() AutomationResponse {
+    return AutomationResponse{ .request_id = 0,
+        .status = AutomationResponseStatus.TransportClosed, .matches = 0, .valid = 0 };
+}
+
+fn automation_protocol_connection(fd: i64) AutomationProtocolConnection {
+    let active: i32 = 0;
+    let owned_fd: i64 = 0 - 1;
+    let status: AutomationTransportStatus = AutomationTransportStatus.IoError;
+    if (linux_fd_value_valid(fd) == 1) {
+        active = 1; owned_fd = fd; status = AutomationTransportStatus.Ready;
+    }
+    return AutomationProtocolConnection{ .fd = owned_fd, .active = active,
+        .terminal_status = status,
+        .received_frames = 0, .sent_frames = 0 };
+}
+
+fn automation_protocol_retire(connection: *AutomationProtocolConnection,
+    status: AutomationTransportStatus) void {
+    if (connection.*.active == 1 && linux_fd_value_valid(connection.*.fd) == 1) {
+        let _closed: i64 = linux_close(connection.*.fd);
+        connection.*.fd = 0 - 1;
+        connection.*.active = 0;
+        connection.*.terminal_status = status;
+    } else if (connection.*.terminal_status == AutomationTransportStatus.Ready) {
+        connection.*.fd = 0 - 1;
+        connection.*.active = 0;
+        connection.*.terminal_status = status;
+    }
+}
+
+fn automation_protocol_close(connection: *AutomationProtocolConnection) void {
+    automation_protocol_retire(connection, AutomationTransportStatus.Closed);
+}
+
+fn automation_command_code(command: AutomationCommand) t27 {
+    if (command == AutomationCommand.Click) { return 1; }
+    if (command == AutomationCommand.Focus) { return 2; }
+    if (command == AutomationCommand.Fill) { return 3; }
+    if (command == AutomationCommand.Type) { return 4; }
+    if (command == AutomationCommand.Press) { return 5; }
+    if (command == AutomationCommand.AssertText) { return 6; }
+    if (command == AutomationCommand.AssertFocus) { return 7; }
+    if (command == AutomationCommand.AssertVisible) { return 8; }
+    if (command == AutomationCommand.DoubleClick) { return 9; }
+    if (command == AutomationCommand.Hover) { return 10; }
+    if (command == AutomationCommand.Blur) { return 11; }
+    if (command == AutomationCommand.Scroll) { return 12; }
+    if (command == AutomationCommand.Select) { return 13; }
+    if (command == AutomationCommand.SelectAll) { return 14; }
+    if (command == AutomationCommand.AssertEnabled) { return 15; }
+    if (command == AutomationCommand.AssertValue) { return 16; }
+    if (command == AutomationCommand.AssertSelectedText) { return 17; }
+    if (command == AutomationCommand.AssertSelection) { return 18; }
+    if (command == AutomationCommand.AssertGeometry) { return 19; }
+    if (command == AutomationCommand.AssertNoLayoutViolations) { return 20; }
+    if (command == AutomationCommand.AssertAction) { return 21; }
+    return 0;
+}
+
+fn automation_command_decode(code: t27) AutomationCommandDecode {
+    let decoded: AutomationCommandDecode = AutomationCommandDecode{
+        .value = AutomationCommand.Click, .valid = 1 };
+    if (code == 1) { decoded.value = AutomationCommand.Click; }
+    else if (code == 2) { decoded.value = AutomationCommand.Focus; }
+    else if (code == 3) { decoded.value = AutomationCommand.Fill; }
+    else if (code == 4) { decoded.value = AutomationCommand.Type; }
+    else if (code == 5) { decoded.value = AutomationCommand.Press; }
+    else if (code == 6) { decoded.value = AutomationCommand.AssertText; }
+    else if (code == 7) { decoded.value = AutomationCommand.AssertFocus; }
+    else if (code == 8) { decoded.value = AutomationCommand.AssertVisible; }
+    else if (code == 9) { decoded.value = AutomationCommand.DoubleClick; }
+    else if (code == 10) { decoded.value = AutomationCommand.Hover; }
+    else if (code == 11) { decoded.value = AutomationCommand.Blur; }
+    else if (code == 12) { decoded.value = AutomationCommand.Scroll; }
+    else if (code == 13) { decoded.value = AutomationCommand.Select; }
+    else if (code == 14) { decoded.value = AutomationCommand.SelectAll; }
+    else if (code == 15) { decoded.value = AutomationCommand.AssertEnabled; }
+    else if (code == 16) { decoded.value = AutomationCommand.AssertValue; }
+    else if (code == 17) { decoded.value = AutomationCommand.AssertSelectedText; }
+    else if (code == 18) { decoded.value = AutomationCommand.AssertSelection; }
+    else if (code == 19) { decoded.value = AutomationCommand.AssertGeometry; }
+    else if (code == 20) { decoded.value = AutomationCommand.AssertNoLayoutViolations; }
+    else if (code == 21) { decoded.value = AutomationCommand.AssertAction; }
+    else { decoded.valid = 0; }
+    return decoded;
+}
+
+fn automation_locator_kind_code(kind: AutomationLocatorKind) t27 {
+    if (kind == AutomationLocatorKind.RoleName) { return 1; }
+    if (kind == AutomationLocatorKind.TestId) { return 2; }
+    if (kind == AutomationLocatorKind.Key) { return 3; }
+    if (kind == AutomationLocatorKind.Text) { return 4; }
+    if (kind == AutomationLocatorKind.State) { return 5; }
+    return 0;
+}
+
+fn automation_locator_kind_decode(code: t27) AutomationLocatorKindDecode {
+    let decoded: AutomationLocatorKindDecode = AutomationLocatorKindDecode{
+        .value = AutomationLocatorKind.RoleName, .valid = 1 };
+    if (code == 1) { decoded.value = AutomationLocatorKind.RoleName; }
+    else if (code == 2) { decoded.value = AutomationLocatorKind.TestId; }
+    else if (code == 3) { decoded.value = AutomationLocatorKind.Key; }
+    else if (code == 4) { decoded.value = AutomationLocatorKind.Text; }
+    else if (code == 5) { decoded.value = AutomationLocatorKind.State; }
+    else { decoded.valid = 0; }
+    return decoded;
+}
+
+fn automation_role_code(role: Role) t27 {
+    if (role == Role.None) { return 0; }
+    if (role == Role.Window) { return 1; }
+    if (role == Role.Group) { return 2; }
+    if (role == Role.Text) { return 3; }
+    if (role == Role.Button) { return 4; }
+    if (role == Role.Checkbox) { return 5; }
+    if (role == Role.Radio) { return 6; }
+    if (role == Role.Slider) { return 7; }
+    if (role == Role.ProgressBar) { return 8; }
+    if (role == Role.TextField) { return 9; }
+    if (role == Role.Image) { return 10; }
+    if (role == Role.List) { return 11; }
+    if (role == Role.ListItem) { return 12; }
+    if (role == Role.Grid) { return 13; }
+    if (role == Role.Row) { return 14; }
+    if (role == Role.Cell) { return 15; }
+    if (role == Role.Tree) { return 16; }
+    if (role == Role.TreeItem) { return 17; }
+    if (role == Role.TabList) { return 18; }
+    if (role == Role.Tab) { return 19; }
+    if (role == Role.Menu) { return 20; }
+    if (role == Role.MenuItem) { return 21; }
+    if (role == Role.Tooltip) { return 22; }
+    if (role == Role.Dialog) { return 23; }
+    if (role == Role.Navigation) { return 24; }
+    return 0;
+}
+
+fn automation_role_decode(code: t27) AutomationRoleDecode {
+    let decoded: AutomationRoleDecode = AutomationRoleDecode{ .value = Role.None, .valid = 1 };
+    if (code == 0) { decoded.value = Role.None; }
+    else if (code == 1) { decoded.value = Role.Window; }
+    else if (code == 2) { decoded.value = Role.Group; }
+    else if (code == 3) { decoded.value = Role.Text; }
+    else if (code == 4) { decoded.value = Role.Button; }
+    else if (code == 5) { decoded.value = Role.Checkbox; }
+    else if (code == 6) { decoded.value = Role.Radio; }
+    else if (code == 7) { decoded.value = Role.Slider; }
+    else if (code == 8) { decoded.value = Role.ProgressBar; }
+    else if (code == 9) { decoded.value = Role.TextField; }
+    else if (code == 10) { decoded.value = Role.Image; }
+    else if (code == 11) { decoded.value = Role.List; }
+    else if (code == 12) { decoded.value = Role.ListItem; }
+    else if (code == 13) { decoded.value = Role.Grid; }
+    else if (code == 14) { decoded.value = Role.Row; }
+    else if (code == 15) { decoded.value = Role.Cell; }
+    else if (code == 16) { decoded.value = Role.Tree; }
+    else if (code == 17) { decoded.value = Role.TreeItem; }
+    else if (code == 18) { decoded.value = Role.TabList; }
+    else if (code == 19) { decoded.value = Role.Tab; }
+    else if (code == 20) { decoded.value = Role.Menu; }
+    else if (code == 21) { decoded.value = Role.MenuItem; }
+    else if (code == 22) { decoded.value = Role.Tooltip; }
+    else if (code == 23) { decoded.value = Role.Dialog; }
+    else if (code == 24) { decoded.value = Role.Navigation; }
+    else { decoded.valid = 0; }
+    return decoded;
+}
+
+fn automation_key_code(key: Key) t27 {
+    if (key == Key.Unknown) { return 0; }
+    if (key == Key.Backspace) { return 1; }
+    if (key == Key.Tab) { return 2; }
+    if (key == Key.Enter) { return 3; }
+    if (key == Key.Space) { return 4; }
+    if (key == Key.Delete) { return 5; }
+    if (key == Key.Home) { return 6; }
+    if (key == Key.End) { return 7; }
+    if (key == Key.ArrowLeft) { return 8; }
+    if (key == Key.ArrowUp) { return 9; }
+    if (key == Key.ArrowRight) { return 10; }
+    if (key == Key.ArrowDown) { return 11; }
+    if (key == Key.A) { return 12; }
+    return 0;
+}
+
+fn automation_key_decode(code: t27) AutomationKeyDecode {
+    let decoded: AutomationKeyDecode = AutomationKeyDecode{ .value = Key.Unknown, .valid = 1 };
+    if (code == 0) { decoded.value = Key.Unknown; }
+    else if (code == 1) { decoded.value = Key.Backspace; }
+    else if (code == 2) { decoded.value = Key.Tab; }
+    else if (code == 3) { decoded.value = Key.Enter; }
+    else if (code == 4) { decoded.value = Key.Space; }
+    else if (code == 5) { decoded.value = Key.Delete; }
+    else if (code == 6) { decoded.value = Key.Home; }
+    else if (code == 7) { decoded.value = Key.End; }
+    else if (code == 8) { decoded.value = Key.ArrowLeft; }
+    else if (code == 9) { decoded.value = Key.ArrowUp; }
+    else if (code == 10) { decoded.value = Key.ArrowRight; }
+    else if (code == 11) { decoded.value = Key.ArrowDown; }
+    else if (code == 12) { decoded.value = Key.A; }
+    else { decoded.valid = 0; }
+    return decoded;
+}
+
+fn automation_status_code(status: AutomationResponseStatus) t27 {
+    if (status == AutomationResponseStatus.Ok) { return 0; }
+    if (status == AutomationResponseStatus.Missing) { return 1; }
+    if (status == AutomationResponseStatus.Ambiguous) { return 2; }
+    if (status == AutomationResponseStatus.InvalidRequest) { return 3; }
+    if (status == AutomationResponseStatus.UnsupportedCommand) { return 4; }
+    if (status == AutomationResponseStatus.ActionFailed) { return 5; }
+    if (status == AutomationResponseStatus.AssertionFailed) { return 6; }
+    if (status == AutomationResponseStatus.TransportClosed) { return 7; }
+    return 3;
+}
+
+fn automation_status_decode(code: t27) AutomationStatusDecode {
+    let decoded: AutomationStatusDecode = AutomationStatusDecode{
+        .value = AutomationResponseStatus.InvalidRequest, .valid = 1 };
+    if (code == 0) { decoded.value = AutomationResponseStatus.Ok; }
+    else if (code == 1) { decoded.value = AutomationResponseStatus.Missing; }
+    else if (code == 2) { decoded.value = AutomationResponseStatus.Ambiguous; }
+    else if (code == 3) { decoded.value = AutomationResponseStatus.InvalidRequest; }
+    else if (code == 4) { decoded.value = AutomationResponseStatus.UnsupportedCommand; }
+    else if (code == 5) { decoded.value = AutomationResponseStatus.ActionFailed; }
+    else if (code == 6) { decoded.value = AutomationResponseStatus.AssertionFailed; }
+    else if (code == 7) { decoded.value = AutomationResponseStatus.TransportClosed; }
+    else { decoded.valid = 0; }
+    return decoded;
+}
+
+fn automation_wire_push_u48(out: *WireBuffer, value: t27) void {
+    if (value < 0 || value > automation_t27_max()) { out.*.error = 1; return; }
+    let remaining: t27 = value;
+    let i: i32 = 0;
+    while (i < 6) {
+        wire_push_u8(out, remaining % 256);
+        remaining = remaining / 256;
+        i = i + 1;
+    }
+}
+
+fn automation_wire_read_u48(input: *WireBuffer, offset: i32) t27 {
+    if (offset < 0 || offset + 6 > len[u8](input.*.bytes)) { input.*.error = 1; return 0; }
+    let value: t27 = 0;
+    let i: i32 = 5;
+    while (i >= 0) {
+        let digit: t27 = wire_read_u8(input, offset + i);
+        if (value > (automation_t27_max() - digit) / 256) {
+            input.*.error = 1; return 0;
+        }
+        value = value * 256 + digit;
+        i = i - 1;
+    }
+    return value;
+}
+
+fn automation_wire_push_t27(out: *WireBuffer, value: t27) void {
+    if (value < 0) {
+        wire_push_u8(out, 1); automation_wire_push_u48(out, 0 - value);
+    } else {
+        wire_push_u8(out, 0); automation_wire_push_u48(out, value);
+    }
+}
+
+fn automation_wire_read_t27(input: *WireBuffer, offset: i32) t27 {
+    let sign: t27 = wire_read_u8(input, offset);
+    let magnitude: t27 = automation_wire_read_u48(input, offset + 1);
+    if (sign == 0) { return magnitude; }
+    if (sign == 1) { return 0 - magnitude; }
+    input.*.error = 1; return 0;
+}
+
+fn automation_append_slice(out: *WireBuffer, value: []u8) void {
+    let i: i32 = 0;
+    while (i < value.len) { wire_push_u8(out, value[i] as t27); i = i + 1; }
+}
+
+fn automation_locator_spec_valid(locator: AutomationLocatorSpec) i32 {
+    if (locator.text.len > automation_protocol_max_field_bytes()) { return 0; }
+    if (utf8_validate(locator.text).valid == 0) { return 0; }
+    if (locator.kind == AutomationLocatorKind.RoleName) {
+        if (locator.role == Role.None || locator.number != 0) { return 0; }
+        return 1;
+    }
+    if (locator.kind == AutomationLocatorKind.TestId) {
+        if (locator.role != Role.None || locator.number != 0 || locator.text.len == 0) { return 0; }
+        return 1;
+    }
+    if (locator.kind == AutomationLocatorKind.Text) {
+        if (locator.role != Role.None || locator.number != 0) { return 0; }
+        return 1;
+    }
+    if (locator.kind == AutomationLocatorKind.Key || locator.kind == AutomationLocatorKind.State) {
+        if (locator.role != Role.None || locator.text.len != 0) { return 0; }
+        return 1;
+    }
+    return 0;
+}
+
+fn automation_request_valid(request: AutomationRequest) i32 {
+    // Field bounds precede both UTF-8 scans and every allocation performed by
+    // the encoder. Invalid local slices receive a typed empty result without
+    // proportional work or storage.
+    if (request.request_id < 0
+        || request.locator.text.len > automation_protocol_max_field_bytes()
+        || request.argument.len > automation_protocol_max_field_bytes()) { return 0; }
+    if (automation_locator_spec_valid(request.locator) == 0
+        || utf8_validate(request.argument).valid == 0) { return 0; }
+    if (request.command == AutomationCommand.Fill || request.command == AutomationCommand.Type
+        || request.command == AutomationCommand.AssertText
+        || request.command == AutomationCommand.AssertSelectedText) {
+        if (request.key != Key.Unknown || request.parameter0 != 0
+            || request.parameter1 != 0 || request.parameter2 != 0
+            || request.parameter3 != 0) { return 0; }
+        return 1;
+    }
+    if (request.command == AutomationCommand.Press) {
+        if (request.key == Key.Unknown || request.argument.len != 0
+            || request.parameter0 != 0 || request.parameter1 != 0
+            || request.parameter2 != 0 || request.parameter3 != 0) { return 0; }
+        // Protocol v2 carries no modifier bits. Keys that have no defined
+        // unmodified behavior must fail before transmission/focus mutation.
+        if (request.key == Key.A || request.key == Key.ArrowUp
+            || request.key == Key.ArrowDown) { return 0; }
+        return 1;
+    }
+    if (request.argument.len != 0 || request.key != Key.Unknown) { return 0; }
+    if (request.command == AutomationCommand.Scroll) {
+        if (request.parameter1 != 0 || request.parameter2 != 0
+            || request.parameter3 != 0) { return 0; }
+        return 1;
+    }
+    if (request.command == AutomationCommand.Select
+        || request.command == AutomationCommand.AssertSelection) {
+        if (request.parameter0 < 0 || request.parameter1 < 0
+            || request.parameter2 != 0 || request.parameter3 != 0) { return 0; }
+        return 1;
+    }
+    if (request.command == AutomationCommand.AssertGeometry) {
+        if (request.parameter2 < 0 || request.parameter3 < 0) { return 0; }
+        return 1;
+    }
+    if (request.command == AutomationCommand.AssertValue) {
+        if (request.parameter1 != 0 || request.parameter2 != 0
+            || request.parameter3 != 0) { return 0; }
+        return 1;
+    }
+    if (request.command == AutomationCommand.AssertNoLayoutViolations) {
+        if ((request.parameter0 != 0 && request.parameter0 != 1)
+            || request.parameter1 != 0 || request.parameter2 != 0
+            || request.parameter3 != 0) { return 0; }
+        return 1;
+    }
+    if (request.command == AutomationCommand.AssertAction) {
+        if (request.parameter0 < (0 - 9841) || request.parameter0 > 9841
+            || request.parameter1 != 0 || request.parameter2 != 0
+            || request.parameter3 != 0) { return 0; }
+        return 1;
+    }
+    if (request.parameter0 != 0 || request.parameter1 != 0
+        || request.parameter2 != 0 || request.parameter3 != 0) { return 0; }
+    return 1;
+}
+
+// The returned payload does not include the four-byte stream length prefix.
+fn automation_encode_request(request: AutomationRequest) WireBuffer {
+    if (automation_request_valid(request) == 0) {
+        let rejected: WireBuffer = wire_new(0); rejected.error = 1; return rejected;
+    }
+    let out: WireBuffer = wire_new(automation_request_header_bytes()
+        + request.locator.text.len + request.argument.len);
+    wire_push_u8(&out, automation_protocol_version());
+    wire_push_u8(&out, automation_message_request());
+    automation_wire_push_u48(&out, request.request_id);
+    wire_push_u8(&out, automation_command_code(request.command));
+    wire_push_u8(&out, automation_locator_kind_code(request.locator.kind));
+    wire_push_u8(&out, automation_role_code(request.locator.role));
+    automation_wire_push_t27(&out, request.locator.number);
+    wire_push_u8(&out, automation_key_code(request.key));
+    wire_push_u16_le(&out, request.locator.text.len as t27);
+    wire_push_u16_le(&out, request.argument.len as t27);
+    automation_wire_push_t27(&out, request.parameter0);
+    automation_wire_push_t27(&out, request.parameter1);
+    automation_wire_push_t27(&out, request.parameter2);
+    automation_wire_push_t27(&out, request.parameter3);
+    automation_append_slice(&out, request.locator.text);
+    automation_append_slice(&out, request.argument);
+    if (len[u8](out.bytes) > automation_protocol_max_frame_bytes()) { out.error = 1; }
+    return out;
+}
+
+fn automation_decode_request(input: *WireBuffer) AutomationRequest {
+    let bad: AutomationRequest = automation_request(0, AutomationCommand.Click,
+        automation_locator_test_id("invalid"), "", Key.Unknown);
+    if (len[u8](input.*.bytes) < automation_request_header_bytes()) { input.*.error = 1; return bad; }
+    let version: t27 = wire_read_u8(input, 0);
+    let message_kind: t27 = wire_read_u8(input, 1);
+    let request_id: t27 = automation_wire_read_u48(input, 2);
+    let command: AutomationCommandDecode = automation_command_decode(wire_read_u8(input, 8));
+    let locator_kind: AutomationLocatorKindDecode = automation_locator_kind_decode(wire_read_u8(input, 9));
+    let role: AutomationRoleDecode = automation_role_decode(wire_read_u8(input, 10));
+    let locator_number: t27 = automation_wire_read_t27(input, 11);
+    let key: AutomationKeyDecode = automation_key_decode(wire_read_u8(input, 18));
+    let locator_len: t27 = wire_read_u16_le(input, 19);
+    let argument_len: t27 = wire_read_u16_le(input, 21);
+    let parameter0: t27 = automation_wire_read_t27(input, 23);
+    let parameter1: t27 = automation_wire_read_t27(input, 30);
+    let parameter2: t27 = automation_wire_read_t27(input, 37);
+    let parameter3: t27 = automation_wire_read_t27(input, 44);
+    if (input.*.error != 0 || version != automation_protocol_version()
+        || message_kind != automation_message_request() || command.valid == 0
+        || locator_kind.valid == 0 || role.valid == 0 || key.valid == 0
+        || locator_len > automation_protocol_max_field_bytes() as t27
+        || argument_len > automation_protocol_max_field_bytes() as t27
+        || automation_request_header_bytes() as t27 + locator_len + argument_len
+            != len[u8](input.*.bytes) as t27) {
+        input.*.error = 1; return bad;
+    }
+    let locator_start: i32 = automation_request_header_bytes();
+    let argument_start: i32 = locator_start + locator_len as i32;
+    let parsed: AutomationRequest = automation_request_parameters(request_id, command.value,
+        AutomationLocatorSpec{ .kind = locator_kind.value, .role = role.value,
+            .text = input.*.bytes.data[locator_start..argument_start], .number = locator_number },
+        input.*.bytes.data[argument_start..len[u8](input.*.bytes)], key.value,
+        parameter0, parameter1, parameter2, parameter3);
+    if (automation_request_valid(parsed) == 0) { input.*.error = 1; return bad; }
+    return parsed;
+}
+
+fn automation_encode_response(response: AutomationResponse) WireBuffer {
+    let out: WireBuffer = wire_new(automation_response_bytes());
+    if (response.valid == 0 || response.request_id < 0 || response.matches < 0) {
+        out.error = 1; return out;
+    }
+    wire_push_u8(&out, automation_protocol_version());
+    wire_push_u8(&out, automation_message_response());
+    automation_wire_push_u48(&out, response.request_id);
+    wire_push_u8(&out, automation_status_code(response.status));
+    automation_wire_push_u48(&out, response.matches);
+    return out;
+}
+
+fn automation_decode_response(input: *WireBuffer) AutomationResponse {
+    let bad: AutomationResponse = automation_response_empty();
+    if (len[u8](input.*.bytes) != automation_response_bytes()) { input.*.error = 1; return bad; }
+    let version: t27 = wire_read_u8(input, 0);
+    let kind: t27 = wire_read_u8(input, 1);
+    let request_id: t27 = automation_wire_read_u48(input, 2);
+    let status: AutomationStatusDecode = automation_status_decode(wire_read_u8(input, 8));
+    let matches: t27 = automation_wire_read_u48(input, 9);
+    if (input.*.error != 0 || version != automation_protocol_version()
+        || kind != automation_message_response() || status.valid == 0) {
+        input.*.error = 1; return bad;
+    }
+    return AutomationResponse{ .request_id = request_id,
+        .status = status.value, .matches = matches, .valid = 1 };
+}
+
+fn automation_read_exact_until(connection: *AutomationProtocolConnection, byte_count: i32,
+    deadline: i64, frame_started: i32) AutomationExactRead {
+    let out: AutomationExactRead = AutomationExactRead{ .wire = wire_new(0),
+        .status = AutomationTransportStatus.Ready, .complete = 0 };
+    if (connection.*.active == 0 || byte_count < 0
+        || (frame_started != 0 && frame_started != 1)) {
+        out.status = AutomationTransportStatus.IoError;
+        return out;
+    }
+    if (byte_count > automation_protocol_max_frame_bytes()) {
+        out.status = AutomationTransportStatus.Oversized;
+        return out;
+    }
+    if (byte_count == 0) { out.complete = 1; return out; }
+    out.wire = wire_new(byte_count);
+    while (len[u8](out.wire.bytes) < byte_count) {
+        let ready: i64 = linux_poll_event_until(connection.*.fd, 1, deadline);
+        if (ready == 0) {
+            if (len[u8](out.wire.bytes) == 0 && frame_started == 0) {
+                out.status = AutomationTransportStatus.Timeout;
+            } else {
+                out.status = AutomationTransportStatus.Truncated;
+                automation_protocol_retire(connection, out.status);
+            }
+            return out;
+        }
+        if (ready < 0) {
+            out.status = AutomationTransportStatus.IoError;
+            automation_protocol_retire(connection, out.status);
+            return out;
+        }
+        let remaining: i32 = byte_count - len[u8](out.wire.bytes);
+        let native: LinuxByteBuffer = linux_buffer_new(remaining);
+        let got: i64 = linux_read_into(connection.*.fd, &native);
+        if (got > 0) {
+            let i: i32 = 0;
+            while (i < native.len) {
+                wire_push_u8(&out.wire, linux_buffer_byte(&native, i) as t27);
+                i = i + 1;
+            }
+            linux_buffer_free(&native);
+        } else {
+            linux_buffer_free(&native);
+            if (got == (0 - 4) || got == (0 - 11)) {
+                // No progress: poll again against the same absolute deadline.
+            } else {
+                if (got == 0 && len[u8](out.wire.bytes) == 0 && frame_started == 0) {
+                    out.status = AutomationTransportStatus.PeerClosed;
+                } else if (got == 0) {
+                    out.status = AutomationTransportStatus.Truncated;
+                } else {
+                    out.status = AutomationTransportStatus.IoError;
+                }
+                automation_protocol_retire(connection, out.status);
+                return out;
+            }
+        }
+    }
+    out.complete = 1;
+    return out;
+}
+
+fn automation_read_exact(connection: *AutomationProtocolConnection, byte_count: i32,
+    timeout_ms: t27) AutomationExactRead {
+    if (timeout_ms < 0) {
+        return AutomationExactRead{ .wire = wire_new(0),
+            .status = AutomationTransportStatus.IoError, .complete = 0 };
+    }
+    return automation_read_exact_until(connection, byte_count,
+        linux_monotonic_ms() + timeout_ms as i64, 0);
+}
+
+fn automation_receive_frame(connection: *AutomationProtocolConnection,
+    timeout_ms: t27) AutomationFrameReceive {
+    let frame: AutomationFrameReceive = AutomationFrameReceive{
+        .payload = wire_new(0), .status = AutomationTransportStatus.Ready, .valid = 0 };
+    if (timeout_ms < 0) {
+        frame.status = AutomationTransportStatus.IoError; return frame;
+    }
+    // Prefix and payload share one absolute deadline. A peer cannot multiply
+    // the configured bound by dribbling one complete framing phase at a time.
+    let deadline: i64 = linux_monotonic_ms() + timeout_ms as i64;
+    let prefix: AutomationExactRead = automation_read_exact_until(connection, 4, deadline, 0);
+    if (prefix.complete == 0) {
+        frame.status = prefix.status; wire_free(&prefix.wire); return frame;
+    }
+    let frame_len: t27 = wire_read_u32_le(&prefix.wire, 0);
+    wire_free(&prefix.wire);
+    if (frame_len < 1 || frame_len > automation_protocol_max_frame_bytes() as t27) {
+        frame.status = AutomationTransportStatus.Oversized;
+        automation_protocol_retire(connection, frame.status);
+        return frame;
+    }
+    let payload: AutomationExactRead = automation_read_exact_until(connection,
+        frame_len as i32, deadline, 1);
+    if (payload.complete == 0) {
+        frame.status = payload.status; wire_free(&payload.wire); return frame;
+    }
+    wire_free(&frame.payload);
+    frame.payload = payload.wire;
+    frame.valid = 1;
+    connection.*.received_frames = connection.*.received_frames + 1;
+    return frame;
+}
+
+fn automation_send_payload(connection: *AutomationProtocolConnection,
+    payload: *WireBuffer) i32 {
+    if (connection.*.active == 0 || payload.*.error != 0
+        || len[u8](payload.*.bytes) < 1
+        || len[u8](payload.*.bytes) > automation_protocol_max_frame_bytes()) { return 0; }
+    let frame: WireBuffer = wire_new(4 + len[u8](payload.*.bytes));
+    wire_push_u32_le(&frame, len[u8](payload.*.bytes) as t27);
+    wire_append(&frame, payload);
+    let sent: LinuxWriteAllResult = linux_send_wire_all(connection.*.fd, &frame);
+    wire_free(&frame);
+    if (sent.complete == 0) {
+        automation_protocol_retire(connection, AutomationTransportStatus.WriteFailed);
+        return 0;
+    }
+    connection.*.sent_frames = connection.*.sent_frames + 1;
+    return 1;
+}
+
+fn automation_client_send_request(connection: *AutomationProtocolConnection,
+    request: AutomationRequest) i32 {
+    let encoded: WireBuffer = automation_encode_request(request);
+    if (encoded.error != 0) { wire_free(&encoded); return 0; }
+    let sent: i32 = automation_send_payload(connection, &encoded);
+    wire_free(&encoded);
+    return sent;
+}
+
+fn automation_send_response(connection: *AutomationProtocolConnection,
+    response: AutomationResponse) i32 {
+    let encoded: WireBuffer = automation_encode_response(response);
+    if (encoded.error != 0) { wire_free(&encoded); return 0; }
+    let sent: i32 = automation_send_payload(connection, &encoded);
+    wire_free(&encoded);
+    return sent;
+}
+
+fn automation_client_receive_response(connection: *AutomationProtocolConnection,
+    timeout_ms: t27) AutomationResponse {
+    let frame: AutomationFrameReceive = automation_receive_frame(connection, timeout_ms);
+    if (frame.valid == 0) { wire_free(&frame.payload); return automation_response_empty(); }
+    let response: AutomationResponse = automation_decode_response(&frame.payload);
+    if (frame.payload.error != 0 || response.valid == 0) {
+        wire_free(&frame.payload);
+        automation_protocol_retire(connection, AutomationTransportStatus.Malformed);
+        return automation_response_empty();
+    }
+    wire_free(&frame.payload);
+    return response;
+}
+
+fn automation_resolve_locator(ui: *Ui, locator: AutomationLocatorSpec) Locator {
+    if (locator.kind == AutomationLocatorKind.RoleName) {
+        return locate_role(ui, locator.role, locator.text);
+    }
+    if (locator.kind == AutomationLocatorKind.TestId) {
+        return locate_test_id(ui, locator.text);
+    }
+    if (locator.kind == AutomationLocatorKind.Key) {
+        return locate_key(ui, locator.number);
+    }
+    if (locator.kind == AutomationLocatorKind.Text) {
+        return locate_text(ui, locator.text);
+    }
+    return locate_state(ui, locator.number);
+}
+
+fn automation_execute_request(ui: *Ui, request: AutomationRequest) AutomationResponse {
+    let response: AutomationResponse = AutomationResponse{ .request_id = request.request_id,
+        .status = AutomationResponseStatus.InvalidRequest, .matches = 0, .valid = 1 };
+    if (automation_request_valid(request) == 0) { return response; }
+    let locator: Locator = automation_resolve_locator(ui, request.locator);
+    response.matches = locator.matches as t27;
+    if (locator.matches == 0 || locator.node < 0) {
+        response.status = AutomationResponseStatus.Missing; return response;
+    }
+    if (locator.matches != 1) {
+        response.status = AutomationResponseStatus.Ambiguous; return response;
+    }
+    let result: i32 = 0;
+    let assertion: i32 = 0;
+    if (request.command == AutomationCommand.Click) { result = locator_click(ui, locator); }
+    else if (request.command == AutomationCommand.DoubleClick) {
+        result = locator_double_click(ui, locator);
+    }
+    else if (request.command == AutomationCommand.Hover) {
+        result = locator_hover(ui, locator);
+    }
+    else if (request.command == AutomationCommand.Focus) { result = locator_focus(ui, locator); }
+    else if (request.command == AutomationCommand.Blur) { result = locator_blur(ui, locator); }
+    else if (request.command == AutomationCommand.Fill) { result = locator_fill(ui, locator, request.argument); }
+    else if (request.command == AutomationCommand.Type) { result = locator_type(ui, locator, request.argument); }
+    else if (request.command == AutomationCommand.Press) { result = locator_press(ui, locator, request.key); }
+    else if (request.command == AutomationCommand.Scroll) {
+        result = locator_scroll(ui, locator, request.parameter0);
+    }
+    else if (request.command == AutomationCommand.Select) {
+        result = locator_select_text(ui, locator, request.parameter0, request.parameter1);
+    }
+    else if (request.command == AutomationCommand.SelectAll) {
+        result = locator_select_all(ui, locator);
+    }
+    else if (request.command == AutomationCommand.AssertText) {
+        assertion = 1; result = locator_has_text(ui, locator, request.argument);
+    } else if (request.command == AutomationCommand.AssertFocus) {
+        assertion = 1; result = locator_is_focused(ui, locator);
+    } else if (request.command == AutomationCommand.AssertVisible) {
+        assertion = 1; result = locator_is_visible(ui, locator);
+    } else if (request.command == AutomationCommand.AssertEnabled) {
+        assertion = 1; result = locator_is_enabled(ui, locator);
+    } else if (request.command == AutomationCommand.AssertValue) {
+        assertion = 1; result = locator_has_value(ui, locator, request.parameter0);
+    } else if (request.command == AutomationCommand.AssertSelectedText) {
+        assertion = 1; result = locator_has_selected_text(ui, locator, request.argument);
+    } else if (request.command == AutomationCommand.AssertSelection) {
+        assertion = 1; result = locator_has_selection(
+            ui, locator, request.parameter0, request.parameter1);
+    } else if (request.command == AutomationCommand.AssertGeometry) {
+        assertion = 1; result = locator_has_geometry(ui, locator,
+            rect(request.parameter0, request.parameter1,
+                request.parameter2, request.parameter3));
+    } else if (request.command == AutomationCommand.AssertNoLayoutViolations) {
+        assertion = 1; result = ui_has_no_layout_violations(
+            ui, request.parameter0 as i32);
+    } else if (request.command == AutomationCommand.AssertAction) {
+        assertion = 1; result = action_emitted(ui, request.parameter0 as t9);
+    } else {
+        response.status = AutomationResponseStatus.UnsupportedCommand; return response;
+    }
+    if (result == 1) { response.status = AutomationResponseStatus.Ok; }
+    else if (assertion == 1) { response.status = AutomationResponseStatus.AssertionFailed; }
+    else { response.status = AutomationResponseStatus.ActionFailed; }
+    return response;
+}
+
+fn automation_server_step(connection: *AutomationProtocolConnection, ui: *Ui,
+    timeout_ms: t27) AutomationResponse {
+    let frame: AutomationFrameReceive = automation_receive_frame(connection, timeout_ms);
+    if (frame.valid == 0) { wire_free(&frame.payload); return automation_response_empty(); }
+    // Capture a bounded request id before full validation so a schema rejection
+    // can still produce one typed response when the fixed header is present.
+    let error_request_id: t27 = 0;
+    if (len[u8](frame.payload.bytes) >= 8) {
+        error_request_id = automation_wire_read_u48(&frame.payload, 2);
+        frame.payload.error = 0;
+    }
+    let request: AutomationRequest = automation_decode_request(&frame.payload);
+    if (frame.payload.error != 0) {
+        let rejected: AutomationResponse = AutomationResponse{ .request_id = error_request_id,
+            .status = AutomationResponseStatus.InvalidRequest, .matches = 0, .valid = 1 };
+        let _sent_rejection: i32 = automation_send_response(connection, rejected);
+        wire_free(&frame.payload);
+        automation_protocol_retire(connection, AutomationTransportStatus.Malformed);
+        return rejected;
+    }
+    let response: AutomationResponse = automation_execute_request(ui, request);
+    let _sent: i32 = automation_send_response(connection, response);
+    wire_free(&frame.payload);
+    return response;
+}

@@ -1,0 +1,96 @@
+// Deterministic CPU Surface presentation over the X11 core PutImage request.
+// Packed pixels exist only in this display-protocol boundary module.
+
+struct X11PresentResult {
+    rows: t27,
+    requests: t27,
+    ok: i32,
+    error: []u8,
+}
+
+fn x11_mask_shift(mask: t27) t27 {
+    let value: t27 = mask;
+    let shift: t27 = 0;
+    while (value > 0 && value % 2 == 0) { value = value / 2; shift = shift + 1; }
+    return shift;
+}
+
+fn x11_mask_range(mask: t27) t27 {
+    let value: t27 = mask;
+    while (value > 0 && value % 2 == 0) { value = value / 2; }
+    return value;
+}
+
+fn x11_pow2(exponent: t27) t27 {
+    let value: t27 = 1;
+    let i: t27 = 0;
+    while (i < exponent) { value = value * 2; i = i + 1; }
+    return value;
+}
+
+fn x11_channel_pixel(channel: t27, mask: t27) t27 {
+    let range: t27 = x11_mask_range(mask);
+    return ((channel * range + 127) / 255) * x11_pow2(x11_mask_shift(mask));
+}
+
+fn x11_push_pixel(out: *WireBuffer, setup: *X11SetupSuccess, red: t27, green: t27, blue: t27) void {
+    let pixel: t27 = x11_channel_pixel(red, setup.*.red_mask)
+        + x11_channel_pixel(green, setup.*.green_mask) + x11_channel_pixel(blue, setup.*.blue_mask);
+    let byte_count: t27 = setup.*.bits_per_pixel / 8;
+    let i: t27 = 0;
+    while (i < byte_count) {
+        let byte_index: t27 = i;
+        if (setup.*.image_byte_order != 0) { byte_index = byte_count - i - 1; }
+        wire_push_u8(out, (pixel / x11_pow2(byte_index * 8)) % 256);
+        i = i + 1;
+    }
+}
+
+fn x11_surface_rows(setup: *X11SetupSuccess, surface: *Surface, first_y: t27, row_count: t27) WireBuffer {
+    let row_bits: t27 = surface.*.width * setup.*.bits_per_pixel;
+    let padded_bits: t27 = ((row_bits + setup.*.scanline_pad - 1) / setup.*.scanline_pad) * setup.*.scanline_pad;
+    let row_bytes: t27 = padded_bits / 8;
+    let out: WireBuffer = wire_new((row_bytes * row_count) as i32);
+    let y: t27 = first_y;
+    while (y < first_y + row_count) {
+        let row_start: i32 = len[u8](out.bytes);
+        let x: t27 = 0;
+        while (x < surface.*.width) {
+            let offset: i32 = ((y * surface.*.width + x) * 4) as i32;
+            x11_push_pixel(&out, setup, get[u8](surface.*.pixels, offset) as t27,
+                get[u8](surface.*.pixels, offset + 1) as t27, get[u8](surface.*.pixels, offset + 2) as t27);
+            x = x + 1;
+        }
+        let written: t27 = (len[u8](out.bytes) - row_start) as t27;
+        while (written < row_bytes) { wire_push_u8(&out, 0); written = written + 1; }
+        y = y + 1;
+    }
+    return out;
+}
+
+fn x11_present_surface(connection: *X11NativeConnection, window: *X11NativeWindow, surface: *Surface) X11PresentResult {
+    let result: X11PresentResult = X11PresentResult{ .rows = 0, .requests = 0, .ok = 0, .error = "presentation not attempted" };
+    if (connection.*.authenticated == 0 || window.*.live == 0 || window.*.mapped == 0) { result.error = "window is not mapped"; return result; }
+    if (connection.*.setup.pixel_format_valid == 0) { result.error = "server root visual is not a supported TrueColor format"; return result; }
+    if (surface.*.width != window.*.width || surface.*.height != window.*.height) { result.error = "surface dimensions do not match window"; return result; }
+    let row_bits: t27 = surface.*.width * connection.*.setup.bits_per_pixel;
+    let row_bytes: t27 = (((row_bits + connection.*.setup.scanline_pad - 1) / connection.*.setup.scanline_pad)
+        * connection.*.setup.scanline_pad) / 8;
+    let available: t27 = connection.*.setup.maximum_request_length * 4 - 24;
+    let rows_per_request: t27 = available / row_bytes;
+    if (rows_per_request < 1) { result.error = "surface row exceeds X11 maximum request length"; return result; }
+    let y: t27 = 0;
+    while (y < surface.*.height) {
+        let count: t27 = rows_per_request;
+        if (count > surface.*.height - y) { count = surface.*.height - y; }
+        let pixels: WireBuffer = x11_surface_rows(&connection.*.setup, surface, y, count);
+        let request: WireBuffer = x11_put_image_request(window.*.window_id, window.*.gc_id,
+            surface.*.width, count, 0, y, connection.*.setup.root_depth, &pixels);
+        wire_free(&pixels);
+        if (x11_native_send_request(connection, &request, 1) == 0) {
+            result.error = "X11 PutImage write failed"; return result;
+        }
+        result.rows = result.rows + count; result.requests = result.requests + 1; y = y + count;
+    }
+    result.ok = 1; result.error = ""; return result;
+}

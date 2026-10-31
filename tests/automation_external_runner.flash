@@ -1,0 +1,44 @@
+@import("../src/flashy.flash")
+
+fn main() i32 {
+    if (_zag_argc() != 2) {
+        _zag_println("automation_external_runner: expected one socket path");
+        return 2;
+    }
+    let path: []u8 = _zag_arg(1);
+    let runner: AutomationRunner = automation_runner_connect(path);
+    if (runner.active == 0) {
+        automation_runner_close(&runner);
+        _zag_println("automation_external_runner: connect failed");
+        return 1;
+    }
+    let runner_fd: i64 = runner.connection.fd;
+
+    let click_request: AutomationRequest = automation_request(1001,
+        AutomationCommand.Click, automation_locator_test_id("light-button"),
+        "", Key.Unknown);
+    let click: AutomationResponse = automation_runner_round_trip(
+        &runner, click_request, 8000);
+
+    let assertion_request: AutomationRequest = automation_request(1002,
+        AutomationCommand.AssertVisible, automation_locator_key(729),
+        "", Key.Unknown);
+    let assertion: AutomationResponse = automation_runner_round_trip(
+        &runner, assertion_request, 8000);
+
+    let ok: i32 = 1;
+    if (click.valid == 0 || click.request_id != 1001
+        || click.status != AutomationResponseStatus.Ok) { ok = 0; }
+    if (assertion.valid == 0 || assertion.request_id != 1002
+        || assertion.status != AutomationResponseStatus.Ok
+        || runner.completed_requests != 2) { ok = 0; }
+    automation_runner_close(&runner);
+    if (linux_fd_flags(runner_fd) != (0 - 9)) { ok = 0; }
+
+    if (ok == 1) {
+        _zag_println("automation_external_runner: ok");
+        return 0;
+    }
+    _zag_println("automation_external_runner: failed");
+    return 1;
+}

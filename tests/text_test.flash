@@ -1,0 +1,678 @@
+@import("../src/flashy.flash")
+
+fn text_expect(ok: i32, message: []u8) i32 {
+    if (ok == 0) { _zag_print("FAIL "); _zag_println(message); return 1; }
+    return 0;
+}
+
+fn malformed2(first: t9, second: t9) ArrayList[u8] {
+    let bytes: ArrayList[u8] = make[u8](2);
+    push[u8](&bytes, first as u8); push[u8](&bytes, second as u8); return bytes;
+}
+
+fn malformed3(first: t9, second: t9, third: t9) ArrayList[u8] {
+    let bytes: ArrayList[u8] = make[u8](3);
+    push[u8](&bytes, first as u8); push[u8](&bytes, second as u8); push[u8](&bytes, third as u8); return bytes;
+}
+
+fn malformed4(first: t9, second: t9, third: t9, fourth: t9) ArrayList[u8] {
+    let bytes: ArrayList[u8] = make[u8](4);
+    push[u8](&bytes, first as u8); push[u8](&bytes, second as u8);
+    push[u8](&bytes, third as u8); push[u8](&bytes, fourth as u8); return bytes;
+}
+
+fn repeated_ascii(count: t27) ArrayList[u8] {
+    let bytes: ArrayList[u8] = make[u8](count as i32);
+    let i: t27 = 0;
+    while (i < count) {
+        push[u8](&bytes, 97 as u8);
+        i = i + 1;
+    }
+    return bytes;
+}
+
+fn edit_input_handler(context: *EventContext, event: Event) void {
+    if (event.kind != EventKind.Input) { return; }
+    let calls: StateHandle = ui_state(context.*.ui, context.*.user_data, 0, 1);
+    let _updated: i32 = state_set(context.*.ui, calls, state_get(context.*.ui, calls) + 1);
+}
+
+fn reentrant_input_handler(context: *EventContext, event: Event) void {
+    if (event.kind != EventKind.Input) { return; }
+    let status: StateHandle = ui_state(context.*.ui, context.*.user_data, 0, 1);
+    if (state_get(context.*.ui, status) != 0) { return; }
+    let _entered: i32 = state_set(context.*.ui, status, 1);
+    let before: i32 = @strEq(event.text, "outer");
+    let node_id: i32 = ui_find_key(context.*.ui, context.*.node_key);
+    let nested: i32 = ui_set_text_value(context.*.ui, node_id, "inner");
+    let after: i32 = @strEq(event.text, "outer");
+    if (before == 1 && nested == 1 && after == 1) {
+        let _passed: i32 = state_set(context.*.ui, status, 3);
+    } else {
+        let _failed: i32 = state_set(context.*.ui, status, -1);
+    }
+}
+
+fn self_unbinding_input_handler(context: *EventContext, event: Event) void {
+    if (event.kind != EventKind.Input) { return; }
+    let status: StateHandle = ui_state(context.*.ui, context.*.user_data, 0, 1);
+    let before: i32 = @strEq(event.text, "unbind");
+    let unbound: i32 = ui_unbind_handler(context.*.ui, context.*.node_key);
+    let after: i32 = @strEq(event.text, "unbind");
+    if (before == 1 && unbound == 1 && after == 1) {
+        let _passed: i32 = state_set(context.*.ui, status, state_get(context.*.ui, status) + 1);
+    } else {
+        let _failed: i32 = state_set(context.*.ui, status, -1);
+    }
+}
+
+fn replacement_input_handler(context: *EventContext, event: Event) void {
+    if (event.kind != EventKind.Input) { return; }
+    let calls: StateHandle = ui_state(context.*.ui, context.*.user_data, 0, 1);
+    if (@strEq(event.text, "second") == 1) {
+        let _passed: i32 = state_set(context.*.ui, calls, state_get(context.*.ui, calls) + 1);
+    } else {
+        let _failed: i32 = state_set(context.*.ui, calls, -1);
+    }
+}
+
+fn rebinding_input_handler(context: *EventContext, event: Event) void {
+    if (event.kind != EventKind.Input) { return; }
+    let status: StateHandle = ui_state(context.*.ui, context.*.user_data, 0, 1);
+    let before: i32 = @strEq(event.text, "first");
+    let rebound: i32 = ui_bind_handler(context.*.ui, context.*.node_key,
+        context.*.user_data + 1, replacement_input_handler);
+    let after: i32 = @strEq(event.text, "first");
+    if (before == 1 && rebound == 1 && after == 1) {
+        let _passed: i32 = state_set(context.*.ui, status, state_get(context.*.ui, status) + 1);
+    } else {
+        let _failed: i32 = state_set(context.*.ui, status, -1);
+    }
+}
+
+fn unmounting_input_handler(context: *EventContext, event: Event) void {
+    if (event.kind != EventKind.Input) { return; }
+    let status: StateHandle = ui_state(context.*.ui, context.*.user_data, 0, 1);
+    let before: i32 = @strEq(event.text, "gone");
+    ui_begin(context.*.ui);
+    ui_end(context.*.ui);
+    let after: i32 = @strEq(event.text, "gone");
+    if (before == 1 && after == 1) {
+        let _passed: i32 = state_set(context.*.ui, status, state_get(context.*.ui, status) + 1);
+    } else {
+        let _failed: i32 = state_set(context.*.ui, status, -1);
+    }
+}
+
+fn handler_live_for_key(ui: *Ui, key: t27) i32 {
+    let i: i32 = 0;
+    while (i < len[HandlerBinding](ui.*.handlers)) {
+        let binding: HandlerBinding = get[HandlerBinding](ui.*.handlers, i);
+        if (binding.node_key == key) { return binding.live; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn handler_event_count_for_key(ui: *Ui, key: t27) t27 {
+    let i: i32 = 0;
+    while (i < len[HandlerBinding](ui.*.handlers)) {
+        let binding: HandlerBinding = get[HandlerBinding](ui.*.handlers, i);
+        if (binding.node_key == key) { return binding.context.event_count; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn main() i32 {
+    let failures: i32 = 0;
+    failures = failures + text_expect(text_field_max_bytes() == 531441,
+        "TextField ownership uses the balanced-ternary 3^12 byte ceiling");
+    let checked_length: t27 = -7;
+    let maximum_t27_length: t27 = -7;
+    let rejected_length: t27 = -7;
+    let minimum_t27: t27 = 0 - flashy_t27_max();
+    failures = failures + text_expect(text_replacement_length_checked(
+            10, 2, 5, 4, text_field_max_bytes(), &checked_length) == 1
+        && checked_length == 11
+        && text_replacement_length_checked(flashy_t27_max(), 0,
+            flashy_t27_max(), flashy_t27_max(), flashy_t27_max(),
+            &maximum_t27_length) == 1
+        && maximum_t27_length == flashy_t27_max()
+        && text_replacement_length_checked(flashy_t27_max(), 0, 0,
+            1, flashy_t27_max(), &rejected_length) == 0
+        && rejected_length == -7
+        && text_replacement_length_checked(0, minimum_t27,
+            flashy_t27_max(), 0, flashy_t27_max(), &rejected_length) == 0
+        && rejected_length == -7,
+        "replacement length proof accepts exact bounds and rejects full-t27 overflow without touching output");
+    failures = failures + text_expect(utf8_validate("Flashy").valid == 1
+        && utf8_validate("Flashy").codepoints == 6, "ASCII validates with exact codepoint count");
+    failures = failures + text_expect(utf8_validate("é").valid == 1
+        && utf8_validate("é").codepoints == 2 && utf8_grapheme_count("é") == 1,
+        "combining sequence is one grapheme");
+    failures = failures + text_expect(utf8_validate("👩‍💻").codepoints == 3
+        && utf8_grapheme_count("👩‍💻") == 1, "ZWJ emoji sequence is one grapheme");
+    failures = failures + text_expect(utf8_validate("🇺🇸").codepoints == 2
+        && utf8_grapheme_count("🇺🇸") == 1, "regional indicator pair is one grapheme");
+    failures = failures + text_expect(utf8_next_grapheme("é", 0) == "é".len
+        && utf8_previous_grapheme("é", "é".len) == 0, "caret navigation respects combining cluster boundary");
+    failures = failures + text_expect(utf8_next_grapheme("👩‍💻", 0) == "👩‍💻".len
+        && utf8_previous_grapheme("👩‍💻", "👩‍💻".len) == 0, "caret navigation respects ZWJ cluster boundary");
+    let indexed_text: []u8 = "Aé👩‍💻Z";
+    failures = failures + text_expect(utf8_grapheme_count(indexed_text) == 4
+        && utf8_grapheme_byte_offset(indexed_text, 0) == 0
+        && utf8_grapheme_byte_offset(indexed_text, 1) == 1
+        && utf8_grapheme_byte_offset(indexed_text, 2) == 4
+        && utf8_grapheme_byte_offset(indexed_text, 3) == 15
+        && utf8_grapheme_byte_offset(indexed_text, 4) == 16
+        && utf8_grapheme_byte_offset(indexed_text, -2) == 0
+        && utf8_grapheme_byte_offset(indexed_text, 99) == 16,
+        "grapheme indices map to exact UTF-8 boundaries [0,1,4,15,16]");
+    failures = failures + text_expect(utf8_grapheme_index_at_byte(indexed_text, 0) == 0
+        && utf8_grapheme_index_at_byte(indexed_text, 1) == 1
+        && utf8_grapheme_index_at_byte(indexed_text, 4) == 2
+        && utf8_grapheme_index_at_byte(indexed_text, 15) == 3
+        && utf8_grapheme_index_at_byte(indexed_text, 16) == 4
+        && utf8_grapheme_index_at_byte(indexed_text, 2) == -1,
+        "only exact UTF-8 grapheme boundaries convert back to logical indices");
+    failures = failures + text_expect(utf8_grapheme_index_at_or_after_byte(indexed_text, -1) == 0
+        && utf8_grapheme_index_at_or_after_byte(indexed_text, 2) == 2
+        && utf8_grapheme_index_at_or_after_byte(indexed_text, 8) == 3
+        && utf8_grapheme_index_at_or_after_byte(indexed_text, 99) == 4,
+        "external byte offsets clamp and round forward without splitting a cluster");
+    failures = failures + text_expect(selection_valid(indexed_text, 1, 3) == 1
+        && selection_valid(indexed_text, 3, 1) == 0
+        && selection_valid(indexed_text, -1, 2) == 0
+        && selection_valid(indexed_text, 0, 5) == 0,
+        "normalized logical selection ranges are bounded by grapheme count");
+    failures = failures + text_expect(utf8_line_count("a\r\nb\n") == 3, "CRLF is counted as one line break");
+
+    let overlong: ArrayList[u8] = malformed2(192, 128);
+    let bad_continuation: ArrayList[u8] = malformed2(194, 32);
+    let truncated: ArrayList[u8] = malformed2(226, 130);
+    let surrogate: ArrayList[u8] = malformed3(237, 160, 128);
+    let out_of_range: ArrayList[u8] = malformed4(244, 144, 128, 128);
+    failures = failures + text_expect(utf8_validate(overlong.data[0..2]).error == Utf8Error.Overlong,
+        "overlong encoding is rejected");
+    failures = failures + text_expect(utf8_validate(bad_continuation.data[0..2]).error == Utf8Error.InvalidContinuation,
+        "invalid continuation is rejected");
+    failures = failures + text_expect(utf8_validate(truncated.data[0..2]).error == Utf8Error.Truncated,
+        "truncated sequence is rejected");
+    failures = failures + text_expect(utf8_validate(surrogate.data[0..3]).error == Utf8Error.Surrogate,
+        "UTF-16 surrogate encoding is rejected");
+    failures = failures + text_expect(utf8_validate(out_of_range.data[0..4]).error == Utf8Error.OutOfRange,
+        "codepoint beyond Unicode range is rejected");
+    failures = failures + text_expect(utf8_grapheme_byte_offset(overlong.data[0..2], 0) == -1
+        && utf8_grapheme_index_at_byte(overlong.data[0..2], 0) == -1
+        && utf8_grapheme_index_at_or_after_byte(overlong.data[0..2], 0) == -1,
+        "malformed UTF-8 has no logical selection boundaries");
+    let single: ArrayList[u8] = make[u8](1); push[u8](&single, 0 as u8);
+    let byte_value: t27 = 0; let single_byte_ok: i32 = 1;
+    while (byte_value <= 255) {
+        set[u8](&single, 0, byte_value as u8);
+        let validation: Utf8Validation = utf8_validate(single.data[0..1]);
+        if (byte_value <= 127 && validation.valid == 0) { single_byte_ok = 0; }
+        if (byte_value > 127 && validation.valid == 1) { single_byte_ok = 0; }
+        byte_value = byte_value + 1;
+    }
+    failures = failures + text_expect(single_byte_ok == 1,
+        "all 256 isolated byte values terminate with deterministic validity");
+
+    let oversized_text: ArrayList[u8] = repeated_ascii(
+        text_field_max_bytes() + 1);
+    let exact_text: []u8 = oversized_text.data[
+        0..text_field_max_bytes() as i32];
+    failures = failures + text_expect(
+        text_field_value_length_valid(exact_text) == 1
+        && text_field_value_length_valid(oversized_text.data[
+            0..oversized_text.len]) == 0,
+        "TextField byte admission accepts exactly 3^12 and rejects the next byte");
+    let replacement_buffer: TextBuffer = text_buffer_copy("keep");
+    failures = failures + text_expect(text_buffer_replace_range(
+            &replacement_buffer, 0, 4, exact_text) == 1
+        && replacement_buffer.bytes.len as t27 == text_field_max_bytes()
+        && text_buffer_view(&replacement_buffer)[0] == (97 as u8)
+        && text_buffer_view(&replacement_buffer)[
+            text_field_max_bytes() as i32 - 1] == (97 as u8),
+        "owned replacement accepts the exact balanced-ternary byte ceiling");
+    failures = failures + text_expect(text_buffer_replace_range(
+            &replacement_buffer, text_field_max_bytes(),
+            text_field_max_bytes(), "x") == 0
+        && replacement_buffer.bytes.len as t27 == text_field_max_bytes()
+        && text_buffer_view(&replacement_buffer)[
+            text_field_max_bytes() as i32 - 1] == (97 as u8),
+        "one-byte overflow is rejected before allocation and preserves the exact prior buffer");
+    text_buffer_free(&replacement_buffer);
+
+    let rejected_mount: Ui = ui_new(120, 60); ui_begin(&rejected_mount);
+    let rejected_mount_id: i32 = ui_text_field_control(&rejected_mount,
+        700, -1, rect(0, 0, 100, 44), "Bounded", oversized_text.data[
+            0..oversized_text.len], 1);
+    ui_end(&rejected_mount);
+    failures = failures + text_expect(rejected_mount_id == -1
+        && len[Node](rejected_mount.nodes) == 0
+        && rejected_mount.reconcile.mounted == 0,
+        "oversized declarative mount fails without allocating or mounting a placeholder");
+    ui_free(&rejected_mount);
+
+    let rejected_reconcile: Ui = ui_new(120, 60); ui_begin(&rejected_reconcile);
+    let retained_field: i32 = ui_text_field_control(&rejected_reconcile,
+        701, -1, rect(0, 0, 100, 44), "Retained", "keep", 2);
+    ui_end(&rejected_reconcile);
+    let _retained_focus: i32 = ui_set_focus(&rejected_reconcile, retained_field);
+    let _retained_selection: i32 = ui_set_text_selection(&rejected_reconcile,
+        retained_field, TextSelection{ .anchor = 1, .focus = 3 });
+    ui_begin(&rejected_reconcile);
+    let rejected_reconcile_id: i32 = ui_text_field_control(
+        &rejected_reconcile, 701, -1, rect(9, 9, 90, 40), "Changed",
+        oversized_text.data[0..oversized_text.len], 9);
+    ui_end(&rejected_reconcile);
+    failures = failures + text_expect(rejected_reconcile_id == -1
+        && ui_find_key(&rejected_reconcile, 701) == retained_field
+        && rejected_reconcile.nodes.data[retained_field].live == 1
+        && @strEq(rejected_reconcile.nodes.data[retained_field].text,
+            "keep") == 1
+        && rejected_reconcile.nodes.data[retained_field].bounds.x == 0
+        && rejected_reconcile.nodes.data[retained_field].action.id == 2
+        && locator_has_selection(&rejected_reconcile,
+            locate_key(&rejected_reconcile, 701), 1, 3)
+        && rejected_reconcile.focused_node == retained_field
+        && rejected_reconcile.reconcile.updated == 0
+        && rejected_reconcile.reconcile.unmounted == 0,
+        "oversized keyed reconciliation returns failure and retains exact prior text, selection, style data, action, and focus");
+    ui_begin(&rejected_reconcile);
+    let malformed_reconcile_id: i32 = ui_text_field_control(
+        &rejected_reconcile, 701, -1, rect(9, 9, 90, 40), "Changed",
+        overlong.data[0..2], 9);
+    ui_end(&rejected_reconcile);
+    failures = failures + text_expect(malformed_reconcile_id == -1
+        && ui_find_key(&rejected_reconcile, 701) == retained_field
+        && @strEq(rejected_reconcile.nodes.data[retained_field].text,
+            "keep") == 1
+        && locator_has_selection(&rejected_reconcile,
+            locate_key(&rejected_reconcile, 701), 1, 3)
+        && rejected_reconcile.focused_node == retained_field
+        && rejected_reconcile.reconcile.unmounted == 0,
+        "malformed keyed reconciliation shares the fail-atomic retained-node contract");
+    ui_begin(&rejected_reconcile);
+    let direct_malformed_id: i32 = ui_node(&rejected_reconcile, 701, NodeKind.TextField,
+        -1, rect(9, 9, 90, 40), style_default(),
+        semantics(Role.TextField, "Changed", "", ""),
+        overlong.data[0..2], Action{ .id = 9 });
+    ui_end(&rejected_reconcile);
+    failures = failures + text_expect(direct_malformed_id == -1
+        && ui_find_key(&rejected_reconcile, 701) == retained_field
+        && @strEq(rejected_reconcile.nodes.data[retained_field].text,
+            "keep") == 1
+        && locator_has_selection(&rejected_reconcile,
+            locate_key(&rejected_reconcile, 701), 1, 3)
+        && rejected_reconcile.focused_node == retained_field
+        && rejected_reconcile.reconcile.updated == 0
+        && rejected_reconcile.reconcile.unmounted == 0,
+        "direct malformed TextField construction is rejected in core while retaining the prior keyed node exactly");
+    let rejected_actions: t27 = action_emission_count(&rejected_reconcile, 2);
+    failures = failures + text_expect(ui_set_text_value(&rejected_reconcile,
+            retained_field, oversized_text.data[0..oversized_text.len]) == 0
+        && ui_replace_text_selection(&rejected_reconcile, retained_field,
+            exact_text) == 0
+        && @strEq(rejected_reconcile.nodes.data[retained_field].text,
+            "keep") == 1
+        && locator_has_selection(&rejected_reconcile,
+            locate_key(&rejected_reconcile, 701), 1, 3)
+        && action_emission_count(&rejected_reconcile, 2) == rejected_actions,
+        "external fill and cumulative edit overflow preserve owned text, selection, and actions atomically");
+    ui_free(&rejected_reconcile);
+
+    let ui: Ui = ui_new(180, 80); ui_begin(&ui);
+    let field: i32 = ui_text_field_control(&ui, 1, -1, rect(0, 0, 160, 44), "Name", "valid", 1);
+    ui_end(&ui);
+    let input_calls: StateHandle = ui_state(&ui, 900, 0, 1);
+    failures = failures + text_expect(ui_bind_handler(&ui, 1, 900, edit_input_handler) == 1,
+        "text field binds an Input handler through its stable key");
+    failures = failures + text_expect(locator_fill(&ui, locate_key(&ui, 1), overlong.data[0..2]) == 0,
+        "malformed fill is rejected");
+    failures = failures + text_expect(@strEq(ui.nodes.data[field].text, "valid") == 1
+        && locator_has_selection(&ui, locate_key(&ui, 1), 5, 5),
+        "malformed fill preserves text and logical selection atomically");
+    failures = failures + text_expect(action_emission_count(&ui, 1) == 0 && state_get(&ui, input_calls) == 0,
+        "malformed fill emits no action or Input event");
+
+    failures = failures + text_expect(locator_fill(&ui, locate_key(&ui, 1), "Aé👩‍💻🇺🇸Z") == 1
+        && locator_has_selection(&ui, locate_key(&ui, 1), 5, 5)
+        && action_emission_count(&ui, 1) == 1 && state_get(&ui, input_calls) == 1,
+        "valid fill collapses at the logical end and emits exactly once");
+    failures = failures + text_expect(locator_set_selection(&ui, locate_key(&ui, 1), 1, 2) == 1
+        && locator_has_selected_text(&ui, locate_key(&ui, 1), "é") == 1
+        && locator_type(&ui, locate_key(&ui, 1), "E") == 1
+        && @strEq(ui.nodes.data[field].text, "AE👩‍💻🇺🇸Z") == 1
+        && locator_has_selection(&ui, locate_key(&ui, 1), 2, 2)
+        && action_emission_count(&ui, 1) == 2 && state_get(&ui, input_calls) == 2,
+        "typing replaces a complete combining cluster and emits exactly once");
+    let selected_start_byte: t27 = -7;
+    let selected_end_byte: t27 = -7;
+    let invalid_start_byte: t27 = -7;
+    let invalid_end_byte: t27 = -7;
+    failures = failures + text_expect(locator_set_selection(&ui,
+            locate_key(&ui, 1), 1, 2) == 1
+        && ui_selected_text_byte_range(&ui, field,
+            &selected_start_byte, &selected_end_byte) == 1
+        && selected_start_byte == 1 && selected_end_byte == 2
+        && ui_selected_text_byte_range(&ui, -1,
+            &invalid_start_byte, &invalid_end_byte) == 0
+        && invalid_start_byte == -7 && invalid_end_byte == -7,
+        "selection byte-range preflight is allocation-free, exact, and leaves outputs untouched on failure");
+    failures = failures + text_expect(locator_set_selection(&ui, locate_key(&ui, 1), 2, 3) == 1
+        && locator_has_selected_text(&ui, locate_key(&ui, 1), "👩‍💻") == 1
+        && locator_type(&ui, locate_key(&ui, 1), "T") == 1
+        && @strEq(ui.nodes.data[field].text, "AET🇺🇸Z") == 1
+        && action_emission_count(&ui, 1) == 3 && state_get(&ui, input_calls) == 3,
+        "typing replaces a complete ZWJ cluster and emits exactly once");
+    failures = failures + text_expect(locator_set_selection(&ui, locate_key(&ui, 1), 3, 4) == 1
+        && locator_has_selected_text(&ui, locate_key(&ui, 1), "🇺🇸") == 1
+        && locator_type(&ui, locate_key(&ui, 1), "F") == 1
+        && @strEq(ui.nodes.data[field].text, "AETFZ") == 1
+        && action_emission_count(&ui, 1) == 4 && state_get(&ui, input_calls) == 4,
+        "typing replaces a complete regional-indicator pair and emits exactly once");
+
+    failures = failures + text_expect(locator_set_selection(&ui, locate_key(&ui, 1), 4, 1) == 1
+        && locator_has_selection(&ui, locate_key(&ui, 1), 4, 1)
+        && locator_has_selected_text(&ui, locate_key(&ui, 1), "ETF") == 1,
+        "automation preserves reversed anchor and focus while normalizing the copied range");
+    let reversed_selection: TextSelection = ui_get_text_selection(&ui, field);
+    let located_reversed_selection: TextSelection = locator_selection(&ui, locate_key(&ui, 1));
+    failures = failures + text_expect(reversed_selection.anchor == 4 && reversed_selection.focus == 1
+        && located_reversed_selection.anchor == 4 && located_reversed_selection.focus == 1,
+        "direct and locator selection reads retain the public TextSelection direction");
+    let actions_before_invalid: t27 = action_emission_count(&ui, 1);
+    let inputs_before_invalid: t27 = state_get(&ui, input_calls);
+    failures = failures + text_expect(locator_type(&ui, locate_key(&ui, 1), overlong.data[0..2]) == 0
+        && @strEq(ui.nodes.data[field].text, "AETFZ") == 1
+        && locator_has_selection(&ui, locate_key(&ui, 1), 4, 1)
+        && action_emission_count(&ui, 1) == actions_before_invalid
+        && state_get(&ui, input_calls) == inputs_before_invalid,
+        "malformed selection replacement leaves text, reversed selection, actions, and handlers untouched");
+
+    failures = failures + text_expect(locator_fill(&ui, locate_key(&ui, 1), indexed_text) == 1
+        && locator_set_selection(&ui, locate_key(&ui, 1), 2, 2) == 1,
+        "navigation fixture starts at grapheme index two");
+    let actions_before_moves: t27 = action_emission_count(&ui, 1);
+    let inputs_before_moves: t27 = state_get(&ui, input_calls);
+    let shift_only: KeyModifiers = KeyModifiers{ .shift = 1, .control = 0, .alt = 0, .meta = 0 };
+    failures = failures + text_expect(locator_press_modified(&ui, locate_key(&ui, 1), Key.ArrowLeft, shift_only) == 1
+        && locator_has_selection(&ui, locate_key(&ui, 1), 2, 1)
+        && locator_press_modified(&ui, locate_key(&ui, 1), Key.ArrowRight, shift_only) == 1
+        && locator_has_selection(&ui, locate_key(&ui, 1), 2, 2)
+        && locator_press_modified(&ui, locate_key(&ui, 1), Key.Home, shift_only) == 1
+        && locator_has_selection(&ui, locate_key(&ui, 1), 2, 0)
+        && locator_press_modified(&ui, locate_key(&ui, 1), Key.End, shift_only) == 1
+        && locator_has_selection(&ui, locate_key(&ui, 1), 2, 4),
+        "Shift plus left, right, home, and end extends from a stable grapheme anchor");
+    failures = failures + text_expect(action_emission_count(&ui, 1) == actions_before_moves
+        && state_get(&ui, input_calls) == inputs_before_moves,
+        "selection-only keyboard commands emit neither Action nor Input");
+    failures = failures + text_expect(locator_press(&ui, locate_key(&ui, 1), Key.ArrowLeft) == 1
+        && locator_has_selection(&ui, locate_key(&ui, 1), 2, 2)
+        && locator_press(&ui, locate_key(&ui, 1), Key.ArrowRight) == 1
+        && locator_has_selection(&ui, locate_key(&ui, 1), 3, 3),
+        "plain horizontal movement collapses a range before moving by logical graphemes");
+    let control_only: KeyModifiers = KeyModifiers{ .shift = 0, .control = 1, .alt = 0, .meta = 0 };
+    failures = failures + text_expect(locator_press_modified(&ui, locate_key(&ui, 1), Key.A, control_only) == 1
+        && locator_has_selection(&ui, locate_key(&ui, 1), 0, 4)
+        && locator_has_selected_text(&ui, locate_key(&ui, 1), indexed_text) == 1,
+        "Control+A selects every grapheme without exposing byte positions");
+    failures = failures + text_expect(ui_apply_text_command(&ui, field, TextEditCommand.MoveEnd, 0) == 1
+        && locator_has_selection(&ui, locate_key(&ui, 1), 4, 4)
+        && ui_apply_text_command(&ui, field, TextEditCommand.SelectAll, 0) == 1
+        && locator_has_selection(&ui, locate_key(&ui, 1), 0, 4),
+        "direct text commands share the same grapheme-indexed selection contract");
+
+    failures = failures + text_expect(locator_fill(&ui, locate_key(&ui, 1), indexed_text) == 1
+        && locator_set_selection(&ui, locate_key(&ui, 1), 0, 0) == 1,
+        "deletion fixture starts before the first grapheme");
+    let actions_before_deletes: t27 = action_emission_count(&ui, 1);
+    let inputs_before_deletes: t27 = state_get(&ui, input_calls);
+    failures = failures + text_expect(locator_press(&ui, locate_key(&ui, 1), Key.Delete) == 1
+        && @strEq(ui.nodes.data[field].text, "é👩‍💻Z") == 1
+        && locator_has_selection(&ui, locate_key(&ui, 1), 0, 0),
+        "forward delete removes exactly one ASCII grapheme");
+    failures = failures + text_expect(locator_set_selection(&ui, locate_key(&ui, 1), 3, 3) == 1
+        && locator_press(&ui, locate_key(&ui, 1), Key.Backspace) == 1
+        && @strEq(ui.nodes.data[field].text, "é👩‍💻") == 1
+        && locator_set_selection(&ui, locate_key(&ui, 1), 1, 1) == 1
+        && locator_press(&ui, locate_key(&ui, 1), Key.Delete) == 1
+        && @strEq(ui.nodes.data[field].text, "é") == 1
+        && locator_press(&ui, locate_key(&ui, 1), Key.Backspace) == 1
+        && ui.nodes.data[field].text.len == 0 && locator_has_selection(&ui, locate_key(&ui, 1), 0, 0),
+        "forward and backward deletion remove whole ZWJ and combining clusters");
+    failures = failures + text_expect(action_emission_count(&ui, 1) == actions_before_deletes + 4
+        && state_get(&ui, input_calls) == inputs_before_deletes + 4,
+        "each successful forward or backward deletion emits exactly one Action and Input");
+    let actions_before_noop: t27 = action_emission_count(&ui, 1);
+    let inputs_before_noop: t27 = state_get(&ui, input_calls);
+    failures = failures + text_expect(locator_press(&ui, locate_key(&ui, 1), Key.Backspace) == 1
+        && locator_press(&ui, locate_key(&ui, 1), Key.Delete) == 1
+        && action_emission_count(&ui, 1) == actions_before_noop
+        && state_get(&ui, input_calls) == inputs_before_noop,
+        "boundary deletion no-ops emit neither Action nor Input");
+
+    failures = failures + text_expect(locator_fill(&ui, locate_key(&ui, 1), indexed_text) == 1
+        && locator_set_selection(&ui, locate_key(&ui, 1), 3, 1) == 1,
+        "reconciliation fixture establishes a reversed logical selection");
+    ui_begin(&ui);
+    let same_field: i32 = ui_text_field_control(&ui, 1, -1, rect(0, 0, 160, 44), "Name", indexed_text, 1);
+    ui_end(&ui);
+    failures = failures + text_expect(same_field == field
+        && locator_has_selection(&ui, locate_key(&ui, 1), 3, 1),
+        "unchanged keyed reconciliation preserves reversed selection exactly");
+    ui_begin(&ui);
+    let clamped_field: i32 = ui_text_field_control(&ui, 1, -1, rect(0, 0, 160, 44), "Name", "é", 1);
+    ui_end(&ui);
+    failures = failures + text_expect(clamped_field == field
+        && @strEq(ui.nodes.data[field].text, "é") == 1
+        && locator_has_selection(&ui, locate_key(&ui, 1), 1, 1),
+        "external value reconciliation clamps retained logical positions to the new grapheme count");
+    let text_snapshot: InspectorSnapshot = ui_inspect(&ui);
+    let inspected_field: i32 = inspector_find_key(&text_snapshot, 1);
+    failures = failures + text_expect(inspected_field >= 0
+        && text_snapshot.nodes.data[inspected_field].caret == 1
+        && text_snapshot.nodes.data[inspected_field].selection_start == 1
+        && text_snapshot.nodes.data[inspected_field].selection_end == 1
+        && text_snapshot.nodes.data[inspected_field].grapheme_count == 1
+        && text_snapshot.nodes.data[inspected_field].selection_anchor == 1
+        && text_snapshot.nodes.data[inspected_field].selection_valid == 1
+        && selection_valid(ui.nodes.data[field].text,
+            text_snapshot.nodes.data[inspected_field].selection_start,
+            text_snapshot.nodes.data[inspected_field].selection_end) == 1,
+        "inspector exposes a valid grapheme-indexed caret and selection");
+    inspector_free(&text_snapshot);
+    let invalid_node: Node = get[Node](ui.nodes, field);
+    invalid_node.caret = 2; invalid_node.selection_start = 2; invalid_node.selection_end = 2;
+    set[Node](&ui.nodes, field, invalid_node);
+    let invalid_snapshot: InspectorSnapshot = ui_inspect(&ui);
+    let invalid_field: i32 = inspector_find_key(&invalid_snapshot, 1);
+    failures = failures + text_expect(invalid_field >= 0
+        && invalid_snapshot.nodes.data[invalid_field].grapheme_count == 1
+        && invalid_snapshot.nodes.data[invalid_field].selection_anchor == -1
+        && invalid_snapshot.nodes.data[invalid_field].selection_valid == 0
+        && invalid_snapshot.violations == 1,
+        "inspector reports an out-of-range logical selection as one structural violation");
+    inspector_free(&invalid_snapshot);
+    ui_free(&ui);
+
+    let joining: Ui = ui_new(180, 60); ui_begin(&joining);
+    let joining_field: i32 = ui_text_field_control(&joining, 19, -1,
+        rect(0, 0, 160, 44), "Joining", "aZ", 10);
+    ui_end(&joining);
+    failures = failures + text_expect(locator_set_selection(&joining, locate_key(&joining, 19), 1, 1) == 1
+        && locator_type(&joining, locate_key(&joining, 19), "́") == 1
+        && @strEq(joining.nodes.data[joining_field].text, "áZ") == 1
+        && locator_has_selection(&joining, locate_key(&joining, 19), 1, 1)
+        && utf8_grapheme_count(joining.nodes.data[joining_field].text) == 2,
+        "combining-mark insertion resolves its caret in the joined final grapheme map");
+    failures = failures + text_expect(locator_fill(&joining, locate_key(&joining, 19), "🇺Z") == 1
+        && locator_set_selection(&joining, locate_key(&joining, 19), 1, 1) == 1
+        && locator_type(&joining, locate_key(&joining, 19), "🇸") == 1
+        && @strEq(joining.nodes.data[joining_field].text, "🇺🇸Z") == 1
+        && locator_has_selection(&joining, locate_key(&joining, 19), 1, 1)
+        && utf8_grapheme_count(joining.nodes.data[joining_field].text) == 2,
+        "regional-indicator insertion keeps the caret after the joined flag cluster");
+    failures = failures + text_expect(locator_fill(&joining, locate_key(&joining, 19), "👩Z") == 1
+        && locator_set_selection(&joining, locate_key(&joining, 19), 1, 1) == 1
+        && locator_type(&joining, locate_key(&joining, 19), "‍💻") == 1
+        && @strEq(joining.nodes.data[joining_field].text, "👩‍💻Z") == 1
+        && locator_has_selection(&joining, locate_key(&joining, 19), 1, 1)
+        && utf8_grapheme_count(joining.nodes.data[joining_field].text) == 2,
+        "ZWJ continuation insertion keeps the caret after the joined emoji cluster");
+    ui_free(&joining);
+
+    let reentrant: Ui = ui_new(180, 60); ui_begin(&reentrant);
+    let reentrant_field: i32 = ui_text_field_control(&reentrant, 20, -1,
+        rect(0, 0, 160, 44), "Reentrant", "ready", 4);
+    ui_end(&reentrant);
+    let reentrant_status: StateHandle = ui_state(&reentrant, 901, 0, 1);
+    failures = failures + text_expect(ui_bind_handler(&reentrant, 20, 901, reentrant_input_handler) == 1
+        && locator_fill(&reentrant, locate_key(&reentrant, 20), "outer") == 1
+        && state_get(&reentrant, reentrant_status) == 3
+        && @strEq(reentrant.nodes.data[reentrant_field].text, "inner") == 1
+        && action_emission_count(&reentrant, 4) == 2,
+        "reentrant edits cannot invalidate the outer Input event text view");
+    ui_free(&reentrant);
+
+    let unbinding: Ui = ui_new(180, 60); ui_begin(&unbinding);
+    let unbinding_field: i32 = ui_text_field_control(&unbinding, 21, -1,
+        rect(0, 0, 160, 44), "Unbind", "ready", 5);
+    ui_end(&unbinding);
+    let unbinding_status: StateHandle = ui_state(&unbinding, 910, 0, 1);
+    failures = failures + text_expect(ui_bind_handler(&unbinding, 21, 910, self_unbinding_input_handler) == 1
+        && locator_fill(&unbinding, locate_key(&unbinding, 21), "unbind") == 1
+        && state_get(&unbinding, unbinding_status) == 1
+        && handler_live_for_key(&unbinding, 21) == 0
+        && handler_event_count_for_key(&unbinding, 21) == 1
+        && locator_fill(&unbinding, locate_key(&unbinding, 21), "after") == 1
+        && state_get(&unbinding, unbinding_status) == 1
+        && @strEq(unbinding.nodes.data[unbinding_field].text, "after") == 1,
+        "an Input handler can unbind itself without stale dispatch resurrecting it");
+    ui_free(&unbinding);
+
+    let rebinding: Ui = ui_new(180, 60); ui_begin(&rebinding);
+    let rebinding_field: i32 = ui_text_field_control(&rebinding, 22, -1,
+        rect(0, 0, 160, 44), "Rebind", "ready", 6);
+    ui_end(&rebinding);
+    let original_status: StateHandle = ui_state(&rebinding, 920, 0, 1);
+    let replacement_status: StateHandle = ui_state(&rebinding, 921, 0, 1);
+    failures = failures + text_expect(ui_bind_handler(&rebinding, 22, 920, rebinding_input_handler) == 1
+        && locator_fill(&rebinding, locate_key(&rebinding, 22), "first") == 1
+        && state_get(&rebinding, original_status) == 1
+        && state_get(&rebinding, replacement_status) == 0
+        && handler_live_for_key(&rebinding, 22) == 1
+        && handler_event_count_for_key(&rebinding, 22) == 1
+        && locator_fill(&rebinding, locate_key(&rebinding, 22), "second") == 1
+        && state_get(&rebinding, original_status) == 1
+        && state_get(&rebinding, replacement_status) == 1
+        && handler_event_count_for_key(&rebinding, 22) == 2
+        && @strEq(rebinding.nodes.data[rebinding_field].text, "second") == 1,
+        "an Input handler can replace itself without stale dispatch restoring the old callback");
+    ui_free(&rebinding);
+
+    let unmounting: Ui = ui_new(180, 60); ui_begin(&unmounting);
+    let unmounting_field: i32 = ui_text_field_control(&unmounting, 23, -1,
+        rect(0, 0, 160, 44), "Unmount", "ready", 7);
+    ui_end(&unmounting);
+    let unmounting_status: StateHandle = ui_state(&unmounting, 930, 0, 1);
+    failures = failures + text_expect(ui_bind_handler(&unmounting, 23, 930, unmounting_input_handler) == 1
+        && locator_fill(&unmounting, locate_key(&unmounting, 23), "gone") == 1
+        && state_get(&unmounting, unmounting_status) == 1
+        && ui_find_key(&unmounting, 23) < 0
+        && handler_live_for_key(&unmounting, 23) == 0
+        && handler_event_count_for_key(&unmounting, 23) == 1,
+        "an Input handler can unmount its node without stale dispatch resurrecting its binding");
+    ui_begin(&unmounting);
+    let remounted_field: i32 = ui_text_field_control(&unmounting, 23, -1,
+        rect(0, 0, 160, 44), "Unmount", "new", 7);
+    ui_end(&unmounting);
+    failures = failures + text_expect(remounted_field != unmounting_field
+        && locator_fill(&unmounting, locate_key(&unmounting, 23), "after") == 1
+        && state_get(&unmounting, unmounting_status) == 1
+        && handler_live_for_key(&unmounting, 23) == 0,
+        "remounting the same key does not revive a binding removed during callback dispatch");
+    ui_free(&unmounting);
+
+    let atomic_automation: Ui = ui_new(180, 100); ui_begin(&atomic_automation);
+    let atomic_field: i32 = ui_text_field_control(&atomic_automation, 24, -1,
+        rect(0, 0, 160, 44), "Atomic", "AéZ", 8);
+    let atomic_button: i32 = ui_button_control(&atomic_automation, 25, -1,
+        rect(0, 48, 160, 44), "Not text", 9);
+    ui_end(&atomic_automation);
+    let atomic_calls: StateHandle = ui_state(&atomic_automation, 940, 0, 1);
+    failures = failures + text_expect(ui_bind_handler(&atomic_automation, 24, 940, edit_input_handler) == 1
+        && locator_set_selection(&atomic_automation, locate_key(&atomic_automation, 24), 1, 2) == 1
+        && locator_focus(&atomic_automation, locate_key(&atomic_automation, 25)) == 1
+        && locator_type(&atomic_automation, locate_key(&atomic_automation, 24), "") == 1
+        && @strEq(atomic_automation.nodes.data[atomic_field].text, "AéZ") == 1
+        && locator_has_selection(&atomic_automation, locate_key(&atomic_automation, 24), 1, 2)
+        && atomic_automation.focused_node == atomic_button
+        && action_emission_count(&atomic_automation, 8) == 0
+        && state_get(&atomic_automation, atomic_calls) == 0,
+        "typing an empty value preserves selection, focus, text, actions, and Input callbacks");
+    let empty_input: Event = event_new(EventKind.Input, 0, 0);
+    failures = failures + text_expect(locator_set_selection(&atomic_automation,
+            locate_key(&atomic_automation, 24), 1, 2) == 1
+        && ui_dispatch(&atomic_automation, empty_input) == 1
+        && @strEq(atomic_automation.nodes.data[atomic_field].text, "AéZ") == 1
+        && locator_has_selection(&atomic_automation, locate_key(&atomic_automation, 24), 1, 2)
+        && atomic_automation.focused_node == atomic_field
+        && action_emission_count(&atomic_automation, 8) == 0
+        && state_get(&atomic_automation, atomic_calls) == 0,
+        "direct empty Input dispatch is a true no-op for the focused selection");
+    let _restore_atomic_button_focus: i32 = locator_focus(&atomic_automation,
+        locate_key(&atomic_automation, 25));
+    failures = failures + text_expect(locator_fill(&atomic_automation,
+            locate_key(&atomic_automation, 25), "button") == 0
+        && locator_type(&atomic_automation, locate_key(&atomic_automation, 25), "button") == 0
+        && locator_has_selection(&atomic_automation, locate_key(&atomic_automation, 25), -1, -1) == 0
+        && locator_has_selected_text(&atomic_automation, locate_key(&atomic_automation, 25), "") == 0
+        && atomic_automation.focused_node == atomic_button,
+        "text operations and selection assertions reject a non-TextField without changing focus");
+    failures = failures + text_expect(locator_fill(&atomic_automation,
+            locate_key(&atomic_automation, 24), overlong.data[0..2]) == 0
+        && locator_type(&atomic_automation,
+            locate_key(&atomic_automation, 24), overlong.data[0..2]) == 0
+        && atomic_automation.focused_node == atomic_button
+        && locator_has_selection(&atomic_automation, locate_key(&atomic_automation, 24), 1, 2),
+        "malformed fill and type fail before focus or selection mutation");
+    let corrupt_atomic_field: Node = get[Node](atomic_automation.nodes, atomic_field);
+    corrupt_atomic_field.caret = 9; corrupt_atomic_field.selection_start = 9; corrupt_atomic_field.selection_end = 9;
+    set[Node](&atomic_automation.nodes, atomic_field, corrupt_atomic_field);
+    failures = failures + text_expect(locator_fill(&atomic_automation,
+            locate_key(&atomic_automation, 24), "replacement") == 0
+        && locator_type(&atomic_automation, locate_key(&atomic_automation, 24), "replacement") == 0
+        && locator_has_selection(&atomic_automation, locate_key(&atomic_automation, 24), 9, 9) == 0
+        && locator_has_selected_text(&atomic_automation, locate_key(&atomic_automation, 24), "") == 0
+        && atomic_automation.focused_node == atomic_button
+        && @strEq(atomic_automation.nodes.data[atomic_field].text, "AéZ") == 1,
+        "invalid TextField storage is rejected atomically before focus or text mutation");
+    corrupt_atomic_field.caret = 2; corrupt_atomic_field.selection_start = 1; corrupt_atomic_field.selection_end = 2;
+    set[Node](&atomic_automation.nodes, atomic_field, corrupt_atomic_field);
+    ui_free(&atomic_automation);
+
+    let ambiguous: Ui = ui_new(180, 100); ui_begin(&ambiguous);
+    let ambiguous_a: i32 = ui_text_field_control(&ambiguous, 10, -1, rect(0, 0, 160, 44), "Duplicate", "one", 2);
+    let ambiguous_b: i32 = ui_text_field_control(&ambiguous, 11, -1, rect(0, 48, 160, 44), "Duplicate", "two", 3);
+    ui_end(&ambiguous);
+    let ambiguous_locator: Locator = locate_role(&ambiguous, Role.TextField, "Duplicate");
+    failures = failures + text_expect(ambiguous_locator.matches == 2
+        && locator_set_selection(&ambiguous, ambiguous_locator, 0, 1) == 0
+        && locator_select_all(&ambiguous, ambiguous_locator) == 0
+        && locator_press(&ambiguous, ambiguous_locator, Key.Delete) == 0
+        && @strEq(ambiguous.nodes.data[ambiguous_a].text, "one") == 1
+        && @strEq(ambiguous.nodes.data[ambiguous_b].text, "two") == 1,
+        "ambiguous text automation fails closed without choosing or mutating a node");
+    ui_free(&ambiguous);
+    free[u8](&overlong); free[u8](&bad_continuation); free[u8](&truncated);
+    free[u8](&surrogate); free[u8](&out_of_range);
+    free[u8](&single); free[u8](&oversized_text);
+
+    if (failures != 0) { return 1; }
+    _zag_println("text_test: ok"); return 0;
+}

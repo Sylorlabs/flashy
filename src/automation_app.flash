@@ -1,0 +1,123 @@
+// Explicit application/window binding for the local automation endpoint.
+// Transport ownership remains separate from App so automation is opt-in and a
+// multiwindow application must name the retained window it exposes.
+
+enum AutomationAppServerStatus {
+    Ready, AcceptTimeout, RequestTimeout, TargetMissing, Invalid,
+    TransportFailed, Closed
+}
+
+struct AutomationAppServer {
+    listener: AutomationListener,
+    connection: AutomationProtocolConnection,
+    target_window_key: t27,
+    handled_requests: t27,
+    active: i32,
+    status: AutomationAppServerStatus,
+}
+
+fn automation_app_server_empty() AutomationAppServer {
+    return AutomationAppServer{ .listener = automation_listener_empty(),
+        .connection = automation_protocol_connection(0 - 1),
+        .target_window_key = 0, .handled_requests = 0, .active = 0,
+        .status = AutomationAppServerStatus.Closed };
+}
+
+fn automation_app_server_open(path: []u8, target_window_key: t27,
+    backlog: t27) AutomationAppServer {
+    let server: AutomationAppServer = automation_app_server_empty();
+    server.target_window_key = target_window_key;
+    server.listener = automation_listener_open(path, backlog);
+    if (server.listener.active == 1) {
+        server.active = 1;
+        server.status = AutomationAppServerStatus.Ready;
+    } else {
+        server.status = AutomationAppServerStatus.TransportFailed;
+    }
+    return server;
+}
+
+fn automation_app_server_target(server: *AutomationAppServer,
+    target_window_key: t27) void {
+    server.*.target_window_key = target_window_key;
+}
+
+fn automation_app_server_window(app: *App,
+    target_window_key: t27) *Window {
+    let i: i32 = 0;
+    while (i < len[Window](app.*.windows)) {
+        if (app.*.windows.data[i].open == 1
+            && app.*.windows.data[i].key == target_window_key) {
+            return &app.*.windows.data[i];
+        }
+        i = i + 1;
+    }
+    return null as *Window;
+}
+
+// Handle at most one request. Accept and frame processing share one absolute
+// deadline, so a new peer cannot multiply timeout_ms across lifecycle phases.
+fn automation_app_server_step(server: *AutomationAppServer, app: *App,
+    timeout_ms: t27) AutomationResponse {
+    if (timeout_ms < 0) {
+        server.*.status = AutomationAppServerStatus.Invalid;
+        return automation_response_empty();
+    }
+    if (server.*.active == 0 || server.*.listener.active == 0) {
+        server.*.status = AutomationAppServerStatus.Closed;
+        return automation_response_empty();
+    }
+    let deadline: i64 = linux_monotonic_ms() + timeout_ms as i64;
+    if (server.*.connection.active == 0) {
+        let accepted: AutomationListenerAccept = automation_listener_accept(
+            &server.*.listener, timeout_ms);
+        if (accepted.accepted == 0) {
+            if (accepted.status == AutomationEndpointStatus.AcceptTimeout) {
+                server.*.status = AutomationAppServerStatus.AcceptTimeout;
+            } else {
+                server.*.status = AutomationAppServerStatus.TransportFailed;
+                if (server.*.listener.active == 0) { server.*.active = 0; }
+            }
+            return automation_response_empty();
+        }
+        server.*.connection = accepted.connection;
+    }
+
+    let window: *Window = automation_app_server_window(
+        app, server.*.target_window_key);
+    if (window == null as *Window) {
+        server.*.status = AutomationAppServerStatus.TargetMissing;
+        return automation_response_empty();
+    }
+    let remaining_i64: i64 = deadline - linux_monotonic_ms();
+    if (remaining_i64 < 0) { remaining_i64 = 0; }
+    let response: AutomationResponse = automation_server_step(
+        &server.*.connection, &window.*.ui, remaining_i64 as t27);
+    if (response.valid == 1) {
+        server.*.handled_requests = server.*.handled_requests + 1;
+        window.*.needs_present = 1;
+        if (server.*.connection.active == 1) {
+            server.*.status = AutomationAppServerStatus.Ready;
+        } else {
+            server.*.status = AutomationAppServerStatus.TransportFailed;
+        }
+    } else if (server.*.connection.active == 0) {
+        server.*.status = AutomationAppServerStatus.TransportFailed;
+    } else {
+        // A no-progress frame timeout retains the accepted stream.
+        server.*.status = AutomationAppServerStatus.RequestTimeout;
+    }
+    return response;
+}
+
+fn automation_app_server_close(server: *AutomationAppServer) i32 {
+    automation_protocol_close(&server.*.connection);
+    let listener_closed: i32 = automation_listener_close(&server.*.listener);
+    server.*.active = 0;
+    if (listener_closed == 1) {
+        server.*.status = AutomationAppServerStatus.Closed;
+    } else {
+        server.*.status = AutomationAppServerStatus.TransportFailed;
+    }
+    return listener_closed;
+}

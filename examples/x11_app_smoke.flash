@@ -1,0 +1,37 @@
+@import("../src/flashy.flash")
+
+fn build_native_window(window: *Window, key: t27, color: Color) void {
+    ui_begin(&window.*.ui);
+    let style: Style = theme_surface();
+    style.bg = color;
+    let _root: i32 = ui_node(&window.*.ui, key, NodeKind.Root, -1,
+        rect(0, 0, window.*.width, window.*.height), style,
+        semantics(Role.Window, window.*.title, "", window.*.title), "", Action{ .id = 0 });
+    ui_end(&window.*.ui);
+}
+
+fn main() i32 {
+    let app: App = app_new(BackendKind.X11);
+    if (app.running == 0) {
+        _zag_print("x11_app_smoke: X11 app startup failed: "); _zag_println(app.error); return 2;
+    }
+    let first: i32 = app_open_window(&app, 1, "Flashy One", 160, 90);
+    let second: i32 = app_open_window(&app, 2, "Flashy Two", 144, 81);
+    if (first < 0 || second < 0) { _zag_println("x11_app_smoke: multiwindow open failed"); app_shutdown(&app); return 1; }
+    build_native_window(app_window(&app, first), 10, color_rgba(22, 25, 34, 255));
+    build_native_window(app_window(&app, second), 20, color_rgba(65, 60, 180, 255));
+    if (app_present_window(&app, first, 1) == 0 || app_present_window(&app, second, 1) == 0) {
+        _zag_println("x11_app_smoke: multiwindow presentation failed"); app_shutdown(&app); return 1;
+    }
+    if (x11_verify_window_pid(&app.x11, &app_window(&app, first).*.native, 2000) == 0
+        || x11_verify_window_pid(&app.x11, &app_window(&app, second).*.native, 2000) == 0) {
+        _zag_println("x11_app_smoke: PID/window association failed"); app_shutdown(&app); return 1;
+    }
+    if (x11_sync_window_geometry(&app.x11, &app_window(&app, first).*.native, 2000) == 0
+        || x11_sync_window_geometry(&app.x11, &app_window(&app, second).*.native, 2000) == 0) {
+        _zag_println("x11_app_smoke: server synchronization failed"); app_shutdown(&app); return 1;
+    }
+    app_shutdown(&app);
+    _zag_println("x11_app_smoke: ok");
+    return 0;
+}

@@ -1,0 +1,230 @@
+@import("../src/core.flash")
+@import("../src/render.flash")
+@import("../src/graphics2d.flash")
+
+fn graphics_expect(ok: i32, message: []u8) i32 {
+    if (ok == 0) { _zag_print("FAIL "); _zag_println(message); return 1; }
+    return 0;
+}
+
+fn graphics_print_number(value: t27, newline: i32) void {
+    let rendered: []u8 = _zag_i64_to_str(value as i64);
+    if (newline == 1) { _zag_println(rendered); } else { _zag_print(rendered); }
+    _zag_str_free(rendered);
+}
+
+fn main() i32 {
+    let failures: i32 = 0;
+    let scaled: Point2D = transform_apply(transform_scaled(1458, 2187), Point2D{ .x = 3, .y = 3 });
+    failures = failures + graphics_expect(transform_scale() == 729 && scaled.x == 6 && scaled.y == 9,
+        "balanced-ternary fixed-point transform uses exact 3^6 scale");
+    let composed: Transform2D = transform_compose(transform_translate(3, 6), transform_scaled(1458, 1458));
+    let composed_point: Point2D = transform_apply(composed, Point2D{ .x = 3, .y = 3 });
+    failures = failures + graphics_expect(composed_point.x == 9 && composed_point.y == 12,
+        "nested transforms compose without floating-point state");
+
+    let gradient: Surface = surface_new(27, 3);
+    let gradient_pixels: t27 = surface_fill_linear_gradient(&gradient, rect(0, 0, 27, 3), rect(0, 0, 27, 3),
+        color_rgba(0, 0, 0, 255), color_rgba(243, 81, 27, 255), 1);
+    failures = failures + graphics_expect(gradient_pixels == 81 && gradient.pixels.data[0] == 0
+        && gradient.pixels.data[(13 * 4)] == 121 && gradient.pixels.data[(26 * 4)] == 243,
+        "horizontal gradient interpolates deterministic ternary-friendly colors");
+
+    let path: Path2D = path_new(); path_move_to(&path, 0, 0);
+    let _line1: i32 = path_line_to(&path, 18, 0); let _line2: i32 = path_line_to(&path, 0, 18);
+    let _closed: i32 = path_close(&path);
+    let path_surface: Surface = surface_new(27, 27);
+    let painted: t27 = surface_fill_path_aa(&path_surface, &path, transform_translate(3, 3),
+        rect(0, 0, 18, 27), color_rgba(65, 60, 180, 255));
+    let partial: i32 = 0; let i: i32 = 3;
+    while (i < len[u8](path_surface.pixels)) {
+        let alpha: t27 = path_surface.pixels.data[i] as t27;
+        if (alpha > 0 && alpha < 255) { partial = 1; }
+        i = i + 4;
+    }
+    let clipped_offset: i32 = ((6 * 27 + 18) * 4 + 3);
+    failures = failures + graphics_expect(painted > 0 && partial == 1,
+        "3x3 path sampling produces partial edge coverage");
+    failures = failures + graphics_expect(path_surface.pixels.data[clipped_offset] == 0,
+        "path rasterization obeys explicit clip bounds");
+    let checksum: t27 = surface_checksum(&path_surface);
+    failures = failures + graphics_expect(checksum == 205913488, "antialiased transformed path matches deterministic golden");
+
+    let stroke_path: Path2D = path_new(); path_move_to(&stroke_path, 3, 21);
+    let _stroke_line: i32 = path_line_to(&stroke_path, 21, 3);
+    let stroke_surface: Surface = surface_new(27, 27);
+    let stroke: StrokeResult = surface_stroke_path_aa(&stroke_surface, &stroke_path, transform_identity(),
+        rect(0, 0, 27, 27), 3, color_rgba(243, 81, 27, 255), StrokeJoin.Round);
+    let stroke_partial: i32 = 0; let stroke_i: i32 = 3;
+    while (stroke_i < len[u8](stroke_surface.pixels)) {
+        let stroke_alpha: t27 = stroke_surface.pixels.data[stroke_i] as t27;
+        if (stroke_alpha > 0 && stroke_alpha < 255) { stroke_partial = 1; }
+        stroke_i = stroke_i + 4;
+    }
+    failures = failures + graphics_expect(stroke.ok == 1 && stroke.painted > 0 && stroke_partial == 1,
+        "round stroke and caps use deterministic partial coverage");
+    let stroke_checksum: t27 = surface_checksum(&stroke_surface);
+    failures = failures + graphics_expect(stroke_checksum == 616154376, "antialiased stroke matches deterministic golden");
+    let invalid_width: StrokeResult = surface_stroke_path_aa(&stroke_surface, &stroke_path, transform_identity(),
+        rect(0, 0, 27, 27), 0, color_rgba(1, 1, 1, 255), StrokeJoin.Round);
+    failures = failures + graphics_expect(invalid_width.error == GraphicsError.InvalidWidth,
+        "invalid stroke widths fail with typed errors");
+
+    let curve_path: Path2D = path_new(); path_move_to(&curve_path, 0, 18);
+    let quadratic_ok: i32 = path_quadratic_to(&curve_path, 9, 0, 18, 18);
+    let cubic_ok: i32 = path_cubic_to(&curve_path, 18, 24, 24, 24, 24, 18);
+    let curve_closed: i32 = path_close(&curve_path);
+    let curve_count: i32 = len[Point2D](curve_path.points);
+    let curve_midpoint: Point2D = curve_path.points.data[curve_count / 2];
+    failures = failures + graphics_expect(quadratic_ok == 1 && cubic_ok == 1 && curve_closed == 1
+        && curve_count >= 28 && curve_count <= 55
+        && curve_midpoint.x > 5 && curve_midpoint.x < 20 && curve_midpoint.y > 0 && curve_midpoint.y < 18
+        && curve_path.points.data[curve_count - 1].x == 24 && curve_path.points.data[curve_count - 1].y == 18,
+        "curves flatten through adaptive integer subdivisions and preserve endpoints");
+    let collinear_curve: Path2D = path_new(); path_move_to(&collinear_curve, 0, 0);
+    let collinear_ok: i32 = path_quadratic_to(&collinear_curve, 9, 0, 18, 0);
+    let collinear_count: i32 = len[Point2D](collinear_curve.points);
+    failures = failures + graphics_expect(collinear_ok == 1 && collinear_count == 4
+        && collinear_curve.points.data[1].y == 0 && collinear_curve.points.data[3].x == 18,
+        "near-collinear quadratic curves flatten with reduced segments");
+    let curve_surface: Surface = surface_new(27, 27);
+    let curve_painted: t27 = surface_fill_path_aa(&curve_surface, &curve_path, transform_identity(),
+        rect(0, 0, 27, 27), color_rgba(65, 60, 180, 255));
+    let curve_checksum: t27 = surface_checksum(&curve_surface);
+    failures = failures + graphics_expect(curve_painted > 0 && curve_checksum == 65860093,
+        "flattened curves render through the antialiased path pipeline and match their CPU golden");
+
+    let join_path: Path2D = path_new(); path_move_to(&join_path, 3, 21);
+    let _join_line1: i32 = path_line_to(&join_path, 13, 3); let _join_line2: i32 = path_line_to(&join_path, 23, 21);
+    let bevel_surface: Surface = surface_new(27, 27); let miter_surface: Surface = surface_new(27, 27);
+    let bevel: StrokeResult = surface_stroke_path_aa(&bevel_surface, &join_path, transform_identity(),
+        rect(0, 0, 27, 27), 6, color_rgba(243, 81, 27, 255), StrokeJoin.Bevel);
+    let miter: StrokeResult = surface_stroke_path_aa(&miter_surface, &join_path, transform_identity(),
+        rect(0, 0, 27, 27), 6, color_rgba(243, 81, 27, 255), StrokeJoin.Miter);
+    let bevel_checksum: t27 = surface_checksum(&bevel_surface); let miter_checksum: t27 = surface_checksum(&miter_surface);
+    failures = failures + graphics_expect(bevel.ok == 1 && miter.ok == 1 && bevel.painted > 0 && miter.painted > 0
+        && bevel_checksum == 163072683 && miter_checksum == 702204145,
+        "bevel and bounded-miter joins produce distinct geometry matching exact CPU goldens");
+
+    let maximum: t27 = flashy_t27_max();
+    let minimum: t27 = (0 as t27) - maximum;
+    let negated_minimum: t27 = 0;
+    let left_boundary_product: t27 = 0;
+    let right_boundary_product: t27 = 0;
+    let signed_boundary_product: t27 = 0;
+    let rejected_boundary_product: t27 = 27;
+    failures = failures + graphics_expect(graphics_abs(minimum) == maximum
+        && graphics_sub_checked(0, minimum, &negated_minimum) == 1 && negated_minimum == maximum
+        && graphics_sub_checked(maximum, minimum, &rejected_boundary_product) == 0
+        && graphics_sub_checked(minimum, maximum, &rejected_boundary_product) == 0
+        && graphics_sub_checked(minimum, minimum, &negated_minimum) == 1 && negated_minimum == 0
+        && rejected_boundary_product == 27 && minimum / -1 == maximum,
+        "balanced-t27 minimum negation, subtraction, and division preserve the symmetric boundary");
+    failures = failures + graphics_expect(graphics_mul_checked(minimum, -1, &left_boundary_product) == 1
+        && left_boundary_product == maximum
+        && graphics_mul_checked(-1, minimum, &right_boundary_product) == 1
+        && right_boundary_product == maximum
+        && graphics_mul_checked(maximum, -1, &signed_boundary_product) == 1
+        && signed_boundary_product == minimum
+        && graphics_mul_checked(minimum, -2, &rejected_boundary_product) == 0
+        && graphics_mul_checked(-2, minimum, &rejected_boundary_product) == 0
+        && rejected_boundary_product == 27,
+        "checked multiplication is commutative at both balanced-t27 signed boundaries");
+    let rejected_point: Point2D = Point2D{ .x = 27, .y = 27 };
+    let extreme_transform: Transform2D = Transform2D{ .m00 = maximum, .m01 = maximum,
+        .m10 = maximum, .m11 = maximum, .tx = maximum, .ty = maximum };
+    let rejected_transform: i32 = transform_apply_checked(extreme_transform,
+        Point2D{ .x = maximum, .y = maximum }, &rejected_point);
+    let wrapped_rejection: Point2D = transform_apply(extreme_transform,
+        Point2D{ .x = maximum, .y = maximum });
+    let rejected_composition: Transform2D = transform_identity();
+    failures = failures + graphics_expect(rejected_transform == 0 && rejected_point.x == 27 && rejected_point.y == 27
+        && wrapped_rejection.x == 0 && wrapped_rejection.y == 0
+        && transform_compose_checked(extreme_transform, extreme_transform, &rejected_composition) == 0
+        && rejected_composition.m00 == transform_scale(),
+        "unrepresentable transform products fail closed without publishing partial output");
+
+    let safety_surface: Surface = surface_new(9, 9);
+    let clipped_positive: Rect = rect_clip_to_surface(&safety_surface, rect(maximum - 1, 0, maximum, 9));
+    let clipped_negative_empty: Rect = rect_clip_to_surface(&safety_surface, rect(minimum, 0, maximum, 9));
+    let clipped_negative_visible: Rect = rect_clip_to_surface(&safety_surface, rect(minimum + 9, 0, maximum, 9));
+    failures = failures + graphics_expect(clipped_positive.w == 0 && clipped_positive.h == 0
+        && clipped_negative_empty.w == 0 && clipped_negative_empty.h == 0
+        && clipped_negative_visible.x == 0 && clipped_negative_visible.w == 9
+        && rect_clip_to_surface(&safety_surface, rect(0, 0, -1, 9)).w == 0,
+        "full-t27 clips resolve against bounded surfaces without forming overflowing endpoints");
+
+    let gradient_extreme: Surface = surface_new(9, 3);
+    let bounded_extreme_gradient: t27 = surface_fill_linear_gradient(&gradient_extreme,
+        rect(minimum + 9, 0, maximum, 3), rect(0, 0, 9, 3),
+        color_rgba(0, 0, 0, 255), color_rgba(255, 255, 255, 255), 1);
+    let skipped_extreme_gradient: t27 = surface_fill_linear_gradient(&gradient_extreme,
+        rect(maximum - 1, 0, maximum, 3), rect(0, 0, 9, 3),
+        color_rgba(0, 0, 0, 255), color_rgba(255, 255, 255, 255), 1);
+    let almost_finish: Color = color_lerp(color_rgba(0, 0, 0, 255), color_rgba(255, 255, 255, 255),
+        maximum - 1, maximum);
+    failures = failures + graphics_expect(bounded_extreme_gradient == 27 && skipped_extreme_gradient == 0
+        && almost_finish.r == 254 && almost_finish.g == 254 && almost_finish.b == 254,
+        "maximum-length gradients iterate only their surface intersection and interpolate without overflow");
+
+    let rejected_curve: Path2D = path_new(); path_move_to(&rejected_curve, 0, 0);
+    let rejected_quadratic: i32 = path_quadratic_to(&rejected_curve, maximum, 0, 9, 9);
+    let rejected_cubic: i32 = path_cubic_to(&rejected_curve, 1, 1, maximum, 0, 9, 9);
+    let rejected_arc: i32 = path_arc_axis_aligned_to(&rejected_curve, maximum, 9, 0, 1, 9, 9);
+    failures = failures + graphics_expect(rejected_quadratic == 0 && rejected_cubic == 0 && rejected_arc == 0
+        && len[Point2D](rejected_curve.points) == 1
+        && path_arc_hypot_upper(maximum, maximum) == maximum,
+        "extreme curves and radii reject atomically while conservative hypot saturates in t27");
+
+    let extreme_path: Path2D = path_new(); path_move_to(&extreme_path, maximum, 0);
+    let _extreme_line1: i32 = path_line_to(&extreme_path, maximum, 9);
+    let _extreme_line2: i32 = path_line_to(&extreme_path, maximum - 1, 0);
+    let _extreme_closed: i32 = path_close(&extreme_path);
+    let safety_before: t27 = surface_checksum(&safety_surface);
+    let rejected_fill: t27 = surface_fill_path_aa(&safety_surface, &extreme_path, transform_identity(),
+        rect(0, 0, 9, 9), color_rgba(255, 255, 255, 255));
+    let rejected_stroke: StrokeResult = surface_stroke_path_aa(&safety_surface, &extreme_path,
+        transform_identity(), rect(0, 0, 9, 9), 3, color_rgba(255, 255, 255, 255), StrokeJoin.Miter);
+    let empty_stroke: StrokeResult = surface_stroke_path_aa(&safety_surface, &stroke_path,
+        transform_identity(), rect(maximum, 0, maximum, 9), 3,
+        color_rgba(255, 255, 255, 255), StrokeJoin.Round);
+    failures = failures + graphics_expect(rejected_fill == 0 && rejected_stroke.ok == 0
+        && rejected_stroke.error == GraphicsError.InvalidPath && empty_stroke.ok == 1
+        && empty_stroke.painted == 0 && surface_checksum(&safety_surface) == safety_before,
+        "untrusted path coordinates reject with existing result semantics and empty clips remain successful no-ops");
+    failures = failures + graphics_expect(point_near_segment_six(maximum, maximum,
+            Point2D{ .x = maximum, .y = 0 }, Point2D{ .x = maximum, .y = 1 }, 9) == 0
+        && point_in_triangle_six(maximum, maximum, Point2D{ .x = maximum, .y = 0 },
+            Point2D{ .x = 0, .y = maximum }, Point2D{ .x = minimum, .y = 0 }) == 0,
+        "direct vector and triangle predicates reject values outside the proven squared-vector envelope");
+
+    let oversized_path: Path2D = path_new(); path_move_to(&oversized_path, 0, 0);
+    let oversized_i: i32 = 0;
+    while (oversized_i < 4096) {
+        push[Point2D](&oversized_path.points, Point2D{ .x = (oversized_i % 9) as t27,
+            .y = ((oversized_i / 9) % 9) as t27 });
+        oversized_i = oversized_i + 1;
+    }
+    oversized_path.closed = 1;
+    failures = failures + graphics_expect(len[Point2D](oversized_path.points) == 4097
+        && surface_fill_path_aa(&safety_surface, &oversized_path, transform_identity(),
+            rect(0, 0, 9, 9), color_rgba(255, 255, 255, 255)) == 0
+        && path_quadratic_to(&oversized_path, 1, 1, 2, 2) == 0
+        && path_cubic_to(&oversized_path, 1, 1, 2, 2, 3, 3) == 0
+        && path_arc_axis_aligned_to(&oversized_path, 3, 3, 0, 1, 3, 3) == 0
+        && path_close(&oversized_path) == 0 && len[Point2D](oversized_path.points) == 4097,
+        "mutated paths above the 4096-point contract reject before casts, subdivision, or allocation");
+
+    path_free(&path); path_free(&stroke_path); path_free(&curve_path); path_free(&collinear_curve); path_free(&join_path);
+    path_free(&rejected_curve); path_free(&extreme_path); path_free(&oversized_path);
+    surface_free(&gradient); surface_free(&path_surface); surface_free(&stroke_surface); surface_free(&curve_surface);
+    surface_free(&bevel_surface); surface_free(&miter_surface); surface_free(&safety_surface); surface_free(&gradient_extreme);
+    if (failures != 0) { _zag_print("graphics_checksum="); graphics_print_number(checksum, 1);
+        _zag_print("stroke_checksum="); graphics_print_number(stroke_checksum, 1);
+        _zag_print("curve_checksum="); graphics_print_number(curve_checksum, 1);
+        _zag_print("bevel_checksum="); graphics_print_number(bevel_checksum, 1);
+        _zag_print("miter_checksum="); graphics_print_number(miter_checksum, 1); return 1; }
+    _zag_print("graphics_test: ok curve="); graphics_print_number(curve_checksum, 0);
+    _zag_print(" bevel="); graphics_print_number(bevel_checksum, 0);
+    _zag_print(" miter="); graphics_print_number(miter_checksum, 1); return 0;
+}

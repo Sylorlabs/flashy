@@ -1,0 +1,44 @@
+@import("../src/flashy.flash")
+
+fn main() i32 {
+    let connection: X11NativeConnection = x11_connect_local();
+    if (connection.authenticated == 0) {
+        _zag_print("x11_handshake_smoke: unavailable: "); _zag_println(connection.error);
+        return 2;
+    }
+    if (connection.setup.protocol_major != 11 || connection.setup.resource_id_mask == 0 || connection.setup.roots < 1) {
+        _zag_println("x11_handshake_smoke: invalid setup contract");
+        x11_disconnect(&connection);
+        return 1;
+    }
+    let window: X11NativeWindow = x11_open_window(&connection, 160, 90);
+    if (window.live == 0 || x11_wait_window_ready(&connection, &window, 2000) == 0) {
+        _zag_println("x11_handshake_smoke: persistent window map/event lifecycle failed");
+        x11_disconnect(&connection);
+        return 1;
+    }
+    let surface: Surface = surface_new(160, 90);
+    surface_fill(&surface, rect(0, 0, 160, 90), color_rgba(22, 25, 34, 255));
+    surface_fill(&surface, rect(24, 20, 112, 50), color_rgba(65, 60, 180, 255));
+    let presented: X11PresentResult = x11_present_surface(&connection, &window, &surface);
+    if (presented.ok == 0 || presented.rows != 90) {
+        _zag_println("x11_handshake_smoke: CPU surface presentation failed");
+        x11_close_window(&connection, &window);
+        x11_disconnect(&connection);
+        return 1;
+    }
+    if (x11_sync_window_geometry(&connection, &window, 2000) == 0) {
+        _zag_println("x11_handshake_smoke: presentation synchronization failed");
+        x11_close_window(&connection, &window);
+        x11_disconnect(&connection);
+        return 1;
+    }
+    if (x11_close_window(&connection, &window) == 0) {
+        _zag_println("x11_handshake_smoke: persistent window close failed");
+        x11_disconnect(&connection);
+        return 1;
+    }
+    x11_disconnect(&connection);
+    _zag_println("x11_handshake_smoke: ok");
+    return 0;
+}

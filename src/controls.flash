@@ -1,0 +1,112 @@
+// Accessible unstyled control primitives built on ordinary Flash functions.
+
+fn ui_text(ui: *Ui, key: t27, parent: i32, bounds: Rect, text: []u8) i32 {
+    return ui_node(ui, key, NodeKind.Text, parent, bounds, style_default(),
+        semantics(Role.Text, text, "", ""), text, Action{ .id = 0 });
+}
+
+fn ui_button_control(ui: *Ui, key: t27, parent: i32, bounds: Rect, label: []u8, action_id: t9) i32 {
+    return ui_node(ui, key, NodeKind.Button, parent, bounds, theme_button(),
+        semantics(Role.Button, label, "", ""), label, Action{ .id = action_id });
+}
+
+fn ui_toggle_control(ui: *Ui, key: t27, parent: i32, bounds: Rect, label: []u8, checked: t27, action_id: t9) i32 {
+    let id: i32 = ui_node(ui, key, NodeKind.Toggle, parent, bounds, theme_button(),
+        semantics(Role.Checkbox, label, "", ""), label, Action{ .id = action_id });
+    let n: Node = get[Node](ui.*.nodes, id);
+    n.value = checked;
+    set[Node](&ui.*.nodes, id, n);
+    return id;
+}
+
+fn ui_slider_control(ui: *Ui, key: t27, parent: i32, bounds: Rect, label: []u8, value: t27, action_id: t9) i32 {
+    let id: i32 = ui_node(ui, key, NodeKind.Slider, parent, bounds, theme_button(),
+        semantics_range(Role.Slider, label, "", 0, 100, value), "", Action{ .id = action_id });
+    let n: Node = get[Node](ui.*.nodes, id);
+    n.value = value;
+    set[Node](&ui.*.nodes, id, n);
+    return id;
+}
+
+fn ui_text_field_control(ui: *Ui, key: t27, parent: i32, bounds: Rect, label: []u8,
+    value: []u8, action_id: t9) i32 {
+    let prior_caret: t27 = 0;
+    let prior_start: t27 = 0;
+    let prior_end: t27 = 0;
+    let compatible: i32 = 0;
+    let unchanged: i32 = 0;
+    let prior_id: i32 = ui_find_key(ui, key);
+    if (prior_id >= 0) {
+        let prior: Node = get[Node](ui.*.nodes, prior_id);
+        if (text_node_storage_valid(&prior) == 1) {
+            compatible = 1;
+            unchanged = text_buffer_equal(&prior.text_buffer, value);
+            prior_caret = prior.caret;
+            prior_start = prior.selection_start;
+            prior_end = prior.selection_end;
+        }
+    }
+    let style: Style = style_default();
+    style.bg = color_rgba(34, 38, 50, 255); style.padding = 12; style.min_w = 44; style.min_h = 44;
+    let id: i32 = ui_node(ui, key, NodeKind.TextField, parent, bounds, style,
+        semantics(Role.TextField, label, value, ""), value, Action{ .id = action_id });
+    if (id < 0) { return -1; }
+    let node: Node = get[Node](ui.*.nodes, id);
+    let graphemes: t27 = utf8_grapheme_count(node.text);
+    if (compatible == 0) {
+        node.caret = graphemes; node.selection_start = graphemes; node.selection_end = graphemes;
+    } else if (unchanged == 1) {
+        // Reconciliation must not collapse or normalize a retained selection.
+        node.caret = prior_caret; node.selection_start = prior_start; node.selection_end = prior_end;
+    } else {
+        // External values are authoritative, while logical positions remain
+        // meaningful and are clamped independently (including reversed ranges).
+        if (prior_caret < 0) { prior_caret = 0; }
+        if (prior_start < 0) { prior_start = 0; }
+        if (prior_end < 0) { prior_end = 0; }
+        if (prior_caret > graphemes) { prior_caret = graphemes; }
+        if (prior_start > graphemes) { prior_start = graphemes; }
+        if (prior_end > graphemes) { prior_end = graphemes; }
+        node.caret = prior_caret; node.selection_start = prior_start; node.selection_end = prior_end;
+    }
+    set[Node](&ui.*.nodes, id, node); return id;
+}
+
+fn ui_radio_control(ui: *Ui, key: t27, parent: i32, bounds: Rect, label: []u8,
+    selected: t27, action_id: t9) i32 {
+    let id: i32 = ui_node(ui, key, NodeKind.Radio, parent, bounds, theme_button(),
+        semantics(Role.Radio, label, "", ""), label, Action{ .id = action_id });
+    let n: Node = get[Node](ui.*.nodes, id); n.value = selected; set[Node](&ui.*.nodes, id, n); return id;
+}
+
+fn ui_progress_control(ui: *Ui, key: t27, parent: i32, bounds: Rect, label: []u8,
+    minimum: t27, maximum: t27, current: t27) i32 {
+    let style: Style = style_default(); style.bg = color_rgba(65, 60, 180, 255);
+    let id: i32 = ui_node(ui, key, NodeKind.Progress, parent, bounds, style,
+        semantics_range(Role.ProgressBar, label, "", minimum, maximum, current), "", Action{ .id = 0 });
+    let n: Node = get[Node](ui.*.nodes, id); n.value = current; set[Node](&ui.*.nodes, id, n); return id;
+}
+
+fn ui_tab_control(ui: *Ui, key: t27, parent: i32, bounds: Rect, label: []u8,
+    selected: t27, action_id: t9) i32 {
+    let id: i32 = ui_node(ui, key, NodeKind.Tab, parent, bounds, theme_button(),
+        semantics(Role.Tab, label, "", ""), label, Action{ .id = action_id });
+    let n: Node = get[Node](ui.*.nodes, id); n.value = selected; set[Node](&ui.*.nodes, id, n); return id;
+}
+
+fn ui_menu_item_control(ui: *Ui, key: t27, parent: i32, bounds: Rect, label: []u8, action_id: t9) i32 {
+    return ui_node(ui, key, NodeKind.MenuItem, parent, bounds, theme_button(),
+        semantics(Role.MenuItem, label, "", ""), label, Action{ .id = action_id });
+}
+
+fn ui_dialog_primitive(ui: *Ui, key: t27, parent: i32, bounds: Rect, label: []u8) i32 {
+    let style: Style = theme_surface(); style.layout = LayoutKind.Column;
+    return ui_node(ui, key, NodeKind.Dialog, parent, bounds, style,
+        semantics(Role.Dialog, label, "", ""), "", Action{ .id = 0 });
+}
+
+fn ui_scroll_primitive(ui: *Ui, key: t27, parent: i32, bounds: Rect, label: []u8) i32 {
+    let style: Style = style_default(); style.bg = color_rgba(34, 38, 50, 255);
+    return ui_node(ui, key, NodeKind.Scroll, parent, bounds, style,
+        semantics(Role.Group, label, "", ""), "", Action{ .id = 0 });
+}

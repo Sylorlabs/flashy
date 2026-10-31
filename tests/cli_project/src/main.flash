@@ -1,0 +1,8 @@
+@import("flashy") as fy
+
+fn main() i32 {
+    let app: fy.App = fy.app_new(fy.BackendKind.Headless);
+    let window: i32 = fy.app_open_window(&app, 1, "CLI", 81, 27);
+    if (window < 0 || fy.app_present_window(&app, window, 1) == 0) { return 1; }
+    fy.app_shutdown(&app); _zag_println("cli_project: ok"); return 0;
+}

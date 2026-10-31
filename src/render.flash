@@ -1,0 +1,148 @@
+// Tiled-premultiplied RGBA8 headless surface and damage-aware scene painting.
+
+struct Surface {
+    width: t27,
+    height: t27,
+    pixels: ArrayList[u8],
+    painted_pixels: t27,
+}
+
+fn surface_max_dimension() t27 { return 16384; }
+fn surface_max_bytes() t27 { return 268435456; }
+
+fn surface_dimensions_valid(width: t27, height: t27) i32 {
+    if (width < 0 || height < 0) { return 0; }
+    if (width == 0 || height == 0) {
+        if (width == 0 && height == 0) { return 1; }
+        return 0;
+    }
+    if (width > surface_max_dimension() || height > surface_max_dimension()) { return 0; }
+    let maximum_pixels: t27 = surface_max_bytes() / 4;
+    if (width > maximum_pixels / height) { return 0; }
+    return 1;
+}
+
+fn surface_new(width: t27, height: t27) Surface {
+    if (surface_dimensions_valid(width, height) == 0) {
+        return Surface{ .width = 0, .height = 0,
+            .pixels = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 },
+            .painted_pixels = 0 };
+    }
+    let byte_count: i32 = (width * height * 4) as i32;
+    let pixels: ArrayList[u8] = make[u8](byte_count);
+    let i: i32 = 0;
+    while (i < byte_count) { push[u8](&pixels, 0 as u8); i = i + 1; }
+    return Surface{ .width = width, .height = height, .pixels = pixels, .painted_pixels = 0 };
+}
+
+fn surface_free(surface: *Surface) void {
+    free[u8](&surface.*.pixels);
+    surface.*.width = 0; surface.*.height = 0; surface.*.painted_pixels = 0;
+}
+
+fn surface_resize(surface: *Surface, width: t27, height: t27) void {
+    if (surface_dimensions_valid(width, height) == 0) { return; }
+    let replacement: Surface = surface_new(width, height);
+    if (replacement.width != width || replacement.height != height) { return; }
+    surface_free(surface);
+    surface.* = replacement;
+}
+
+fn clamp8(v: t27) t9 {
+    if (v < 0) { return 0; }
+    if (v > 255) { return 255; }
+    return v as t9;
+}
+
+fn surface_blend(s: *Surface, x: t27, y: t27, c: Color) void {
+    if (x < 0 || y < 0 || x >= s.*.width || y >= s.*.height) { return; }
+    let off: i32 = ((y * s.*.width + x) * 4) as i32;
+    let a: t27 = clamp8(c.a) as t27;
+    let inv: t27 = 255 - a;
+    let dr: t27 = get[u8](s.*.pixels, off) as t27;
+    let dg: t27 = get[u8](s.*.pixels, off + 1) as t27;
+    let db: t27 = get[u8](s.*.pixels, off + 2) as t27;
+    let da: t27 = get[u8](s.*.pixels, off + 3) as t27;
+    set[u8](&s.*.pixels, off, clamp8(((c.r as t27) * a + dr * inv) / 255) as u8);
+    set[u8](&s.*.pixels, off + 1, clamp8(((c.g as t27) * a + dg * inv) / 255) as u8);
+    set[u8](&s.*.pixels, off + 2, clamp8(((c.b as t27) * a + db * inv) / 255) as u8);
+    set[u8](&s.*.pixels, off + 3, clamp8(a + (da * inv) / 255) as u8);
+    s.*.painted_pixels = s.*.painted_pixels + 1;
+}
+
+fn surface_fill(s: *Surface, r: Rect, c: Color) void {
+    if (r.w <= 0 || r.h <= 0 || s.*.width <= 0 || s.*.height <= 0) { return; }
+    if (r.x > flashy_t27_max() - r.w
+        || r.y > flashy_t27_max() - r.h) { return; }
+
+    // Clip without ever forming r.x + r.w or r.y + r.h. Retained geometry is
+    // allowed to reach the full balanced-t27 range, while surface coordinates
+    // are deliberately bounded by surface_dimensions_valid.
+    let start_x: t27 = r.x;
+    let end_x: t27 = 0;
+    if (r.x < 0) {
+        let hidden_x: t27 = 0 - r.x;
+        if (r.w <= hidden_x) { return; }
+        start_x = 0;
+        let visible_w: t27 = r.w - hidden_x;
+        if (visible_w > s.*.width) { end_x = s.*.width; }
+        else { end_x = visible_w; }
+    } else {
+        if (r.x >= s.*.width) { return; }
+        start_x = r.x;
+        let remaining_w: t27 = s.*.width - r.x;
+        if (r.w >= remaining_w) { end_x = s.*.width; }
+        else { end_x = r.x + r.w; }
+    }
+
+    let start_y: t27 = r.y;
+    let end_y: t27 = 0;
+    if (r.y < 0) {
+        let hidden_y: t27 = 0 - r.y;
+        if (r.h <= hidden_y) { return; }
+        start_y = 0;
+        let visible_h: t27 = r.h - hidden_y;
+        if (visible_h > s.*.height) { end_y = s.*.height; }
+        else { end_y = visible_h; }
+    } else {
+        if (r.y >= s.*.height) { return; }
+        start_y = r.y;
+        let remaining_h: t27 = s.*.height - r.y;
+        if (r.h >= remaining_h) { end_y = s.*.height; }
+        else { end_y = r.y + r.h; }
+    }
+
+    let y: t27 = start_y;
+    while (y < end_y) {
+        let x: t27 = start_x;
+        while (x < end_x) { surface_blend(s, x, y, c); x = x + 1; }
+        y = y + 1;
+    }
+}
+
+fn surface_checksum(s: *Surface) t27 {
+    // Balanced-ternary rolling checksum. Bounded deliberately so t27 range
+    // semantics are identical on optical hardware and bootstrap emulation.
+    let h: t27 = 1;
+    let i: i32 = 0;
+    while (i < len[u8](s.*.pixels)) {
+        h = (h * 109 + (get[u8](s.*.pixels, i) as t27)) % 1000000007;
+        i = i + 1;
+    }
+    return h;
+}
+
+fn ui_render(ui: *Ui, s: *Surface, full: i32) t27 {
+    s.*.painted_pixels = 0;
+    let i: i32 = 0;
+    while (i < len[Node](ui.*.nodes)) {
+        let n: Node = get[Node](ui.*.nodes, i);
+        if (n.live == 1 && n.style.visible == 1 && (full == 1 || n.dirty_paint == 1)) {
+            surface_fill(s, n.bounds, n.style.bg);
+            n.dirty_paint = 0;
+            set[Node](&ui.*.nodes, i, n);
+        }
+        i = i + 1;
+    }
+    return s.*.painted_pixels;
+}

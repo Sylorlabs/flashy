@@ -1,0 +1,676 @@
+// Flashy retained scene graph. Pure Flash, pool-backed, deterministic.
+
+enum NodeKind { Root, Panel, Text, RichText, Button, Toggle, Radio, Slider, Progress, TextField, Editor,
+    Image, Scroll, List, ListItem, Grid, Table, Tree, TreeItem, Tabs, Tab, Menu, MenuItem, Tooltip,
+    Popover, Dialog, SplitView, Navigation, Canvas, Scene3D }
+enum Role { None, Window, Group, Text, Button, Checkbox, Radio, Slider, ProgressBar, TextField, Image,
+    List, ListItem, Grid, Row, Cell, Tree, TreeItem, TabList, Tab, Menu, MenuItem, Tooltip, Dialog, Navigation }
+enum LayoutKind { Absolute, Row, Column, Stack, Grid }
+enum AlignKind { Start, Center, End, Stretch }
+enum LengthKind { Auto, Pixels, Percent }
+enum EventKind { PointerDown, PointerUp, Click, DoubleClick, Hover, Focus, Blur, Press, Input, Scroll }
+enum Key { Unknown, Backspace, Tab, Enter, Space, Delete, Home, End,
+    ArrowLeft, ArrowUp, ArrowRight, ArrowDown, A }
+
+// Bounded UTF-8 decoding is a foundation invariant because core owns editable
+// text bytes. Grapheme navigation and broader Unicode policy remain layered in
+// text.flash, reusing this single validator implementation.
+enum Utf8Error { None, InvalidLead, InvalidContinuation, Overlong, Surrogate, OutOfRange, Truncated }
+
+struct Utf8Decode {
+    codepoint: t27,
+    width: t9,
+    valid: i32,
+    error: Utf8Error,
+}
+
+struct Utf8Validation {
+    valid: i32,
+    error: Utf8Error,
+    error_offset: t27,
+    codepoints: t27,
+}
+
+fn utf8_bad(error: Utf8Error) Utf8Decode {
+    return Utf8Decode{ .codepoint = 0, .width = 0, .valid = 0, .error = error };
+}
+
+fn utf8_continuation(byte: t27) i32 {
+    if (byte >= 128 && byte <= 191) { return 1; }
+    return 0;
+}
+
+fn utf8_decode_at(input: []u8, offset: i32) Utf8Decode {
+    if (offset < 0 || offset >= input.len) { return utf8_bad(Utf8Error.Truncated); }
+    let first: t27 = input[offset] as t27;
+    if (first <= 127) { return Utf8Decode{ .codepoint = first, .width = 1, .valid = 1, .error = Utf8Error.None }; }
+    if (first == 192 || first == 193) { return utf8_bad(Utf8Error.Overlong); }
+    if (first >= 194 && first <= 223) {
+        if (offset + 1 >= input.len) { return utf8_bad(Utf8Error.Truncated); }
+        let second: t27 = input[offset + 1] as t27;
+        if (utf8_continuation(second) == 0) { return utf8_bad(Utf8Error.InvalidContinuation); }
+        return Utf8Decode{ .codepoint = (first - 192) * 64 + (second - 128),
+            .width = 2, .valid = 1, .error = Utf8Error.None };
+    }
+    if (first >= 224 && first <= 239) {
+        if (offset + 2 >= input.len) { return utf8_bad(Utf8Error.Truncated); }
+        let second: t27 = input[offset + 1] as t27; let third: t27 = input[offset + 2] as t27;
+        if (utf8_continuation(second) == 0 || utf8_continuation(third) == 0) {
+            return utf8_bad(Utf8Error.InvalidContinuation);
+        }
+        if (first == 224 && second < 160) { return utf8_bad(Utf8Error.Overlong); }
+        if (first == 237 && second > 159) { return utf8_bad(Utf8Error.Surrogate); }
+        return Utf8Decode{ .codepoint = (first - 224) * 4096 + (second - 128) * 64 + (third - 128),
+            .width = 3, .valid = 1, .error = Utf8Error.None };
+    }
+    if (first >= 240 && first <= 244) {
+        if (offset + 3 >= input.len) { return utf8_bad(Utf8Error.Truncated); }
+        let second: t27 = input[offset + 1] as t27; let third: t27 = input[offset + 2] as t27;
+        let fourth: t27 = input[offset + 3] as t27;
+        if (utf8_continuation(second) == 0 || utf8_continuation(third) == 0 || utf8_continuation(fourth) == 0) {
+            return utf8_bad(Utf8Error.InvalidContinuation);
+        }
+        if (first == 240 && second < 144) { return utf8_bad(Utf8Error.Overlong); }
+        if (first == 244 && second > 143) { return utf8_bad(Utf8Error.OutOfRange); }
+        return Utf8Decode{ .codepoint = (first - 240) * 262144 + (second - 128) * 4096
+            + (third - 128) * 64 + (fourth - 128), .width = 4, .valid = 1, .error = Utf8Error.None };
+    }
+    if (first >= 245) { return utf8_bad(Utf8Error.OutOfRange); }
+    return utf8_bad(Utf8Error.InvalidLead);
+}
+
+fn utf8_validate(input: []u8) Utf8Validation {
+    let result: Utf8Validation = Utf8Validation{ .valid = 1, .error = Utf8Error.None,
+        .error_offset = 0, .codepoints = 0 };
+    let offset: i32 = 0;
+    while (offset < input.len) {
+        let decoded: Utf8Decode = utf8_decode_at(input, offset);
+        if (decoded.valid == 0) {
+            result.valid = 0; result.error = decoded.error; result.error_offset = offset as t27; return result;
+        }
+        result.codepoints = result.codepoints + 1; offset = offset + decoded.width as i32;
+    }
+    return result;
+}
+
+fn flashy_t27_max() t27 { return 3812798742493; }
+
+// 3^12 bytes keeps editable ownership native to a balanced-ternary scale while
+// still admitting the backend-neutral clipboard ceiling. Text bytes remain a
+// storage boundary; logical caret and selection state stays in t27 graphemes.
+fn text_field_max_bytes() t27 { return 531441; }
+
+fn text_field_value_length_valid(value: []u8) i32 {
+    if (value.len as t27 > text_field_max_bytes()) { return 0; }
+    return 1;
+}
+
+fn text_field_value_valid(value: []u8) i32 {
+    if (text_field_value_length_valid(value) == 0) { return 0; }
+    if (utf8_validate(value).valid == 0) { return 0; }
+    return 1;
+}
+
+struct KeyModifiers {
+    shift: t9,
+    control: t9,
+    alt: t9,
+    meta: t9,
+}
+
+// Owned UTF-8 storage for editable nodes. Byte storage is an explicit boundary;
+// caret and selection positions elsewhere in the scene graph are grapheme indices.
+struct TextBuffer {
+    bytes: ArrayList[u8],
+}
+
+fn text_buffer_empty() TextBuffer {
+    return TextBuffer{ .bytes = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 } };
+}
+
+fn text_buffer_copy(value: []u8) TextBuffer {
+    let buffer: TextBuffer = TextBuffer{ .bytes = make[u8](value.len) };
+    let i: i32 = 0;
+    while (i < value.len) { push[u8](&buffer.bytes, value[i]); i = i + 1; }
+    return buffer;
+}
+
+fn text_buffer_view(buffer: *TextBuffer) []u8 {
+    if (buffer.*.bytes.len == 0) { return ""; }
+    return buffer.*.bytes.data[0..buffer.*.bytes.len];
+}
+
+fn text_buffer_equal(buffer: *TextBuffer, value: []u8) i32 {
+    if (buffer.*.bytes.len != value.len) { return 0; }
+    let i: i32 = 0;
+    while (i < value.len) {
+        if (buffer.*.bytes.data[i] != value[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn text_buffer_free(buffer: *TextBuffer) void {
+    if (buffer.*.bytes.cap > 0) { free[u8](&buffer.*.bytes); }
+    buffer.*.bytes.data = null as *u8;
+    buffer.*.bytes.len = 0;
+    buffer.*.bytes.cap = 0;
+}
+
+fn text_buffer_take(bytes: *ArrayList[u8]) TextBuffer {
+    let buffer: TextBuffer = TextBuffer{ .bytes = bytes.* };
+    bytes.*.data = null as *u8;
+    bytes.*.len = 0;
+    bytes.*.cap = 0;
+    return buffer;
+}
+
+// Resolve a replacement size without evaluating an unchecked sum. All terms
+// remain t27 until the caller has proven the result fits its owned-storage
+// ceiling, after which narrowing to an ArrayList length is authoritative.
+fn text_replacement_length_checked(current_len: t27, start: t27, end: t27,
+    replacement_len: t27, maximum: t27, next_len: *t27) i32 {
+    if (current_len < 0 || start < 0 || end < start || end > current_len
+        || replacement_len < 0 || maximum < 0) { return 0; }
+    let removed: t27 = end - start;
+    let retained: t27 = current_len - removed;
+    if (retained > maximum || replacement_len > maximum - retained) { return 0; }
+    next_len.* = retained + replacement_len;
+    return 1;
+}
+
+// start/end are byte offsets already resolved from grapheme positions. The
+// replacement is copied before the old allocation is released, so aliasing a
+// view of this buffer is safe. This mutation primitive is deliberately bounded
+// to the central TextField ownership ceiling before any i32 allocation cast.
+fn text_buffer_replace_range(buffer: *TextBuffer, start: t27, end: t27, replacement: []u8) i32 {
+    let next_len: t27 = 0;
+    if (text_replacement_length_checked(buffer.*.bytes.len as t27,
+        start, end, replacement.len as t27, text_field_max_bytes(),
+        &next_len) == 0) { return 0; }
+    let next: ArrayList[u8] = make[u8](next_len as i32);
+    let i: i32 = 0;
+    while (i < start as i32) { push[u8](&next, buffer.*.bytes.data[i]); i = i + 1; }
+    let replacement_i: i32 = 0;
+    while (replacement_i < replacement.len) {
+        push[u8](&next, replacement[replacement_i]); replacement_i = replacement_i + 1;
+    }
+    i = end as i32;
+    while (i < buffer.*.bytes.len) { push[u8](&next, buffer.*.bytes.data[i]); i = i + 1; }
+    text_buffer_free(buffer);
+    buffer.*.bytes = next;
+    return 1;
+}
+
+struct Color {
+    // Color channels become u8 only at the RGBA wire boundary.
+    r: t9, g: t9, b: t9, a: t9,
+}
+
+struct Theme {
+    surface: Color,
+    surface_raised: Color,
+    text: Color,
+    primary: Color,
+    on_primary: Color,
+    spacing_small: t27,
+    spacing_medium: t27,
+    spacing_large: t27,
+    minimum_target: t27,
+}
+
+struct Rect {
+    x: t27, y: t27, w: t27, h: t27,
+}
+
+struct Length {
+    kind: LengthKind,
+    value: t27,
+}
+
+struct Style {
+    bg: Color,
+    fg: Color,
+    padding: t27,
+    gap: t27,
+    margin: t27,
+    min_w: t27,
+    min_h: t27,
+    max_w: t27,
+    max_h: t27,
+    width: Length,
+    height: Length,
+    layout: LayoutKind,
+    align: AlignKind,
+    columns: t9,
+    wrap: i32,
+    visible: i32,
+    enabled: i32,
+}
+
+struct Semantics {
+    role: Role,
+    label: []u8,
+    value: []u8,
+    test_id: []u8,
+    range_min: t27,
+    range_max: t27,
+    range_current: t27,
+    has_range: i32,
+}
+
+struct Action {
+    id: t9,
+}
+
+struct Event {
+    kind: EventKind,
+    x: t27,
+    y: t27,
+    key: Key,
+    modifiers: KeyModifiers,
+    detail: t27,
+    text: []u8,
+}
+
+fn key_modifiers_none() KeyModifiers {
+    return KeyModifiers{ .shift = 0, .control = 0, .alt = 0, .meta = 0 };
+}
+
+fn event_new(kind: EventKind, x: t27, y: t27) Event {
+    return Event{ .kind = kind, .x = x, .y = y, .key = Key.Unknown,
+        .modifiers = key_modifiers_none(), .detail = 0, .text = "" };
+}
+
+struct EventContext {
+    ui: *Ui,
+    node_key: t27,
+    user_data: t27,
+    event_count: t27,
+}
+
+struct HandlerBinding {
+    node_key: t27,
+    handler: fn(*EventContext, Event) void,
+    context: EventContext,
+    live: i32,
+}
+
+struct StateHandle {
+    slot: i32,
+    generation: t9,
+}
+
+struct StateCell {
+    key: t27,
+    value: t27,
+    version: t9,
+    generation: t9,
+    live: i32,
+}
+
+struct ReconcileStats {
+    mounted: t27,
+    updated: t27,
+    unmounted: t27,
+    focus_preserved: t27,
+    state_preserved: t27,
+    state_migrated: t27,
+}
+
+struct Node {
+    key: t27,
+    kind: NodeKind,
+    parent: i32,
+    bounds: Rect,
+    style: Style,
+    semantics: Semantics,
+    text: []u8,
+    text_buffer: TextBuffer,
+    action: Action,
+    value: t27,
+    generation: t27,
+    seen_epoch: t27,
+    live: i32,
+    dirty_layout: i32,
+    dirty_paint: i32,
+    focused: i32,
+    hovered: i32,
+    pressed: i32,
+    scroll_x: t27,
+    scroll_y: t27,
+    caret: t27,
+    selection_start: t27,
+    selection_end: t27,
+}
+
+struct Ui {
+    width: t27,
+    height: t27,
+    epoch: t27,
+    generation: t27,
+    nodes: ArrayList[Node],
+    states: ArrayList[StateCell],
+    emitted_actions: ArrayList[t9],
+    handlers: ArrayList[HandlerBinding],
+    focused_node: i32,
+    hovered_node: i32,
+    pressed_node: i32,
+    reconcile: ReconcileStats,
+}
+
+fn color_rgba(r: t9, g: t9, b: t9, a: t9) Color {
+    return Color{ .r = r, .g = g, .b = b, .a = a };
+}
+
+fn rect(x: t27, y: t27, w: t27, h: t27) Rect {
+    return Rect{ .x = x, .y = y, .w = w, .h = h };
+}
+
+fn length_auto() Length { return Length{ .kind = LengthKind.Auto, .value = 0 }; }
+fn length_px(value: t27) Length { return Length{ .kind = LengthKind.Pixels, .value = value }; }
+fn length_percent(value: t27) Length { return Length{ .kind = LengthKind.Percent, .value = value }; }
+
+fn length_resolve(length: Length, available: t27, intrinsic: t27) t27 {
+    if (length.kind == LengthKind.Pixels) { return length.value; }
+    if (length.kind == LengthKind.Percent) {
+        let percent: t27 = length.value;
+        if (percent < 0) { percent = 0; }
+        if (percent > 100) { percent = 100; }
+        // Divide before multiplying so every valid t27 extent remains valid at
+        // the percentage boundary. The remainder product is bounded by 9900.
+        return (available / 100) * percent + ((available % 100) * percent) / 100;
+    }
+    return intrinsic;
+}
+
+fn semantics(role: Role, label: []u8, value: []u8, test_id: []u8) Semantics {
+    return Semantics{ .role = role, .label = label, .value = value, .test_id = test_id,
+        .range_min = 0, .range_max = 0, .range_current = 0, .has_range = 0 };
+}
+
+fn semantics_range(role: Role, label: []u8, test_id: []u8, minimum: t27, maximum: t27, current: t27) Semantics {
+    let sem: Semantics = semantics(role, label, "", test_id);
+    sem.range_min = minimum; sem.range_max = maximum; sem.range_current = current; sem.has_range = 1;
+    return sem;
+}
+
+fn style_default() Style {
+    return Style{
+        .bg = color_rgba(0, 0, 0, 0),
+        .fg = color_rgba(232, 235, 242, 255),
+        .padding = 0, .gap = 0, .margin = 0, .min_w = 0, .min_h = 0, .max_w = 0, .max_h = 0,
+        .width = length_auto(), .height = length_auto(), .layout = LayoutKind.Absolute,
+        .align = AlignKind.Start, .columns = 1, .wrap = 0, .visible = 1, .enabled = 1,
+    };
+}
+
+fn theme_default() Theme {
+    return Theme{ .surface = color_rgba(22, 25, 34, 255), .surface_raised = color_rgba(34, 38, 50, 255),
+        .text = color_rgba(240, 242, 248, 255), .primary = color_rgba(65, 60, 180, 255),
+        .on_primary = color_rgba(255, 255, 255, 255), .spacing_small = 8, .spacing_medium = 12,
+        .spacing_large = 16, .minimum_target = 44 };
+}
+
+fn theme_surface_for(theme: Theme) Style {
+    let s: Style = style_default();
+    s.bg = theme.surface; s.fg = theme.text; s.padding = theme.spacing_large; s.gap = theme.spacing_small;
+    return s;
+}
+
+fn theme_button_for(theme: Theme) Style {
+    let s: Style = style_default();
+    s.bg = theme.primary; s.fg = theme.on_primary; s.padding = theme.spacing_medium;
+    s.min_w = theme.minimum_target; s.min_h = theme.minimum_target;
+    return s;
+}
+
+fn theme_surface() Style {
+    return theme_surface_for(theme_default());
+}
+
+fn theme_button() Style {
+    return theme_button_for(theme_default());
+}
+
+fn ui_new(width: t27, height: t27) Ui {
+    return Ui{
+        .width = width, .height = height, .epoch = 0, .generation = 1,
+        .nodes = make[Node](64), .states = make[StateCell](32),
+        .emitted_actions = make[t9](16),
+        .handlers = make[HandlerBinding](16),
+        .focused_node = -1, .hovered_node = -1, .pressed_node = -1,
+        .reconcile = ReconcileStats{ .mounted = 0, .updated = 0, .unmounted = 0,
+            .focus_preserved = 0, .state_preserved = 0, .state_migrated = 0 },
+    };
+}
+
+fn ui_free(ui: *Ui) void {
+    let node_i: i32 = 0;
+    while (node_i < len[Node](ui.*.nodes)) {
+        let node: Node = get[Node](ui.*.nodes, node_i);
+        if (node.kind == NodeKind.TextField) { text_buffer_free(&node.text_buffer); }
+        node_i = node_i + 1;
+    }
+    free[Node](&ui.*.nodes);
+    free[StateCell](&ui.*.states);
+    free[t9](&ui.*.emitted_actions);
+    free[HandlerBinding](&ui.*.handlers);
+    ui.*.width = 0; ui.*.height = 0;
+    ui.*.focused_node = -1; ui.*.hovered_node = -1; ui.*.pressed_node = -1;
+}
+
+fn ui_begin(ui: *Ui) void {
+    ui.*.epoch = ui.*.epoch + 1;
+    ui.*.generation = ui.*.generation + 1;
+    ui.*.emitted_actions.len = 0;
+    ui.*.reconcile = ReconcileStats{ .mounted = 0, .updated = 0, .unmounted = 0,
+        .focus_preserved = 0, .state_preserved = 0, .state_migrated = 0 };
+}
+
+fn ui_find_key(ui: *Ui, key: t27) i32 {
+    let i: i32 = 0;
+    while (i < len[Node](ui.*.nodes)) {
+        let n: Node = get[Node](ui.*.nodes, i);
+        if (n.live == 1 && n.key == key) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// A rejected declarative update still visited its key. Retain the exact prior
+// node through ui_end while returning failure to the caller; no style,
+// selection, owned text, or reconciliation counters are changed.
+fn ui_retain_rejected_key(ui: *Ui, key: t27) i32 {
+    let found: i32 = ui_find_key(ui, key);
+    if (found < 0) { return 0; }
+    let prior: Node = get[Node](ui.*.nodes, found);
+    prior.seen_epoch = ui.*.epoch;
+    set[Node](&ui.*.nodes, found, prior);
+    return 1;
+}
+
+fn ui_node(ui: *Ui, key: t27, kind: NodeKind, parent: i32, bounds: Rect, style: Style, sem: Semantics, text: []u8, action: Action) i32 {
+    if (kind == NodeKind.TextField
+        && text_field_value_valid(text) == 0) {
+        let _retained: i32 = ui_retain_rejected_key(ui, key);
+        return -1;
+    }
+    let found: i32 = ui_find_key(ui, key);
+    if (found >= 0) {
+        let old: Node = get[Node](ui.*.nodes, found);
+        let layout_changed: i32 = 0;
+        if (old.bounds.x != bounds.x || old.bounds.y != bounds.y || old.bounds.w != bounds.w || old.bounds.h != bounds.h || old.parent != parent) {
+            layout_changed = 1;
+        }
+        if (old.kind == NodeKind.TextField && kind != NodeKind.TextField) {
+            text_buffer_free(&old.text_buffer);
+        }
+        if (kind == NodeKind.TextField) {
+            if (old.kind != NodeKind.TextField) {
+                old.text_buffer = text_buffer_copy(text);
+            } else if (text_buffer_equal(&old.text_buffer, text) == 0) {
+                let replaced: i32 = text_buffer_replace_range(&old.text_buffer, 0,
+                    old.text_buffer.bytes.len as t27, text);
+                if (replaced == 0) {
+                    old.seen_epoch = ui.*.epoch;
+                    set[Node](&ui.*.nodes, found, old);
+                    return -1;
+                }
+            }
+            old.text = text_buffer_view(&old.text_buffer);
+            sem.value = old.text;
+        } else {
+            old.text = text;
+        }
+        old.kind = kind;
+        old.parent = parent;
+        old.bounds = bounds;
+        old.style = style;
+        old.semantics = sem;
+        old.action = action;
+        old.seen_epoch = ui.*.epoch;
+        old.dirty_layout = layout_changed;
+        old.dirty_paint = 1;
+        set[Node](&ui.*.nodes, found, old);
+        ui.*.reconcile.updated = ui.*.reconcile.updated + 1;
+        if (old.focused == 1) {
+            ui.*.reconcile.focus_preserved = ui.*.reconcile.focus_preserved + 1;
+        }
+        return found;
+    }
+    let owned_text: TextBuffer = text_buffer_empty();
+    let node_text: []u8 = text;
+    if (kind == NodeKind.TextField) {
+        owned_text = text_buffer_copy(text);
+        node_text = text_buffer_view(&owned_text);
+        sem.value = node_text;
+    }
+    let n: Node = Node{
+        .key = key, .kind = kind, .parent = parent, .bounds = bounds,
+        .style = style, .semantics = sem, .text = node_text, .text_buffer = owned_text, .action = action,
+        .value = 0, .generation = ui.*.generation, .seen_epoch = ui.*.epoch,
+        .live = 1, .dirty_layout = 1, .dirty_paint = 1,
+        .focused = 0, .scroll_x = 0, .scroll_y = 0,
+        .hovered = 0, .pressed = 0, .caret = 0, .selection_start = 0, .selection_end = 0,
+    };
+    push[Node](&ui.*.nodes, n);
+    ui.*.reconcile.mounted = ui.*.reconcile.mounted + 1;
+    return len[Node](ui.*.nodes) - 1;
+}
+
+fn ui_end(ui: *Ui) void {
+    let i: i32 = 0;
+    while (i < len[Node](ui.*.nodes)) {
+        let n: Node = get[Node](ui.*.nodes, i);
+        if (n.live == 1 && n.seen_epoch != ui.*.epoch) {
+            if (n.kind == NodeKind.TextField) {
+                text_buffer_free(&n.text_buffer);
+                n.text = ""; n.semantics.value = "";
+            }
+            n.live = 0;
+            n.focused = 0;
+            n.hovered = 0;
+            n.pressed = 0;
+            if (ui.*.focused_node == i) { ui.*.focused_node = -1; }
+            if (ui.*.hovered_node == i) { ui.*.hovered_node = -1; }
+            if (ui.*.pressed_node == i) { ui.*.pressed_node = -1; }
+            n.generation = n.generation + 1;
+            ui.*.reconcile.unmounted = ui.*.reconcile.unmounted + 1;
+            set[Node](&ui.*.nodes, i, n);
+        }
+        i = i + 1;
+    }
+    let handler_i: i32 = 0;
+    while (handler_i < len[HandlerBinding](ui.*.handlers)) {
+        let binding: HandlerBinding = get[HandlerBinding](ui.*.handlers, handler_i);
+        if (binding.live == 1 && ui_find_key(ui, binding.node_key) < 0) {
+            binding.live = 0; set[HandlerBinding](&ui.*.handlers, handler_i, binding);
+        }
+        handler_i = handler_i + 1;
+    }
+}
+
+fn ui_live_count(ui: *Ui) i32 {
+    let count: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[Node](ui.*.nodes)) {
+        if (get[Node](ui.*.nodes, i).live == 1) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+fn ui_state(ui: *Ui, key: t27, initial: t27, version: t9) StateHandle {
+    let i: i32 = 0;
+    while (i < len[StateCell](ui.*.states)) {
+        let c: StateCell = get[StateCell](ui.*.states, i);
+        if (c.live == 1 && c.key == key) {
+            if (c.version != version) {
+                c.value = initial;
+                c.version = version;
+                c.generation = c.generation + 1;
+                set[StateCell](&ui.*.states, i, c);
+                ui.*.reconcile.state_migrated = ui.*.reconcile.state_migrated + 1;
+            } else {
+                ui.*.reconcile.state_preserved = ui.*.reconcile.state_preserved + 1;
+            }
+            return StateHandle{ .slot = i, .generation = c.generation };
+        }
+        i = i + 1;
+    }
+    let c: StateCell = StateCell{ .key = key, .value = initial, .version = version, .generation = 1, .live = 1 };
+    push[StateCell](&ui.*.states, c);
+    return StateHandle{ .slot = len[StateCell](ui.*.states) - 1, .generation = 1 };
+}
+
+fn state_valid(ui: *Ui, h: StateHandle) i32 {
+    if (h.slot < 0 || h.slot >= len[StateCell](ui.*.states)) { return 0; }
+    let c: StateCell = get[StateCell](ui.*.states, h.slot);
+    if (c.live == 1 && c.generation == h.generation) { return 1; }
+    return 0;
+}
+
+fn state_get(ui: *Ui, h: StateHandle) t27 {
+    if (state_valid(ui, h) == 0) { return 0; }
+    return get[StateCell](ui.*.states, h.slot).value;
+}
+
+fn state_set(ui: *Ui, h: StateHandle, value: t27) i32 {
+    if (state_valid(ui, h) == 0) { return 0; }
+    let c: StateCell = get[StateCell](ui.*.states, h.slot);
+    c.value = value;
+    set[StateCell](&ui.*.states, h.slot, c);
+    return 1;
+}
+
+fn ui_bind_handler(ui: *Ui, node_key: t27, user_data: t27,
+    handler: fn(*EventContext, Event) void) i32 {
+    if (ui_find_key(ui, node_key) < 0) { return 0; }
+    let i: i32 = 0;
+    while (i < len[HandlerBinding](ui.*.handlers)) {
+        let binding: HandlerBinding = get[HandlerBinding](ui.*.handlers, i);
+        if (binding.node_key == node_key) {
+            binding.handler = handler; binding.context.ui = ui; binding.context.user_data = user_data;
+            binding.live = 1; set[HandlerBinding](&ui.*.handlers, i, binding); return 1;
+        }
+        i = i + 1;
+    }
+    let context: EventContext = EventContext{ .ui = ui, .node_key = node_key,
+        .user_data = user_data, .event_count = 0 };
+    push[HandlerBinding](&ui.*.handlers, HandlerBinding{ .node_key = node_key,
+        .handler = handler, .context = context, .live = 1 });
+    return 1;
+}
+
+fn ui_unbind_handler(ui: *Ui, node_key: t27) i32 {
+    let i: i32 = 0;
+    while (i < len[HandlerBinding](ui.*.handlers)) {
+        let binding: HandlerBinding = get[HandlerBinding](ui.*.handlers, i);
+        if (binding.live == 1 && binding.node_key == node_key) {
+            binding.live = 0; set[HandlerBinding](&ui.*.handlers, i, binding); return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}

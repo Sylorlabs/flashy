@@ -1,0 +1,1584 @@
+@import("../src/flashy.flash")
+
+fn wayland_keyboard_expect(ok: i32, message: []u8) i32 {
+    if (ok == 0) { _zag_print("FAIL "); _zag_println(message); return 1; }
+    return 0;
+}
+
+fn wayland_keyboard_manual_keymap(keyboard_id: t27, format: t27, size: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(8);
+    wire_push_u32_le(&payload, format); wire_push_u32_le(&payload, size);
+    let out: WireBuffer = wayland_encode(keyboard_id, 0, &payload);
+    wire_free(&payload); return out;
+}
+
+fn wayland_keyboard_manual_key(keyboard_id: t27, serial: t27, time: t27,
+    key: t27, state: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(16);
+    wire_push_u32_le(&payload, serial); wire_push_u32_le(&payload, time);
+    wire_push_u32_le(&payload, key); wire_push_u32_le(&payload, state);
+    let out: WireBuffer = wayland_encode(keyboard_id, 3, &payload);
+    wire_free(&payload); return out;
+}
+
+fn wayland_keyboard_wire_range(input: *WireBuffer, first: i32, last: i32) WireBuffer {
+    let out: WireBuffer = wire_new(last - first);
+    if (first < 0 || last < first || last > len[u8](input.*.bytes)) {
+        out.error = 1; return out;
+    }
+    let i: i32 = first;
+    while (i < last) { wire_push_u8(&out, get[u8](input.*.bytes, i) as t27); i = i + 1; }
+    return out;
+}
+
+fn wayland_keyboard_test_global(name: t27, interface: []u8) WaylandGlobal {
+    return WaylandGlobal{ .name = name, .interface = interface,
+        .interface_storage = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 },
+        .version = 1, .valid = 1 };
+}
+
+fn wayland_keyboard_test_window(surface_id: t27, xdg_surface_id: t27,
+    toplevel_id: t27, buffer_id: t27) WaylandNativeWindow {
+    return WaylandNativeWindow{ .surface_id = surface_id,
+        .xdg_surface_id = xdg_surface_id, .toplevel_id = toplevel_id,
+        .width = 640, .height = 480, .live = 1, .configured = 0,
+        .close_requested = 0, .buffer_id = buffer_id,
+        .buffer_width = 640, .buffer_height = 480,
+        .memory = LinuxSharedMemory{ .fd = 0 - 1, .address = 0,
+            .len = 0, .valid = 0 }, .buffer_busy = 0 };
+}
+
+// Test-only multi-descriptor sender. Production emission uses the exact-write
+// transport; this raw fixture exercises malicious SCM_RIGHTS cardinality.
+fn wayland_keyboard_send_many(socket_fd: i64, input: *WireBuffer,
+    fds: *ArrayList[i64]) i64 {
+    let packed: LinuxByteBuffer = linux_pack_wire(input);
+    let count: i32 = len[i64](fds.*);
+    if (socket_fd < 0 || packed.len < 1 || count < 1 || count > 16) {
+        linux_buffer_free(&packed); return 0 - 22;
+    }
+    let iovec: LinuxByteBuffer = linux_buffer_new(16);
+    linux_buffer_set_u64(&iovec, 0, packed.words.data as i64);
+    linux_buffer_set_u64(&iovec, 8, packed.len as i64);
+    let cmsg_len: i64 = 16 + (count as i64) * 4;
+    let control_len: i32 = linux_cmsg_align(cmsg_len) as i32;
+    let control: LinuxByteBuffer = linux_buffer_new(control_len);
+    linux_buffer_set_u64(&control, 0, cmsg_len);
+    linux_buffer_set_u32(&control, 8, 1); linux_buffer_set_u32(&control, 12, 1);
+    let fd_i: i32 = 0;
+    while (fd_i < count) {
+        linux_buffer_set_u32(&control, 16 + fd_i * 4, get[i64](fds.*, fd_i));
+        fd_i = fd_i + 1;
+    }
+    control.len = control_len;
+    let message: LinuxByteBuffer = linux_buffer_new(56);
+    linux_buffer_zero_storage(&message);
+    linux_buffer_set_u64(&message, 16, iovec.words.data as i64);
+    linux_buffer_set_u64(&message, 24, 1);
+    linux_buffer_set_u64(&message, 32, control.words.data as i64);
+    linux_buffer_set_u64(&message, 40, control_len as i64);
+    message.len = 56;
+    let sent: i64 = _zag_raw_syscall(linux_sys_sendmsg(), socket_fd,
+        message.words.data as i64, 0, 0, 0, 0);
+    linux_buffer_free(&message); linux_buffer_free(&control);
+    linux_buffer_free(&iovec); linux_buffer_free(&packed);
+    return sent;
+}
+
+fn main() i32 {
+    let failures: i32 = 0;
+
+    let get_keyboard: WireBuffer = wayland_seat_get_keyboard(9, 27);
+    let get_keyboard_frame: WaylandFrame = wayland_decode(&get_keyboard, 0);
+    failures = failures + wayland_keyboard_expect(get_keyboard_frame.valid == 1
+        && get_keyboard_frame.object_id == 9 && get_keyboard_frame.opcode == 1
+        && get_keyboard_frame.size == 12
+        && wire_read_u32_le(&get_keyboard, get_keyboard_frame.payload_offset) == 27,
+        "wl_seat.get_keyboard uses opcode 1 and an exact new-id payload");
+    wire_free(&get_keyboard);
+
+    let damage_v1: WireBuffer = wayland_surface_damage(4, 640, 480);
+    let damage_v1_frame: WaylandFrame = wayland_decode(&damage_v1, 0);
+    failures = failures + wayland_keyboard_expect(damage_v1_frame.valid == 1
+        && damage_v1_frame.object_id == 4 && damage_v1_frame.opcode == 2
+        && damage_v1_frame.size == 24
+        && wire_read_i32_le(&damage_v1, damage_v1_frame.payload_offset) == 0
+        && wire_read_i32_le(&damage_v1, damage_v1_frame.payload_offset + 4) == 0
+        && wire_read_i32_le(&damage_v1, damage_v1_frame.payload_offset + 8) == 640
+        && wire_read_i32_le(&damage_v1, damage_v1_frame.payload_offset + 12) == 480,
+        "wl_surface.damage v1 fallback uses opcode 2 and an exact signed rectangle");
+    wire_free(&damage_v1);
+
+    let keymap_wire: WireBuffer = wayland_keyboard_keymap_event(27, 1, 5);
+    let keymap_decoded: WaylandKeyboardEvent = wayland_decode_keyboard_event(
+        &keymap_wire, wayland_decode(&keymap_wire, 0), 27);
+    failures = failures + wayland_keyboard_expect(keymap_decoded.valid == 1
+        && keymap_decoded.kind == WaylandKeyboardEventKind.Keymap
+        && keymap_decoded.keymap_format == 1 && keymap_decoded.keymap_size == 5,
+        "wl_keyboard keymap frame decodes format and bounded size");
+    wayland_keyboard_event_free(&keymap_decoded); wire_free(&keymap_wire);
+
+    let no_keymap_wire: WireBuffer = wayland_keyboard_keymap_event(27, 0, 0);
+    let no_keymap_decoded: WaylandKeyboardEvent = wayland_decode_keyboard_event(
+        &no_keymap_wire, wayland_decode(&no_keymap_wire, 0), 27);
+    failures = failures + wayland_keyboard_expect(no_keymap_decoded.valid == 1
+        && no_keymap_decoded.kind == WaylandKeyboardEventKind.Keymap
+        && no_keymap_decoded.keymap_format == 0 && no_keymap_decoded.keymap_size == 0,
+        "wl_keyboard no_keymap is a valid zero-byte authority withdrawal");
+    wayland_keyboard_event_free(&no_keymap_decoded); wire_free(&no_keymap_wire);
+
+    let keys: ArrayList[t27] = make[t27](2);
+    push[t27](&keys, 30); push[t27](&keys, 42);
+    let enter_wire: WireBuffer = wayland_keyboard_enter_event(27, 101, 99, &keys);
+    let enter_decoded: WaylandKeyboardEvent = wayland_decode_keyboard_event(
+        &enter_wire, wayland_decode(&enter_wire, 0), 27);
+    failures = failures + wayland_keyboard_expect(enter_decoded.valid == 1
+        && enter_decoded.kind == WaylandKeyboardEventKind.Enter
+        && enter_decoded.serial == 101 && enter_decoded.surface_id == 99
+        && len[t27](enter_decoded.pressed_keys) == 2
+        && get[t27](enter_decoded.pressed_keys, 0) == 30
+        && get[t27](enter_decoded.pressed_keys, 1) == 42,
+        "wl_keyboard enter decodes its exact u32 pressed-key array");
+    wayland_keyboard_event_free(&enter_decoded);
+
+    let malformed_array_payload: WireBuffer = wire_new(15);
+    wire_push_u32_le(&malformed_array_payload, 102);
+    wire_push_u32_le(&malformed_array_payload, 99);
+    wire_push_u32_le(&malformed_array_payload, 3);
+    wire_push_u8(&malformed_array_payload, 1); wire_push_u8(&malformed_array_payload, 2);
+    wire_push_u8(&malformed_array_payload, 3);
+    let malformed_array_wire: WireBuffer = wayland_encode(27, 1, &malformed_array_payload);
+    let malformed_array: WaylandKeyboardEvent = wayland_decode_keyboard_event(
+        &malformed_array_wire, wayland_decode(&malformed_array_wire, 0), 27);
+    failures = failures + wayland_keyboard_expect(malformed_array.valid == 0,
+        "wl_keyboard rejects an enter array not divisible into u32 keys");
+    wayland_keyboard_event_free(&malformed_array);
+    wire_free(&malformed_array_wire); wire_free(&malformed_array_payload);
+
+    let duplicate_payload: WireBuffer = wire_new(20);
+    wire_push_u32_le(&duplicate_payload, 103); wire_push_u32_le(&duplicate_payload, 99);
+    wire_push_u32_le(&duplicate_payload, 8); wire_push_u32_le(&duplicate_payload, 30);
+    wire_push_u32_le(&duplicate_payload, 30);
+    let duplicate_wire: WireBuffer = wayland_encode(27, 1, &duplicate_payload);
+    let duplicate_enter: WaylandKeyboardEvent = wayland_decode_keyboard_event(
+        &duplicate_wire, wayland_decode(&duplicate_wire, 0), 27);
+    failures = failures + wayland_keyboard_expect(duplicate_enter.valid == 0,
+        "wl_keyboard rejects duplicate keys in the enter snapshot");
+    wayland_keyboard_event_free(&duplicate_enter);
+    wire_free(&duplicate_wire); wire_free(&duplicate_payload);
+
+    let invalid_state_wire: WireBuffer = wayland_keyboard_manual_key(27, 104, 105, 46, 2);
+    let invalid_state: WaylandKeyboardEvent = wayland_decode_keyboard_event(
+        &invalid_state_wire, wayland_decode(&invalid_state_wire, 0), 27);
+    failures = failures + wayland_keyboard_expect(invalid_state.valid == 0,
+        "wl_keyboard rejects key states outside released and pressed");
+    wayland_keyboard_event_free(&invalid_state); wire_free(&invalid_state_wire);
+
+    let repeat_wire: WireBuffer = wayland_empty_request(27, 5);
+    let repeat_event: WaylandKeyboardEvent = wayland_decode_keyboard_event(
+        &repeat_wire, wayland_decode(&repeat_wire, 0), 27);
+    failures = failures + wayland_keyboard_expect(repeat_event.valid == 0,
+        "wl_keyboard v3 rejects the unbound version-4 repeat_info opcode");
+    wayland_keyboard_event_free(&repeat_event); wire_free(&repeat_wire);
+
+    let seat_name_wire: WireBuffer = wayland_seat_name_event(7, "seat0");
+    let malformed_seat_name: WireBuffer = wayland_u32_request(7, 1, 4);
+    let oversized_seat_name_bytes: ArrayList[u8] = make[u8](257);
+    let oversized_seat_i: i32 = 0;
+    while (oversized_seat_i < 257) {
+        push[u8](&oversized_seat_name_bytes, 's');
+        oversized_seat_i = oversized_seat_i + 1;
+    }
+    let oversized_seat_name: WireBuffer = wayland_seat_name_event(7,
+        oversized_seat_name_bytes.data[0..len[u8](oversized_seat_name_bytes)]);
+    failures = failures + wayland_keyboard_expect(
+        wayland_seat_name_event_valid(&seat_name_wire,
+            wayland_decode(&seat_name_wire, 0), 7) == 1
+        && wayland_seat_name_event_valid(&malformed_seat_name,
+            wayland_decode(&malformed_seat_name, 0), 7) == 0
+        && wayland_seat_name_event_valid(&oversized_seat_name,
+            wayland_decode(&oversized_seat_name, 0), 7) == 0,
+        "wl_seat v3 accepts exact bounded name events and rejects malformed or oversized strings");
+    wire_free(&seat_name_wire); wire_free(&malformed_seat_name);
+    wire_free(&oversized_seat_name); free[u8](&oversized_seat_name_bytes);
+
+    let peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + wayland_keyboard_expect(peer.ok == 1,
+        "Wayland keyboard fake peer opens a real Unix socketpair");
+    if (peer.ok == 1) {
+        let connection: WaylandNativeConnection = wayland_empty_connection();
+        connection.fd = peer.first; connection.connected = 1;
+        connection.seat_id = 7; connection.seat_version = 3; connection.next_id = 20;
+
+        let keyboard_capability: WireBuffer = wayland_seat_capabilities_event(7, 2);
+        failures = failures + wayland_keyboard_expect(wayland_process_seat_frame(&connection,
+            &keyboard_capability, wayland_decode(&keyboard_capability, 0)) == 1
+            && connection.seat_has_keyboard == 1 && connection.keyboard_id == 20
+            && connection.next_id == 21 && connection.keyboard_version == 3,
+            "keyboard capability binds a releasable wl_keyboard v3 object");
+        let bind_call: WireBuffer = wayland_receive_frame(peer.second, 100);
+        let bind_frame: WaylandFrame = wayland_decode(&bind_call, 0);
+        failures = failures + wayland_keyboard_expect(bind_frame.valid == 1
+            && bind_frame.object_id == 7 && bind_frame.opcode == 1 && bind_frame.size == 12
+            && wire_read_u32_le(&bind_call, bind_frame.payload_offset) == 20,
+            "fake peer observes the exact get_keyboard request");
+        wire_free(&bind_call); wire_free(&keyboard_capability);
+
+        let keymap_memory: LinuxSharedMemory = linux_shared_memory_create(5);
+        failures = failures + wayland_keyboard_expect(keymap_memory.valid == 1,
+            "keymap fixture owns a bounded CLOEXEC memfd");
+        if (keymap_memory.valid == 1) {
+            linux_shared_memory_set_byte(&keymap_memory, 0, 'x');
+            linux_shared_memory_set_byte(&keymap_memory, 1, 'k');
+            linux_shared_memory_set_byte(&keymap_memory, 2, 'b');
+            linux_shared_memory_set_byte(&keymap_memory, 3, 10);
+            linux_shared_memory_set_byte(&keymap_memory, 4, 0);
+
+            let advanced_cursor: LinuxByteBuffer = linux_buffer_new(2);
+            let advanced_read: i64 = linux_read_into(keymap_memory.fd, &advanced_cursor);
+            failures = failures + wayland_keyboard_expect(advanced_read == 2,
+                "keymap fixture advances the shared open-file cursor before transfer");
+            linux_buffer_free(&advanced_cursor);
+
+            let native_keymap_wire: WireBuffer = wayland_keyboard_keymap_event(20, 1, 5);
+            let sent_keymap: i64 = linux_send_wire_fd(peer.second, &native_keymap_wire,
+                keymap_memory.fd);
+            let received_keymap: WaylandNativeFrameReceive = wayland_receive_frame_with_fd(
+                peer.first, 100);
+            let received_keymap_fd: i64 = received_keymap.received_fd;
+            failures = failures + wayland_keyboard_expect(sent_keymap == 16
+                && received_keymap.valid == 1 && received_keymap.has_fd == 1
+                && received_keymap.fd_count == 1 && received_keymap.cloexec_applied == 1
+                && linux_fd_flags(received_keymap_fd) >= 0
+                && (linux_fd_flags(received_keymap_fd) % 2) == linux_fd_cloexec(),
+                "recvmsg retains one keymap FD with close-on-exec");
+            let native_keymap: WaylandKeyboardEvent = wayland_process_keyboard_frame(&connection,
+                &received_keymap.input, wayland_decode(&received_keymap.input, 0), received_keymap_fd);
+            received_keymap.received_fd = 0 - 1; received_keymap.has_fd = 0;
+            failures = failures + wayland_keyboard_expect(native_keymap.valid == 1
+                && native_keymap.kind == WaylandKeyboardEventKind.Keymap
+                && len[u8](native_keymap.keymap_bytes) == 5
+                && get[u8](native_keymap.keymap_bytes, 0) == 'x'
+                && get[u8](native_keymap.keymap_bytes, 4) == 0
+                && linux_fd_flags(received_keymap_fd) < 0,
+                "read-only mmap starts at byte zero, retains trailing NUL, and closes its FD");
+            failures = failures + wayland_keyboard_expect(
+                wayland_connection_store_pending_keymap(&connection, &native_keymap) == 1
+                && connection.keyboard_pending_keymap_ready == 1,
+                "pre-dispatch loops can retain one owned raw keymap without copying");
+            wayland_keyboard_event_free(&native_keymap);
+            let pending_keymap: WaylandKeyboardAuthorityUpdate =
+                wayland_connection_take_keyboard_authority(
+                &connection);
+            failures = failures + wayland_keyboard_expect(pending_keymap.valid == 1
+                && pending_keymap.kind == WaylandKeyboardAuthorityKind.Map
+                && pending_keymap.generation == 1 && pending_keymap.keymap_size == 5
+                && len[u8](pending_keymap.keymap_bytes) == 5
+                && connection.keyboard_pending_keymap_ready == 0
+                && connection.keyboard_pending_authority_ready == 0,
+                "shared parsing takes one generation-tagged raw map authority update");
+            wayland_keyboard_authority_update_free(&pending_keymap);
+            wire_free(&received_keymap.input); wire_free(&native_keymap_wire);
+
+            let fragmented_wire: WireBuffer = wayland_keyboard_keymap_event(20, 1, 5);
+            let fragmented_prefix: WireBuffer = wayland_keyboard_wire_range(&fragmented_wire, 0, 4);
+            let fragmented_tail: WireBuffer = wayland_keyboard_wire_range(&fragmented_wire, 4,
+                len[u8](fragmented_wire.bytes));
+            let sent_fragment_prefix: i64 = linux_send_wire(peer.second, &fragmented_prefix);
+            let sent_fragment_tail: i64 = linux_send_wire_fd(peer.second, &fragmented_tail,
+                keymap_memory.fd);
+            let fragmented_receive: WaylandNativeFrameReceive = wayland_receive_frame_with_fd(
+                peer.first, 100);
+            let fragmented_fd: i64 = fragmented_receive.received_fd;
+            let fragmented_event: WaylandKeyboardEvent = wayland_process_keyboard_frame(&connection,
+                &fragmented_receive.input, wayland_decode(&fragmented_receive.input, 0),
+                fragmented_fd);
+            fragmented_receive.received_fd = 0 - 1; fragmented_receive.has_fd = 0;
+            failures = failures + wayland_keyboard_expect(sent_fragment_prefix == 4
+                && sent_fragment_tail == 12 && fragmented_receive.valid == 1
+                && fragmented_receive.fd_count == 1 && fragmented_event.valid == 1
+                && len[u8](fragmented_event.keymap_bytes) == 5
+                && get[u8](fragmented_event.keymap_bytes, 0) == 'x'
+                && linux_fd_flags(fragmented_fd) < 0,
+                "recvmsg on every segment retains an FD attached after a fragmented header");
+            wayland_keyboard_event_free(&fragmented_event);
+            wire_free(&fragmented_receive.input); wire_free(&fragmented_tail);
+            wire_free(&fragmented_prefix); wire_free(&fragmented_wire);
+
+            let replacement_wire: WireBuffer = wayland_keyboard_keymap_event(20, 1, 5);
+            let _sent_replacement: i64 = linux_send_wire_fd(peer.second, &replacement_wire,
+                keymap_memory.fd);
+            let replacement_receive: WaylandNativeFrameReceive = wayland_receive_frame_with_fd(
+                peer.first, 100);
+            let replacement_event: WaylandKeyboardEvent = wayland_process_keyboard_frame(&connection,
+                &replacement_receive.input, wayland_decode(&replacement_receive.input, 0),
+                replacement_receive.received_fd);
+            replacement_receive.received_fd = 0 - 1; replacement_receive.has_fd = 0;
+            failures = failures + wayland_keyboard_expect(replacement_event.valid == 1
+                && wayland_connection_store_pending_keymap(&connection, &replacement_event) == 1
+                && connection.keyboard_pending_authority_kind == WaylandKeyboardAuthorityKind.Map,
+                "a valid replacement map is pending before malicious ancillary replacement");
+            wayland_keyboard_event_free(&replacement_event);
+            wire_free(&replacement_receive.input); wire_free(&replacement_wire);
+
+            let second_keymap_memory: LinuxSharedMemory = linux_shared_memory_create(5);
+            failures = failures + wayland_keyboard_expect(second_keymap_memory.valid == 1,
+                "multi-FD keymap fixture owns a second descriptor");
+            if (second_keymap_memory.valid == 1) {
+                let multi_wire: WireBuffer = wayland_keyboard_keymap_event(20, 1, 5);
+                let multi_fds: ArrayList[i64] = make[i64](2);
+                push[i64](&multi_fds, keymap_memory.fd);
+                push[i64](&multi_fds, second_keymap_memory.fd);
+                let sent_multi: i64 = wayland_keyboard_send_many(peer.second, &multi_wire,
+                    &multi_fds);
+                let multi_receive: WaylandNativeFrameReceive = wayland_receive_frame_with_fd(
+                    peer.first, 100);
+                let multi_accepted: i32 = wayland_connection_accept_frame_receive(&connection,
+                    &multi_receive);
+                failures = failures + wayland_keyboard_expect(sent_multi == 16
+                    && multi_accepted == 1 && multi_receive.keyboard_authority_cleared == 1
+                    && multi_receive.valid == 0 && multi_receive.input.error != 0
+                    && multi_receive.fd_count == 2 && multi_receive.received_fd < 0
+                    && multi_receive.closed_fd_count == 2 && multi_receive.last_closed_fd >= 0
+                    && linux_fd_flags(multi_receive.last_closed_fd) < 0,
+                    "keymap rejects multiple SCM_RIGHTS descriptors and closes all of them");
+                let rejected_authority: WaylandKeyboardAuthorityUpdate =
+                    wayland_connection_take_keyboard_authority(&connection);
+                failures = failures + wayland_keyboard_expect(rejected_authority.valid == 1
+                    && rejected_authority.kind == WaylandKeyboardAuthorityKind.Rejected
+                    && len[u8](rejected_authority.keymap_bytes) == 0
+                    && connection.keyboard_pending_keymap_ready == 0,
+                    "ancillary-invalid replacement publishes rejection and removes stale map authority");
+                wayland_keyboard_authority_update_free(&rejected_authority);
+                wire_free(&multi_receive.input); free[i64](&multi_fds); wire_free(&multi_wire);
+                linux_shared_memory_free(&second_keymap_memory);
+            }
+
+            let missing_fd_wire: WireBuffer = wayland_keyboard_keymap_event(20, 1, 5);
+            let _sent_missing_fd: i64 = linux_send_wire(peer.second, &missing_fd_wire);
+            let missing_fd_receive: WaylandNativeFrameReceive = wayland_receive_frame_with_fd(
+                peer.first, 100);
+            let missing_fd_event: WaylandKeyboardEvent = wayland_process_keyboard_frame(&connection,
+                &missing_fd_receive.input, wayland_decode(&missing_fd_receive.input, 0),
+                missing_fd_receive.received_fd);
+            missing_fd_receive.received_fd = 0 - 1;
+            failures = failures + wayland_keyboard_expect(missing_fd_receive.valid == 1
+                && missing_fd_receive.has_fd == 0 && missing_fd_event.valid == 0,
+                "keymap event without SCM_RIGHTS is rejected");
+            let missing_authority: WaylandKeyboardAuthorityUpdate =
+                wayland_connection_take_keyboard_authority(&connection);
+            failures = failures + wayland_keyboard_expect(missing_authority.valid == 1
+                && missing_authority.kind == WaylandKeyboardAuthorityKind.Rejected,
+                "missing keymap FD publishes an authoritative rejection");
+            wayland_keyboard_authority_update_free(&missing_authority);
+            wayland_keyboard_event_free(&missing_fd_event);
+            wire_free(&missing_fd_receive.input); wire_free(&missing_fd_wire);
+
+            let truncated_peer: LinuxFdPair = linux_socketpair_stream();
+            failures = failures + wayland_keyboard_expect(truncated_peer.ok == 1,
+                "truncated frame uses a disposable stream");
+            if (truncated_peer.ok == 1) {
+                let truncated_connection: WaylandNativeConnection = wayland_empty_connection();
+                truncated_connection.fd = truncated_peer.first;
+                truncated_connection.connected = 1;
+                let terminal_map: WaylandKeyboardEvent = wayland_empty_keyboard_event();
+                terminal_map.kind = WaylandKeyboardEventKind.Keymap;
+                terminal_map.keymap_format = 1; terminal_map.keymap_size = 1;
+                terminal_map.keymap_bytes = make[u8](1); push[u8](&terminal_map.keymap_bytes, 0);
+                terminal_map.valid = 1;
+                let _terminal_map_stored: i32 = wayland_connection_store_pending_keymap(
+                    &truncated_connection, &terminal_map);
+                wayland_keyboard_event_free(&terminal_map);
+                let _terminal_surface_registered: i32 = wayland_connection_register_surface(
+                    &truncated_connection, 55);
+                truncated_connection.keyboard_focus_surface = 55;
+                truncated_connection.keyboard_mods_depressed = 3;
+                let truncated_frame: WireBuffer = wire_new(12);
+                wire_push_u32_le(&truncated_frame, 20);
+                wire_push_u32_le(&truncated_frame, 16 * 65536);
+                wire_push_u32_le(&truncated_frame, 1);
+                let _sent_truncated_frame: i64 = linux_send_wire_fd(truncated_peer.second,
+                    &truncated_frame, keymap_memory.fd);
+                let truncated_started: i64 = linux_monotonic_ms();
+                let truncated_receive: WaylandNativeFrameReceive = wayland_receive_frame_with_fd(
+                    truncated_connection.fd, 30);
+                let truncated_elapsed: i64 = linux_monotonic_ms() - truncated_started;
+                let truncated_accepted: i32 = wayland_connection_accept_frame_receive(
+                    &truncated_connection, &truncated_receive);
+                let terminal_authority: WaylandKeyboardAuthorityUpdate =
+                    wayland_connection_take_keyboard_authority(&truncated_connection);
+                failures = failures + wayland_keyboard_expect(truncated_receive.valid == 0
+                    && truncated_receive.input.error != 0 && truncated_receive.received_fd < 0
+                    && truncated_receive.stream_terminal == 1 && truncated_accepted == 0
+                    && truncated_connection.fd < 0 && truncated_connection.connected == 0
+                    && linux_fd_flags(truncated_peer.first) < 0
+                    && truncated_receive.closed_fd_count >= 1
+                    && truncated_receive.last_closed_fd >= 0
+                    && linux_fd_flags(truncated_receive.last_closed_fd) < 0
+                    && truncated_elapsed <= 200 && terminal_authority.valid == 0
+                    && truncated_connection.keyboard_focus_surface == 0
+                    && truncated_connection.keyboard_mods_depressed == 0
+                    && len[t27](truncated_connection.owned_surface_ids) == 0,
+                    "terminal acceptance retires stream, FD, authority, focus, and identities once");
+                wayland_keyboard_authority_update_free(&terminal_authority);
+                wire_free(&truncated_receive.input); wire_free(&truncated_frame);
+                wayland_disconnect(&truncated_connection);
+                let _close_truncated_server: i64 = linux_close(truncated_peer.second);
+            }
+
+            let oversized_wire: WireBuffer = wayland_keyboard_manual_keymap(20, 1,
+                wayland_keyboard_keymap_max_size() + 1);
+            let _sent_oversized: i64 = linux_send_wire_fd(peer.second, &oversized_wire,
+                keymap_memory.fd);
+            let oversized_receive: WaylandNativeFrameReceive = wayland_receive_frame_with_fd(
+                peer.first, 100);
+            let oversized_fd: i64 = oversized_receive.received_fd;
+            let oversized_event: WaylandKeyboardEvent = wayland_process_keyboard_frame(&connection,
+                &oversized_receive.input, wayland_decode(&oversized_receive.input, 0), oversized_fd);
+            oversized_receive.received_fd = 0 - 1;
+            failures = failures + wayland_keyboard_expect(oversized_receive.valid == 1
+                && oversized_event.valid == 0 && linux_fd_flags(oversized_fd) < 0,
+                "oversized keymap is rejected and its descriptor is closed");
+            wayland_keyboard_event_free(&oversized_event);
+            wire_free(&oversized_receive.input); wire_free(&oversized_wire);
+
+            let short_contents_wire: WireBuffer = wayland_keyboard_keymap_event(20, 1, 7);
+            let _sent_short_contents: i64 = linux_send_wire_fd(peer.second, &short_contents_wire,
+                keymap_memory.fd);
+            let short_contents_receive: WaylandNativeFrameReceive = wayland_receive_frame_with_fd(
+                peer.first, 100);
+            let short_contents_fd: i64 = short_contents_receive.received_fd;
+            let short_contents_event: WaylandKeyboardEvent = wayland_process_keyboard_frame(&connection,
+                &short_contents_receive.input, wayland_decode(&short_contents_receive.input, 0),
+                short_contents_fd);
+            short_contents_receive.received_fd = 0 - 1;
+            failures = failures + wayland_keyboard_expect(short_contents_event.valid == 0
+                && linux_fd_flags(short_contents_fd) < 0,
+                "truncated keymap contents fail exact read and close the descriptor");
+            wayland_keyboard_event_free(&short_contents_event);
+            wire_free(&short_contents_receive.input); wire_free(&short_contents_wire);
+
+            let page_short_wire: WireBuffer = wayland_keyboard_keymap_event(20, 1, 8192);
+            let _sent_page_short: i64 = linux_send_wire_fd(peer.second, &page_short_wire,
+                keymap_memory.fd);
+            let page_short_receive: WaylandNativeFrameReceive = wayland_receive_frame_with_fd(
+                peer.first, 100);
+            let page_short_fd: i64 = page_short_receive.received_fd;
+            let page_short_event: WaylandKeyboardEvent = wayland_process_keyboard_frame(&connection,
+                &page_short_receive.input, wayland_decode(&page_short_receive.input, 0),
+                page_short_fd);
+            page_short_receive.received_fd = 0 - 1;
+            failures = failures + wayland_keyboard_expect(page_short_event.valid == 0
+                && linux_fd_flags(page_short_fd) < 0,
+                "file size validation rejects an advertised keymap beyond the backing pages");
+            wayland_keyboard_event_free(&page_short_event);
+            wire_free(&page_short_receive.input); wire_free(&page_short_wire);
+
+            let nonmappable_pair: LinuxFdPair = linux_socketpair_stream();
+            failures = failures + wayland_keyboard_expect(nonmappable_pair.ok == 1,
+                "non-mappable keymap fixture owns a socket descriptor");
+            if (nonmappable_pair.ok == 1) {
+                let nonmappable_wire: WireBuffer = wayland_keyboard_keymap_event(20, 1, 5);
+                let _sent_nonmappable: i64 = linux_send_wire_fd(peer.second, &nonmappable_wire,
+                    nonmappable_pair.first);
+                let nonmappable_receive: WaylandNativeFrameReceive = wayland_receive_frame_with_fd(
+                    peer.first, 100);
+                let nonmappable_fd: i64 = nonmappable_receive.received_fd;
+                let nonmappable_started: i64 = linux_monotonic_ms();
+                let nonmappable_event: WaylandKeyboardEvent = wayland_process_keyboard_frame(
+                    &connection, &nonmappable_receive.input,
+                    wayland_decode(&nonmappable_receive.input, 0), nonmappable_fd);
+                let nonmappable_elapsed: i64 = linux_monotonic_ms() - nonmappable_started;
+                nonmappable_receive.received_fd = 0 - 1;
+                failures = failures + wayland_keyboard_expect(nonmappable_event.valid == 0
+                    && linux_fd_flags(nonmappable_fd) < 0 && nonmappable_elapsed <= 100,
+                    "socket keymap FD fails promptly without a blocking read and is closed");
+                wayland_keyboard_event_free(&nonmappable_event);
+                wire_free(&nonmappable_receive.input); wire_free(&nonmappable_wire);
+                let _close_nonmappable_first: i64 = linux_close(nonmappable_pair.first);
+                let _close_nonmappable_second: i64 = linux_close(nonmappable_pair.second);
+            }
+
+            let map_before_withdrawal_wire: WireBuffer = wayland_keyboard_keymap_event(20, 1, 5);
+            let _sent_map_before_withdrawal: i64 = linux_send_wire_fd(peer.second,
+                &map_before_withdrawal_wire, keymap_memory.fd);
+            let map_before_withdrawal_receive: WaylandNativeFrameReceive =
+                wayland_receive_frame_with_fd(peer.first, 100);
+            let map_before_withdrawal_event: WaylandKeyboardEvent =
+                wayland_process_keyboard_frame(&connection, &map_before_withdrawal_receive.input,
+                    wayland_decode(&map_before_withdrawal_receive.input, 0),
+                    map_before_withdrawal_receive.received_fd);
+            map_before_withdrawal_receive.received_fd = 0 - 1;
+            let _stored_before_withdrawal: i32 = wayland_connection_store_pending_keymap(
+                &connection, &map_before_withdrawal_event);
+            wayland_keyboard_event_free(&map_before_withdrawal_event);
+            wire_free(&map_before_withdrawal_receive.input);
+            wire_free(&map_before_withdrawal_wire);
+
+            let withdrawal_wire: WireBuffer = wayland_keyboard_keymap_event(20, 0, 0);
+            let _sent_withdrawal: i64 = linux_send_wire(peer.second, &withdrawal_wire);
+            let withdrawal_receive: WaylandNativeFrameReceive = wayland_receive_frame_with_fd(
+                peer.first, 100);
+            let withdrawal_event: WaylandKeyboardEvent = wayland_process_keyboard_frame(&connection,
+                &withdrawal_receive.input, wayland_decode(&withdrawal_receive.input, 0),
+                withdrawal_receive.received_fd);
+            withdrawal_receive.received_fd = 0 - 1;
+            let stored_withdrawal: i32 = wayland_connection_store_pending_keymap(
+                &connection, &withdrawal_event);
+            let withdrawn_authority: WaylandKeyboardAuthorityUpdate =
+                wayland_connection_take_keyboard_authority(&connection);
+            failures = failures + wayland_keyboard_expect(withdrawal_event.valid == 1
+                && stored_withdrawal == 1 && withdrawn_authority.valid == 1
+                && withdrawn_authority.kind == WaylandKeyboardAuthorityKind.Withdrawn
+                && len[u8](withdrawn_authority.keymap_bytes) == 0
+                && connection.keyboard_pending_keymap_ready == 0,
+                "no_keymap consumed by an internal loop withdraws an earlier raw map authority");
+            wayland_keyboard_authority_update_free(&withdrawn_authority);
+            wayland_keyboard_event_free(&withdrawal_event);
+            wire_free(&withdrawal_receive.input); wire_free(&withdrawal_wire);
+        }
+
+        failures = failures + wayland_keyboard_expect(
+            wayland_connection_register_surface(&connection, 99) == 1,
+            "keyboard focus fixture registers its owned wl_surface identity");
+        let unknown_enter_wire: WireBuffer = wayland_keyboard_enter_event(20, 100, 100, &keys);
+        let unknown_enter: WaylandKeyboardEvent = wayland_process_keyboard_frame(&connection,
+            &unknown_enter_wire, wayland_decode(&unknown_enter_wire, 0), 0 - 1);
+        failures = failures + wayland_keyboard_expect(unknown_enter.valid == 0
+            && connection.keyboard_focus_surface == 0,
+            "unknown wl_surface enter cannot poison retained keyboard focus");
+        wayland_keyboard_event_free(&unknown_enter); wire_free(&unknown_enter_wire);
+
+        let native_enter_wire: WireBuffer = wayland_keyboard_enter_event(20, 101, 99, &keys);
+        let focus_enter: WaylandKeyboardEvent = wayland_process_keyboard_frame(&connection,
+            &native_enter_wire, wayland_decode(&native_enter_wire, 0), 0 - 1);
+        failures = failures + wayland_keyboard_expect(focus_enter.valid == 1
+            && connection.keyboard_focus_surface == 99 && connection.keyboard_serial == 101
+            && len[t27](connection.keyboard_pressed_keys) == 2,
+            "keyboard enter routes focus and pressed state to its surface");
+        wayland_keyboard_event_free(&focus_enter);
+
+        let duplicate_press_wire: WireBuffer = wayland_keyboard_key_event(20, 106, 107, 30, 1);
+        let duplicate_press: WaylandKeyboardEvent = wayland_process_keyboard_frame(&connection,
+            &duplicate_press_wire, wayland_decode(&duplicate_press_wire, 0), 0 - 1);
+        failures = failures + wayland_keyboard_expect(duplicate_press.valid == 0
+            && len[t27](connection.keyboard_pressed_keys) == 2,
+            "duplicate pressed state is rejected without mutation");
+        wayland_keyboard_event_free(&duplicate_press); wire_free(&duplicate_press_wire);
+
+        let press_wire: WireBuffer = wayland_keyboard_key_event(20, 108, 109, 46, 1);
+        let press_event: WaylandKeyboardEvent = wayland_process_keyboard_frame(&connection,
+            &press_wire, wayland_decode(&press_wire, 0), 0 - 1);
+        failures = failures + wayland_keyboard_expect(press_event.valid == 1
+            && press_event.surface_id == 99 && press_event.key == 46 && press_event.key_state == 1
+            && connection.keyboard_time == 109 && connection.keyboard_key == 46
+            && len[t27](connection.keyboard_pressed_keys) == 3,
+            "raw evdev press retains serial, time, state, and focused surface");
+        wayland_keyboard_event_free(&press_event); wire_free(&press_wire);
+
+        let modifiers_wire: WireBuffer = wayland_keyboard_modifiers_event(20, 110, 3, 4, 5, 0);
+        let modifiers_event: WaylandKeyboardEvent = wayland_process_keyboard_frame(&connection,
+            &modifiers_wire, wayland_decode(&modifiers_wire, 0), 0 - 1);
+        failures = failures + wayland_keyboard_expect(modifiers_event.valid == 1
+            && modifiers_event.surface_id == 99 && connection.keyboard_mods_depressed == 3
+            && connection.keyboard_mods_latched == 4 && connection.keyboard_mods_locked == 5
+            && connection.keyboard_group == 0,
+            "modifier masks and group remain exact uninterpreted protocol state");
+        wayland_keyboard_event_free(&modifiers_event); wire_free(&modifiers_wire);
+
+        let release_wire: WireBuffer = wayland_keyboard_key_event(20, 111, 112, 46, 0);
+        let release_event: WaylandKeyboardEvent = wayland_process_keyboard_frame(&connection,
+            &release_wire, wayland_decode(&release_wire, 0), 0 - 1);
+        failures = failures + wayland_keyboard_expect(release_event.valid == 1
+            && len[t27](connection.keyboard_pressed_keys) == 2,
+            "raw evdev release removes the matching pressed state");
+        wayland_keyboard_event_free(&release_event); wire_free(&release_wire);
+
+        connection.keyboard_pressed_keys.len = 0;
+        let bounded_i: t27 = 0;
+        while (bounded_i < wayland_keyboard_max_pressed_keys()) {
+            push[t27](&connection.keyboard_pressed_keys, bounded_i);
+            bounded_i = bounded_i + 1;
+        }
+        let bounded_press_wire: WireBuffer = wayland_keyboard_key_event(20, 112, 113, 2000, 1);
+        let bounded_press: WaylandKeyboardEvent = wayland_process_keyboard_frame(&connection,
+            &bounded_press_wire, wayland_decode(&bounded_press_wire, 0), 0 - 1);
+        failures = failures + wayland_keyboard_expect(bounded_press.valid == 0
+            && len[t27](connection.keyboard_pressed_keys) as t27
+                == wayland_keyboard_max_pressed_keys(),
+            "distinct presses cannot grow retained state past the 1024-key bound");
+        wayland_keyboard_event_free(&bounded_press); wire_free(&bounded_press_wire);
+        connection.keyboard_pressed_keys.len = 2;
+        connection.keyboard_pressed_keys.data[0] = 30;
+        connection.keyboard_pressed_keys.data[1] = 42;
+
+        let stale_leave_wire: WireBuffer = wayland_keyboard_leave_event(20, 113, 100);
+        let stale_leave: WaylandKeyboardEvent = wayland_process_keyboard_frame(&connection,
+            &stale_leave_wire, wayland_decode(&stale_leave_wire, 0), 0 - 1);
+        failures = failures + wayland_keyboard_expect(stale_leave.valid == 0
+            && connection.keyboard_focus_surface == 99,
+            "stale keyboard leave cannot clear a different focused surface");
+        wayland_keyboard_event_free(&stale_leave); wire_free(&stale_leave_wire);
+
+        let leave_wire: WireBuffer = wayland_keyboard_leave_event(20, 114, 99);
+        let leave_event: WaylandKeyboardEvent = wayland_process_keyboard_frame(&connection,
+            &leave_wire, wayland_decode(&leave_wire, 0), 0 - 1);
+        failures = failures + wayland_keyboard_expect(leave_event.valid == 1
+            && connection.keyboard_focus_surface == 0
+            && len[t27](connection.keyboard_pressed_keys) == 0
+            && connection.keyboard_mods_depressed == 0 && connection.keyboard_group == 0,
+            "matching keyboard leave clears focus, keys, and modifier state");
+        wayland_keyboard_event_free(&leave_event); wire_free(&leave_wire);
+
+        let stale_key_wire: WireBuffer = wayland_keyboard_key_event(20, 115, 116, 46, 1);
+        let stale_key: WaylandKeyboardEvent = wayland_process_keyboard_frame(&connection,
+            &stale_key_wire, wayland_decode(&stale_key_wire, 0), 0 - 1);
+        failures = failures + wayland_keyboard_expect(stale_key.valid == 0,
+            "key event without keyboard focus is rejected");
+        wayland_keyboard_event_free(&stale_key); wire_free(&stale_key_wire);
+
+        let focus_again: WaylandKeyboardEvent = wayland_process_keyboard_frame(&connection,
+            &native_enter_wire, wayland_decode(&native_enter_wire, 0), 0 - 1);
+        wayland_keyboard_event_free(&focus_again);
+        let old_keyboard_id: t27 = connection.keyboard_id;
+        let remove_keyboard: WireBuffer = wayland_seat_capabilities_event(7, 0);
+        failures = failures + wayland_keyboard_expect(wayland_process_seat_frame(&connection,
+            &remove_keyboard, wayland_decode(&remove_keyboard, 0)) == 1
+            && connection.seat_has_keyboard == 0 && connection.keyboard_id == 0
+            && connection.keyboard_focus_surface == 0
+            && len[t27](connection.keyboard_pressed_keys) == 0,
+            "capability loss retires wl_keyboard v3 and clears every state value");
+        let release_call: WireBuffer = wayland_receive_frame(peer.second, 100);
+        let release_frame: WaylandFrame = wayland_decode(&release_call, 0);
+        failures = failures + wayland_keyboard_expect(release_frame.valid == 1
+            && release_frame.object_id == old_keyboard_id && release_frame.opcode == 0
+            && release_frame.size == 8,
+            "v3 capability loss emits wl_keyboard.release for the retired identity");
+        wire_free(&release_call);
+
+        let duplicate_remove_result: i32 = wayland_process_seat_frame(&connection,
+            &remove_keyboard, wayland_decode(&remove_keyboard, 0));
+        let loss_authority: WaylandKeyboardAuthorityUpdate =
+            wayland_connection_take_keyboard_authority(&connection);
+        failures = failures + wayland_keyboard_expect(duplicate_remove_result == 1
+            && loss_authority.valid == 1
+            && loss_authority.kind == WaylandKeyboardAuthorityKind.Withdrawn,
+            "duplicate absent capability cannot erase the unconsumed withdrawal update");
+        wayland_keyboard_authority_update_free(&loss_authority);
+
+        let stale_old_key: WaylandKeyboardEvent = wayland_process_keyboard_frame(&connection,
+            &native_enter_wire, wayland_decode(&native_enter_wire, 0), 0 - 1);
+        failures = failures + wayland_keyboard_expect(stale_old_key.valid == 0,
+            "retired keyboard identity cannot route stale events");
+        wayland_keyboard_event_free(&stale_old_key);
+
+        let restore_keyboard: WireBuffer = wayland_seat_capabilities_event(7, 2);
+        failures = failures + wayland_keyboard_expect(wayland_process_seat_frame(&connection,
+            &restore_keyboard, wayland_decode(&restore_keyboard, 0)) == 1
+            && connection.keyboard_id > old_keyboard_id,
+            "restored keyboard capability allocates a fresh object identity");
+        let restore_call: WireBuffer = wayland_receive_frame(peer.second, 100);
+        let restore_frame: WaylandFrame = wayland_decode(&restore_call, 0);
+        failures = failures + wayland_keyboard_expect(restore_frame.valid == 1
+            && restore_frame.object_id == 7 && restore_frame.opcode == 1
+            && wire_read_u32_le(&restore_call, restore_frame.payload_offset)
+                == connection.keyboard_id,
+            "fake peer observes get_keyboard with the fresh identity");
+        wire_free(&restore_call);
+
+        let churn_i: i32 = 0;
+        while (churn_i < 8) {
+            let churn_old_id: t27 = connection.keyboard_id;
+            let churn_remove: WireBuffer = wayland_seat_capabilities_event(7, 0);
+            let churn_removed: i32 = wayland_process_seat_frame(&connection, &churn_remove,
+                wayland_decode(&churn_remove, 0));
+            let churn_release: WireBuffer = wayland_receive_frame(peer.second, 100);
+            let churn_release_frame: WaylandFrame = wayland_decode(&churn_release, 0);
+            let churn_withdrawal: WaylandKeyboardAuthorityUpdate =
+                wayland_connection_take_keyboard_authority(&connection);
+            failures = failures + wayland_keyboard_expect(churn_removed == 1
+                && churn_release_frame.valid == 1
+                && churn_release_frame.object_id == churn_old_id
+                && churn_release_frame.opcode == 0 && churn_release_frame.size == 8
+                && churn_withdrawal.valid == 1
+                && churn_withdrawal.kind == WaylandKeyboardAuthorityKind.Withdrawn,
+                "keyboard churn releases each v3 resource and publishes withdrawal");
+            wayland_keyboard_authority_update_free(&churn_withdrawal);
+            wire_free(&churn_release); wire_free(&churn_remove);
+
+            let churn_restore: WireBuffer = wayland_seat_capabilities_event(7, 2);
+            let churn_restored: i32 = wayland_process_seat_frame(&connection, &churn_restore,
+                wayland_decode(&churn_restore, 0));
+            let churn_get: WireBuffer = wayland_receive_frame(peer.second, 100);
+            let churn_get_frame: WaylandFrame = wayland_decode(&churn_get, 0);
+            failures = failures + wayland_keyboard_expect(churn_restored == 1
+                && connection.keyboard_id > churn_old_id
+                && churn_get_frame.valid == 1 && churn_get_frame.object_id == 7
+                && churn_get_frame.opcode == 1
+                && wire_read_u32_le(&churn_get, churn_get_frame.payload_offset)
+                    == connection.keyboard_id,
+                "keyboard churn allocates a fresh identity after each exact release");
+            wire_free(&churn_get); wire_free(&churn_restore);
+            churn_i = churn_i + 1;
+        }
+        wire_free(&remove_keyboard); wire_free(&restore_keyboard);
+
+        if (keymap_memory.valid == 1) { linux_shared_memory_free(&keymap_memory); }
+        wire_free(&native_enter_wire); wire_free(&enter_wire); free[t27](&keys);
+        wayland_disconnect(&connection);
+        let _close_server: i64 = linux_close(peer.second);
+    } else {
+        wire_free(&enter_wire); free[t27](&keys);
+    }
+
+    let resource_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + wayland_keyboard_expect(resource_peer.ok == 1,
+        "v3 child-resource fixture opens a Unix socketpair");
+    if (resource_peer.ok == 1) {
+        let resource_connection: WaylandNativeConnection = wayland_empty_connection();
+        resource_connection.fd = resource_peer.first; resource_connection.connected = 1;
+        resource_connection.seat_id = 70; resource_connection.seat_version = 3;
+        resource_connection.next_id = 71;
+        let both_capabilities: WireBuffer = wayland_seat_capabilities_event(70, 3);
+        let both_bound: i32 = wayland_process_seat_frame(&resource_connection,
+            &both_capabilities, wayland_decode(&both_capabilities, 0));
+        let pointer_get: WireBuffer = wayland_receive_frame(resource_peer.second, 100);
+        let keyboard_get: WireBuffer = wayland_receive_frame(resource_peer.second, 100);
+        let pointer_get_frame: WaylandFrame = wayland_decode(&pointer_get, 0);
+        let keyboard_get_frame: WaylandFrame = wayland_decode(&keyboard_get, 0);
+        let resource_pointer_id: t27 = resource_connection.pointer_id;
+        let resource_keyboard_id: t27 = resource_connection.keyboard_id;
+        failures = failures + wayland_keyboard_expect(both_bound == 1
+            && resource_connection.pointer_version == 3
+            && resource_connection.keyboard_version == 3
+            && pointer_get_frame.valid == 1 && pointer_get_frame.object_id == 70
+            && pointer_get_frame.opcode == 0
+            && wire_read_u32_le(&pointer_get, pointer_get_frame.payload_offset)
+                == resource_pointer_id
+            && keyboard_get_frame.valid == 1 && keyboard_get_frame.object_id == 70
+            && keyboard_get_frame.opcode == 1
+            && wire_read_u32_le(&keyboard_get, keyboard_get_frame.payload_offset)
+                == resource_keyboard_id,
+            "seat v3 binds pointer and keyboard children with exact object requests");
+        wire_free(&pointer_get); wire_free(&keyboard_get);
+
+        let no_capabilities: WireBuffer = wayland_seat_capabilities_event(70, 0);
+        let both_released: i32 = wayland_process_seat_frame(&resource_connection,
+            &no_capabilities, wayland_decode(&no_capabilities, 0));
+        let pointer_release: WireBuffer = wayland_receive_frame(resource_peer.second, 100);
+        let keyboard_release: WireBuffer = wayland_receive_frame(resource_peer.second, 100);
+        let pointer_release_frame: WaylandFrame = wayland_decode(&pointer_release, 0);
+        let keyboard_release_frame: WaylandFrame = wayland_decode(&keyboard_release, 0);
+        failures = failures + wayland_keyboard_expect(both_released == 1
+            && pointer_release_frame.valid == 1
+            && pointer_release_frame.object_id == resource_pointer_id
+            && pointer_release_frame.opcode == 1 && pointer_release_frame.size == 8
+            && keyboard_release_frame.valid == 1
+            && keyboard_release_frame.object_id == resource_keyboard_id
+            && keyboard_release_frame.opcode == 0 && keyboard_release_frame.size == 8,
+            "seat v3 capability loss emits exact pointer.release and keyboard.release requests");
+        let resource_withdrawal: WaylandKeyboardAuthorityUpdate =
+            wayland_connection_take_keyboard_authority(&resource_connection);
+        wayland_keyboard_authority_update_free(&resource_withdrawal);
+        wire_free(&pointer_release); wire_free(&keyboard_release);
+        wire_free(&no_capabilities); wire_free(&both_capabilities);
+        wayland_disconnect(&resource_connection);
+        let _close_resource_peer: i64 = linux_close(resource_peer.second);
+    }
+
+    let bind_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + wayland_keyboard_expect(bind_peer.ok == 1,
+        "seat-version binding fixture opens a Unix socketpair");
+    if (bind_peer.ok == 1) {
+        let bind_connection: WaylandNativeConnection = wayland_empty_connection();
+        bind_connection.fd = bind_peer.first; bind_connection.connected = 1;
+        bind_connection.registry_ready = 1;
+        let bind_compositor_global: WaylandGlobal = wayland_keyboard_test_global(10,
+            "wl_compositor"); bind_compositor_global.version = 6;
+        let bind_shell_global: WaylandGlobal = wayland_keyboard_test_global(11,
+            "xdg_wm_base"); bind_shell_global.version = 6;
+        let bind_shm_global: WaylandGlobal = wayland_keyboard_test_global(12, "wl_shm");
+        let bind_seat_global: WaylandGlobal = wayland_keyboard_test_global(13, "wl_seat");
+        bind_seat_global.version = 9;
+        let bind_clipboard_global: WaylandGlobal = wayland_keyboard_test_global(
+            14, "wl_data_device_manager");
+        bind_clipboard_global.version = 3;
+        let recorded_bind_globals: i32 = wayland_record_global(&bind_connection,
+            bind_compositor_global) * wayland_record_global(&bind_connection, bind_shell_global)
+            * wayland_record_global(&bind_connection, bind_shm_global)
+            * wayland_record_global(&bind_connection, bind_seat_global)
+            * wayland_record_global(&bind_connection, bind_clipboard_global);
+        let shell_bound: i32 = wayland_bind_shell(&bind_connection);
+        let bind_compositor_call: WireBuffer = wayland_receive_frame(bind_peer.second, 100);
+        let bind_shell_call: WireBuffer = wayland_receive_frame(bind_peer.second, 100);
+        let bind_shm_call: WireBuffer = wayland_receive_frame(bind_peer.second, 100);
+        let bind_seat_call: WireBuffer = wayland_receive_frame(bind_peer.second, 100);
+        let bind_clipboard_call: WireBuffer = wayland_receive_frame(
+            bind_peer.second, 100);
+        let get_device_call: WireBuffer = wayland_receive_frame(
+            bind_peer.second, 100);
+        let bind_seat_frame: WaylandFrame = wayland_decode(&bind_seat_call, 0);
+        let bind_clipboard_frame: WaylandFrame = wayland_decode(
+            &bind_clipboard_call, 0);
+        let bind_clipboard_interface: WireString = wire_read_string(
+            &bind_clipboard_call, bind_clipboard_frame.payload_offset + 4,
+            bind_clipboard_frame.size as i32);
+        let get_device_frame: WaylandFrame = wayland_decode(&get_device_call, 0);
+        failures = failures + wayland_keyboard_expect(recorded_bind_globals == 1
+            && shell_bound == 1 && bind_connection.seat_version == 3
+            && bind_seat_frame.valid == 1 && bind_seat_frame.object_id == 2
+            && bind_seat_frame.opcode == 0
+            && wire_read_u32_le(&bind_seat_call,
+                bind_seat_frame.payload_offset + 16) == 3
+            && bind_clipboard_frame.valid != 0
+            && bind_clipboard_frame.object_id == 2
+            && bind_clipboard_frame.opcode == 0
+            && wire_read_u32_le(&bind_clipboard_call,
+                bind_clipboard_frame.payload_offset) == 14
+            && bind_clipboard_interface.valid != 0
+            && @strEq(bind_clipboard_interface.value,
+                "wl_data_device_manager") != 0
+            && wire_read_u32_le(&bind_clipboard_call,
+                bind_clipboard_interface.next_offset) == 1
+            && wire_read_u32_le(&bind_clipboard_call,
+                bind_clipboard_interface.next_offset + 4) == 8
+            && get_device_frame.valid != 0
+            && get_device_frame.object_id == 8
+            && get_device_frame.opcode == 1 && get_device_frame.size == 16
+            && wire_read_u32_le(&get_device_call,
+                get_device_frame.payload_offset) == 9
+            && wire_read_u32_le(&get_device_call,
+                get_device_frame.payload_offset + 4) == 7
+            && bind_connection.clipboard_manager_id == 8
+            && bind_connection.clipboard_device_id == 9
+            && bind_connection.clipboard_available != 0
+            && bind_connection.next_id == 10
+            && linux_poll_readable(bind_peer.second, 0) == 0,
+            "seat binds at v3 and optional clipboard manager binds exactly v1 with one dense data device");
+        wire_free(&bind_compositor_call); wire_free(&bind_shell_call);
+        wire_free(&bind_shm_call); wire_free(&bind_seat_call);
+        wire_free(&bind_clipboard_call); wire_free(&get_device_call);
+        wayland_disconnect(&bind_connection);
+        let _close_bind_peer: i64 = linux_close(bind_peer.second);
+    }
+
+    let count_connection: WaylandNativeConnection = wayland_empty_connection();
+    let count_ok: i32 = 1;
+    let count_i: t27 = 1;
+    while (count_i <= wayland_registry_max_globals()) {
+        let counted: WaylandGlobal = wayland_keyboard_test_global(count_i, "x");
+        if (wayland_record_global(&count_connection, counted) == 0) { count_ok = 0; }
+        count_i = count_i + 1;
+    }
+    let count_overflow: WaylandGlobal = wayland_keyboard_test_global(
+        wayland_registry_max_globals() + 1, "x");
+    failures = failures + wayland_keyboard_expect(count_ok == 1
+        && wayland_record_global(&count_connection, count_overflow) == 0
+        && len[WaylandGlobal](count_connection.globals) as t27
+            == wayland_registry_max_globals(),
+        "registry retention stops exactly at the global-count bound");
+    wayland_disconnect(&count_connection);
+
+    let flood_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + wayland_keyboard_expect(flood_peer.ok == 1,
+        "registry flood fixture opens a Unix socketpair");
+    if (flood_peer.ok == 1) {
+        let flood_connection: WaylandNativeConnection = wayland_empty_connection();
+        flood_connection.fd = flood_peer.first; flood_connection.connected = 1;
+        let flood_sent: i32 = 1;
+        let flood_i: t27 = 1;
+        while (flood_i <= wayland_registry_max_globals() + 1) {
+            let flood_wire: WireBuffer = wayland_registry_global(2, flood_i, "x", 1);
+            if (linux_send_wire(flood_peer.second, &flood_wire)
+                != len[u8](flood_wire.bytes) as i64) { flood_sent = 0; }
+            wire_free(&flood_wire); flood_i = flood_i + 1;
+        }
+        let flood_finished: i32 = wayland_finish_registry(&flood_connection, 500);
+        failures = failures + wayland_keyboard_expect(flood_sent == 1
+            && flood_finished == 0 && flood_connection.registry_failed == 1
+            && flood_connection.connected == 0 && flood_connection.fd < 0
+            && len[WaylandGlobal](flood_connection.globals) as t27
+                == wayland_registry_max_globals(),
+            "registry flood retires the stream at the retention bound without extra growth");
+        wayland_disconnect(&flood_connection);
+        let _close_flood_peer: i64 = linux_close(flood_peer.second);
+    }
+
+    let validation_connection: WaylandNativeConnection = wayland_empty_connection();
+    let first_global: WaylandGlobal = wayland_keyboard_test_global(1, "wl_output");
+    let duplicate_global: WaylandGlobal = wayland_keyboard_test_global(1, "wl_seat");
+    let invalid_name_global: WaylandGlobal = wayland_keyboard_test_global(2, "bad name");
+    let too_long_global: WaylandGlobal = wayland_keyboard_test_global(3,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    failures = failures + wayland_keyboard_expect(
+        wayland_record_global(&validation_connection, first_global) == 1
+        && wayland_record_global(&validation_connection, duplicate_global) == 0
+        && wayland_record_global(&validation_connection, invalid_name_global) == 0
+        && wayland_record_global(&validation_connection, too_long_global) == 0
+        && len[WaylandGlobal](validation_connection.globals) == 1,
+        "registry rejects duplicate names, invalid interface bytes, and oversized names");
+    wayland_disconnect(&validation_connection);
+
+    let total_connection: WaylandNativeConnection = wayland_empty_connection();
+    let interface_128: []u8 =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let total_ok: i32 = 1;
+    let total_i: t27 = 1;
+    while (total_i <= 64) {
+        let total_global: WaylandGlobal = wayland_keyboard_test_global(total_i, interface_128);
+        if (wayland_record_global(&total_connection, total_global) == 0) { total_ok = 0; }
+        total_i = total_i + 1;
+    }
+    let total_overflow: WaylandGlobal = wayland_keyboard_test_global(65, "x");
+    failures = failures + wayland_keyboard_expect(total_ok == 1
+        && total_connection.registry_total_interface_bytes
+            == wayland_registry_max_total_interface_bytes()
+        && wayland_record_global(&total_connection, total_overflow) == 0,
+        "registry retention enforces the cumulative interface-byte bound");
+    wayland_disconnect(&total_connection);
+
+    let failed_send_connection: WaylandNativeConnection = wayland_empty_connection();
+    failed_send_connection.connected = 1;
+    let failed_send_map: WaylandKeyboardEvent = wayland_empty_keyboard_event();
+    failed_send_map.kind = WaylandKeyboardEventKind.Keymap;
+    failed_send_map.keymap_format = 1; failed_send_map.keymap_size = 1;
+    failed_send_map.keymap_bytes = make[u8](1); push[u8](&failed_send_map.keymap_bytes, 0);
+    failed_send_map.valid = 1;
+    let _failed_send_map_stored: i32 = wayland_connection_store_pending_keymap(
+        &failed_send_connection, &failed_send_map);
+    wayland_keyboard_event_free(&failed_send_map);
+    let failed_send_queued_wire: WireBuffer = wayland_empty_request(80, 0);
+    let _failed_send_queued: i32 = wayland_connection_queue_pending_frame(
+        &failed_send_connection, &failed_send_queued_wire);
+    let failed_request: WireBuffer = wayland_seat_get_keyboard(7, 8);
+    let failed_request_ok: i32 = wayland_native_send_request(&failed_send_connection,
+        &failed_request, 1);
+    let failed_send_authority: WaylandKeyboardAuthorityUpdate =
+        wayland_connection_take_keyboard_authority(&failed_send_connection);
+    let failed_send_pending: WaylandNativeFrameReceive =
+        wayland_connection_take_pending_frame(&failed_send_connection);
+    failures = failures + wayland_keyboard_expect(failed_request_ok == 0
+        && failed_send_connection.fd < 0 && failed_send_connection.connected == 0
+        && failed_request.bytes.cap == 0 && failed_send_authority.valid == 0
+        && failed_send_pending.valid == 0,
+        "incomplete byte request retires wire, authority, and queued-frame ownership");
+    wayland_keyboard_authority_update_free(&failed_send_authority);
+    wayland_native_frame_free(&failed_send_pending);
+    wayland_disconnect(&failed_send_connection);
+
+    let failed_fd_memory: LinuxSharedMemory = linux_shared_memory_create(4);
+    if (failed_fd_memory.valid == 1) {
+        let failed_fd_connection: WaylandNativeConnection = wayland_empty_connection();
+        failed_fd_connection.connected = 1;
+        let failed_fd_request: WireBuffer = wayland_shm_create_pool(4, 5, 4);
+        let failed_fd_ok: i32 = wayland_native_send_request_fd(&failed_fd_connection,
+            &failed_fd_request, failed_fd_memory.fd, 1);
+        failures = failures + wayland_keyboard_expect(failed_fd_ok == 0
+            && failed_fd_connection.fd < 0 && failed_fd_connection.connected == 0
+            && failed_fd_request.bytes.cap == 0 && linux_fd_flags(failed_fd_memory.fd) >= 0,
+            "incomplete FD request retires the stream, frees wire bytes, and preserves caller FD ownership");
+        wayland_disconnect(&failed_fd_connection);
+        linux_shared_memory_free(&failed_fd_memory);
+    } else {
+        failures = failures + wayland_keyboard_expect(0,
+            "FD request failure fixture creates shared memory");
+    }
+
+    let disconnect_authority: WaylandNativeConnection = wayland_empty_connection();
+    let stale_map: WaylandKeyboardEvent = wayland_empty_keyboard_event();
+    stale_map.kind = WaylandKeyboardEventKind.Keymap; stale_map.keymap_format = 1;
+    stale_map.keymap_size = 1; stale_map.keymap_bytes = make[u8](1);
+    push[u8](&stale_map.keymap_bytes, 0); stale_map.valid = 1;
+    let _stored_stale_map: i32 = wayland_connection_store_pending_keymap(
+        &disconnect_authority, &stale_map);
+    wayland_keyboard_event_free(&stale_map);
+    wayland_disconnect(&disconnect_authority);
+    let after_disconnect: WaylandKeyboardAuthorityUpdate =
+        wayland_connection_take_keyboard_authority(&disconnect_authority);
+    failures = failures + wayland_keyboard_expect(after_disconnect.valid == 0,
+        "disconnect invalidates every pending keyboard authority update");
+    wayland_keyboard_authority_update_free(&after_disconnect);
+
+    let local_cleanup_connection: WaylandNativeConnection = wayland_empty_connection();
+    let local_cleanup_memory: LinuxSharedMemory = linux_shared_memory_create(32);
+    if (local_cleanup_memory.valid == 1) {
+        let local_cleanup_window: WaylandNativeWindow = WaylandNativeWindow{
+            .surface_id = 90, .xdg_surface_id = 91, .toplevel_id = 92,
+            .width = 1, .height = 1, .live = 1, .configured = 1,
+            .close_requested = 0, .buffer_id = 93, .buffer_width = 1,
+            .buffer_height = 1, .memory = local_cleanup_memory, .buffer_busy = 1 };
+        let local_cleanup_ok: i32 = wayland_close_window(&local_cleanup_connection,
+            &local_cleanup_window);
+        failures = failures + wayland_keyboard_expect(local_cleanup_ok == 0
+            && local_cleanup_window.live == 0 && local_cleanup_window.buffer_id == 0
+            && local_cleanup_window.buffer_busy == 0
+            && local_cleanup_window.memory.valid == 0 && local_cleanup_window.memory.fd < 0,
+            "window local mmap and memfd teardown completes after transport failure");
+    } else {
+        failures = failures + wayland_keyboard_expect(0,
+            "window cleanup fixture creates shared memory");
+    }
+    wayland_disconnect(&local_cleanup_connection);
+
+    let focus_connection: WaylandNativeConnection = wayland_empty_connection();
+    focus_connection.seat_has_keyboard = 1; focus_connection.keyboard_id = 501;
+    let focus_keys: ArrayList[t27] = make[t27](1);
+    let _focus_surface_registered: i32 = wayland_connection_register_surface(
+        &focus_connection, 500);
+    let focus_wire: WireBuffer = wayland_keyboard_enter_event(501, 1, 500, &focus_keys);
+    let focused_event: WaylandKeyboardEvent = wayland_process_keyboard_frame(&focus_connection,
+        &focus_wire, wayland_decode(&focus_wire, 0), 0 - 1);
+    focus_connection.pointer_focus_surface = 500;
+    let focused_window: WaylandNativeWindow = wayland_keyboard_test_window(500, 502, 503, 0);
+    let _focused_close: i32 = wayland_close_window(&focus_connection, &focused_window);
+    let _next_surface_registered: i32 = wayland_connection_register_surface(
+        &focus_connection, 504);
+    let next_focus_wire: WireBuffer = wayland_keyboard_enter_event(501, 2, 504, &focus_keys);
+    let next_focus_event: WaylandKeyboardEvent = wayland_process_keyboard_frame(&focus_connection,
+        &next_focus_wire, wayland_decode(&next_focus_wire, 0), 0 - 1);
+    failures = failures + wayland_keyboard_expect(focused_event.valid == 1
+        && next_focus_event.valid == 1 && focus_connection.pointer_focus_surface == 0
+        && focus_connection.keyboard_focus_surface == 504
+        && wayland_connection_has_surface(&focus_connection, 500) == 0,
+        "focused close unregisters its surface and permits a later owned-surface enter");
+    wayland_keyboard_event_free(&focused_event);
+    wayland_keyboard_event_free(&next_focus_event);
+    wire_free(&focus_wire); wire_free(&next_focus_wire); free[t27](&focus_keys);
+    wayland_disconnect(&focus_connection);
+
+    let queue_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + wayland_keyboard_expect(queue_peer.ok == 1,
+        "multiwindow pending-frame fixture opens a Unix socketpair");
+    if (queue_peer.ok == 1) {
+        let queue_connection: WaylandNativeConnection = wayland_empty_connection();
+        queue_connection.fd = queue_peer.first; queue_connection.connected = 1;
+        queue_connection.pointer_id = 510; queue_connection.pointer_version = 3;
+        queue_connection.keyboard_id = 511; queue_connection.keyboard_version = 3;
+        queue_connection.seat_has_pointer = 1; queue_connection.seat_has_keyboard = 1;
+        let _queue_surface_one: i32 = wayland_connection_register_surface(
+            &queue_connection, 1001);
+        let _queue_surface_two: i32 = wayland_connection_register_surface(
+            &queue_connection, 1002);
+        let queued_window: WaylandNativeWindow = wayland_keyboard_test_window(1002, 520, 521, 0);
+        let queued_keys: ArrayList[t27] = make[t27](1);
+        let queued_other_configure: WireBuffer = wayland_xdg_toplevel_configure(519, 800, 600);
+        let queued_other_close: WireBuffer = wayland_empty_request(519, 1);
+        let queued_pointer: WireBuffer = wayland_pointer_enter_event(510, 3, 1001, 4, 5);
+        let queued_keyboard: WireBuffer = wayland_keyboard_enter_event(511, 4, 1001,
+            &queued_keys);
+        let target_configure: WireBuffer = wayland_xdg_surface_configure(520, 77);
+        let queued_sent: i32 = 1;
+        if (linux_send_wire(queue_peer.second, &queued_other_configure)
+            != len[u8](queued_other_configure.bytes) as i64) { queued_sent = 0; }
+        if (linux_send_wire(queue_peer.second, &queued_other_close)
+            != len[u8](queued_other_close.bytes) as i64) { queued_sent = 0; }
+        if (linux_send_wire(queue_peer.second, &queued_pointer)
+            != len[u8](queued_pointer.bytes) as i64) { queued_sent = 0; }
+        if (linux_send_wire(queue_peer.second, &queued_keyboard)
+            != len[u8](queued_keyboard.bytes) as i64) { queued_sent = 0; }
+        if (linux_send_wire(queue_peer.second, &target_configure)
+            != len[u8](target_configure.bytes) as i64) { queued_sent = 0; }
+        let queue_wait_ok: i32 = wayland_wait_window_configure(&queue_connection,
+            &queued_window, 500);
+        let queue_ack: WireBuffer = wayland_receive_frame(queue_peer.second, 100);
+        let queue_ack_frame: WaylandFrame = wayland_decode(&queue_ack, 0);
+        let queued_one: WaylandNativePendingEvent = wayland_connection_take_pending_event(
+            &queue_connection);
+        let queued_two: WaylandNativePendingEvent = wayland_connection_take_pending_event(
+            &queue_connection);
+        let queued_three: WaylandNativePendingEvent = wayland_connection_take_pending_event(
+            &queue_connection);
+        let queued_four: WaylandNativePendingEvent = wayland_connection_take_pending_event(
+            &queue_connection);
+        let queued_one_frame: WaylandFrame = wayland_decode(&queued_one.input, 0);
+        let queued_two_frame: WaylandFrame = wayland_decode(&queued_two.input, 0);
+        let queued_three_frame: WaylandFrame = wayland_decode(&queued_three.input, 0);
+        let queued_four_frame: WaylandFrame = wayland_decode(&queued_four.input, 0);
+        let queued_pointer_event: WaylandPointerEvent = wayland_process_pointer_frame(
+            &queue_connection, &queued_three.input, queued_three_frame);
+        let queued_keyboard_event: WaylandKeyboardEvent = wayland_process_keyboard_frame(
+            &queue_connection, &queued_four.input, queued_four_frame, 0 - 1);
+        failures = failures + wayland_keyboard_expect(queued_sent == 1 && queue_wait_ok == 1
+            && queued_window.configured == 1 && queue_ack_frame.valid == 1
+            && queue_ack_frame.object_id == 520 && queue_ack_frame.opcode == 4
+            && queued_one.kind == WaylandNativePendingKind.Frame
+            && queued_two.kind == WaylandNativePendingKind.Frame
+            && queued_three.kind == WaylandNativePendingKind.Frame
+            && queued_four.kind == WaylandNativePendingKind.Frame
+            && queued_one_frame.object_id == 519 && queued_one_frame.opcode == 0
+            && queued_two_frame.object_id == 519 && queued_two_frame.opcode == 1
+            && queued_three_frame.object_id == 510 && queued_three_frame.opcode == 0
+            && queued_four_frame.object_id == 511 && queued_four_frame.opcode == 1
+            && queued_pointer_event.valid == 1 && queued_keyboard_event.valid == 1
+            && queue_connection.pointer_focus_surface == 1001
+            && queue_connection.keyboard_focus_surface == 1001
+            && len[WaylandNativeQueuedFrame](queue_connection.pending_frames) == 0
+            && queue_connection.pending_frame_bytes == 0,
+            "window2 configure wait preserves window1 configure, close, pointer, and keyboard order");
+        wayland_keyboard_event_free(&queued_keyboard_event);
+        wayland_native_pending_event_free(&queued_one);
+        wayland_native_pending_event_free(&queued_two);
+        wayland_native_pending_event_free(&queued_three);
+        wayland_native_pending_event_free(&queued_four);
+        wire_free(&queue_ack); wire_free(&queued_other_configure);
+        wire_free(&queued_other_close); wire_free(&queued_pointer);
+        wire_free(&queued_keyboard); wire_free(&target_configure); free[t27](&queued_keys);
+        wayland_disconnect(&queue_connection);
+        let _close_queue_peer: i64 = linux_close(queue_peer.second);
+    }
+
+    let seat_queue_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + wayland_keyboard_expect(seat_queue_peer.ok == 1,
+        "deferred seat-transition fixture opens a Unix socketpair");
+    if (seat_queue_peer.ok == 1) {
+        let seat_queue_connection: WaylandNativeConnection = wayland_empty_connection();
+        seat_queue_connection.fd = seat_queue_peer.first;
+        seat_queue_connection.connected = 1;
+        seat_queue_connection.seat_id = 570; seat_queue_connection.seat_version = 3;
+        seat_queue_connection.pointer_id = 571; seat_queue_connection.pointer_version = 3;
+        seat_queue_connection.keyboard_id = 572; seat_queue_connection.keyboard_version = 3;
+        seat_queue_connection.seat_has_pointer = 1;
+        seat_queue_connection.seat_has_keyboard = 1;
+        seat_queue_connection.pointer_focus_surface = 573;
+        seat_queue_connection.keyboard_focus_surface = 573;
+        let seat_queue_window: WaylandNativeWindow = wayland_keyboard_test_window(
+            580, 581, 582, 0);
+        let queued_seat_name: WireBuffer = wayland_seat_name_event(570, "seat0");
+        let queued_seat_loss: WireBuffer = wayland_seat_capabilities_event(570, 0);
+        let seat_target_configure: WireBuffer = wayland_xdg_surface_configure(581, 88);
+        let seat_queue_sent: i32 = 1;
+        if (linux_send_wire(seat_queue_peer.second, &queued_seat_name)
+            != len[u8](queued_seat_name.bytes) as i64) { seat_queue_sent = 0; }
+        if (linux_send_wire(seat_queue_peer.second, &queued_seat_loss)
+            != len[u8](queued_seat_loss.bytes) as i64) { seat_queue_sent = 0; }
+        if (linux_send_wire(seat_queue_peer.second, &seat_target_configure)
+            != len[u8](seat_target_configure.bytes) as i64) { seat_queue_sent = 0; }
+        let seat_wait_ok: i32 = wayland_wait_window_configure(
+            &seat_queue_connection, &seat_queue_window, 500);
+        let seat_ack: WireBuffer = wayland_receive_frame(seat_queue_peer.second, 100);
+        let seat_name_pending: WaylandNativePendingEvent =
+            wayland_connection_take_pending_event(&seat_queue_connection);
+        let seat_name_pending_frame: WaylandFrame = wayland_decode(
+            &seat_name_pending.input, 0);
+        let seat_name_processed: i32 = wayland_process_seat_frame(
+            &seat_queue_connection, &seat_name_pending.input, seat_name_pending_frame);
+        let seat_pending: WaylandNativePendingEvent =
+            wayland_connection_take_pending_event(&seat_queue_connection);
+        let seat_pending_frame: WaylandFrame = wayland_decode(&seat_pending.input, 0);
+        let seat_state_deferred: i32 = seat_queue_connection.pointer_id == 571
+            && seat_queue_connection.keyboard_id == 572
+            && seat_queue_connection.pointer_focus_surface == 573
+            && seat_queue_connection.keyboard_focus_surface == 573;
+        let seat_processed: i32 = wayland_process_seat_frame(&seat_queue_connection,
+            &seat_pending.input, seat_pending_frame);
+        let pointer_release_after_wait: WireBuffer = wayland_receive_frame(
+            seat_queue_peer.second, 100);
+        let keyboard_release_after_wait: WireBuffer = wayland_receive_frame(
+            seat_queue_peer.second, 100);
+        let pointer_release_after_wait_frame: WaylandFrame = wayland_decode(
+            &pointer_release_after_wait, 0);
+        let keyboard_release_after_wait_frame: WaylandFrame = wayland_decode(
+            &keyboard_release_after_wait, 0);
+        let seat_withdrawal: WaylandKeyboardAuthorityUpdate =
+            wayland_connection_take_keyboard_authority(&seat_queue_connection);
+        failures = failures + wayland_keyboard_expect(seat_queue_sent == 1
+            && seat_wait_ok == 1 && seat_name_pending.valid == 1
+            && seat_name_pending.kind == WaylandNativePendingKind.Frame
+            && seat_name_pending_frame.object_id == 570
+            && seat_name_pending_frame.opcode == 1 && seat_name_processed == 1
+            && seat_pending.valid == 1
+            && seat_pending.kind == WaylandNativePendingKind.Frame
+            && seat_pending_frame.object_id == 570 && seat_pending_frame.opcode == 0
+            && seat_state_deferred == 1 && seat_processed == 1
+            && seat_queue_connection.pointer_id == 0
+            && seat_queue_connection.keyboard_id == 0
+            && seat_queue_connection.pointer_focus_surface == 0
+            && seat_queue_connection.keyboard_focus_surface == 0
+            && pointer_release_after_wait_frame.object_id == 571
+            && pointer_release_after_wait_frame.opcode == 1
+            && keyboard_release_after_wait_frame.object_id == 572
+            && keyboard_release_after_wait_frame.opcode == 0
+            && seat_withdrawal.valid == 1
+            && seat_withdrawal.kind == WaylandKeyboardAuthorityKind.Withdrawn,
+            "seat capability loss survives configure wait and is applied exactly once by app dispatch");
+        wayland_keyboard_authority_update_free(&seat_withdrawal);
+        wayland_native_pending_event_free(&seat_name_pending);
+        wayland_native_pending_event_free(&seat_pending);
+        wire_free(&pointer_release_after_wait); wire_free(&keyboard_release_after_wait);
+        wire_free(&seat_ack); wire_free(&queued_seat_name); wire_free(&queued_seat_loss);
+        wire_free(&seat_target_configure); wayland_disconnect(&seat_queue_connection);
+        let _close_seat_queue_peer: i64 = linux_close(seat_queue_peer.second);
+    }
+
+    let authority_queue_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + wayland_keyboard_expect(authority_queue_peer.ok == 1,
+        "ordered keymap authority fixture opens a Unix socketpair");
+    if (authority_queue_peer.ok == 1) {
+        let authority_queue_connection: WaylandNativeConnection = wayland_empty_connection();
+        authority_queue_connection.fd = authority_queue_peer.first;
+        authority_queue_connection.connected = 1;
+        authority_queue_connection.seat_has_keyboard = 1;
+        authority_queue_connection.keyboard_id = 611;
+        authority_queue_connection.keyboard_version = 3;
+        let authority_queue_window: WaylandNativeWindow = wayland_keyboard_test_window(
+            619, 620, 621, 0);
+        let map_a_memory: LinuxSharedMemory = linux_shared_memory_create(2);
+        let map_b_memory: LinuxSharedMemory = linux_shared_memory_create(2);
+        failures = failures + wayland_keyboard_expect(map_a_memory.valid == 1
+            && map_b_memory.valid == 1,
+            "ordered keymap fixture creates two bounded read-only map sources");
+        if (map_a_memory.valid == 1 && map_b_memory.valid == 1) {
+            linux_shared_memory_set_byte(&map_a_memory, 0, 'a');
+            linux_shared_memory_set_byte(&map_a_memory, 1, 0);
+            linux_shared_memory_set_byte(&map_b_memory, 0, 'b');
+            linux_shared_memory_set_byte(&map_b_memory, 1, 0);
+            let map_a_wire: WireBuffer = wayland_keyboard_keymap_event(611, 1, 2);
+            let key_a_wire: WireBuffer = wayland_keyboard_key_event(611, 1, 2, 30, 1);
+            let map_b_wire: WireBuffer = wayland_keyboard_keymap_event(611, 1, 2);
+            let key_b_wire: WireBuffer = wayland_keyboard_key_event(611, 3, 4, 31, 1);
+            let authority_target_configure: WireBuffer =
+                wayland_xdg_surface_configure(620, 99);
+            let authority_queue_sent: i32 = 1;
+            if (linux_send_wire_fd(authority_queue_peer.second, &map_a_wire,
+                map_a_memory.fd) != len[u8](map_a_wire.bytes) as i64) {
+                authority_queue_sent = 0;
+            }
+            if (linux_send_wire(authority_queue_peer.second, &key_a_wire)
+                != len[u8](key_a_wire.bytes) as i64) { authority_queue_sent = 0; }
+            if (linux_send_wire_fd(authority_queue_peer.second, &map_b_wire,
+                map_b_memory.fd) != len[u8](map_b_wire.bytes) as i64) {
+                authority_queue_sent = 0;
+            }
+            if (linux_send_wire(authority_queue_peer.second, &key_b_wire)
+                != len[u8](key_b_wire.bytes) as i64) { authority_queue_sent = 0; }
+            if (linux_send_wire(authority_queue_peer.second, &authority_target_configure)
+                != len[u8](authority_target_configure.bytes) as i64) {
+                authority_queue_sent = 0;
+            }
+            let authority_wait_ok: i32 = wayland_wait_window_configure(
+                &authority_queue_connection, &authority_queue_window, 500);
+            let authority_ack: WireBuffer = wayland_receive_frame(
+                authority_queue_peer.second, 100);
+            let authority_queue_bytes: t27 = authority_queue_connection.pending_frame_bytes;
+            let authority_a: WaylandNativePendingEvent =
+                wayland_connection_take_pending_event(&authority_queue_connection);
+            let raw_key_a: WaylandNativePendingEvent =
+                wayland_connection_take_pending_event(&authority_queue_connection);
+            let authority_b: WaylandNativePendingEvent =
+                wayland_connection_take_pending_event(&authority_queue_connection);
+            let raw_key_b: WaylandNativePendingEvent =
+                wayland_connection_take_pending_event(&authority_queue_connection);
+            let decoded_key_a: WaylandKeyboardEvent = wayland_decode_keyboard_event(
+                &raw_key_a.input, wayland_decode(&raw_key_a.input, 0), 611);
+            let decoded_key_b: WaylandKeyboardEvent = wayland_decode_keyboard_event(
+                &raw_key_b.input, wayland_decode(&raw_key_b.input, 0), 611);
+            failures = failures + wayland_keyboard_expect(authority_queue_sent == 1
+                && authority_wait_ok == 1 && authority_queue_bytes == 52
+                && authority_a.valid == 1
+                && authority_a.kind == WaylandNativePendingKind.KeyboardAuthority
+                && authority_a.authority.kind == WaylandKeyboardAuthorityKind.Map
+                && authority_a.authority.generation == 1
+                && len[u8](authority_a.authority.keymap_bytes) == 2
+                && get[u8](authority_a.authority.keymap_bytes, 0) == 'a'
+                && raw_key_a.valid == 1 && raw_key_a.kind == WaylandNativePendingKind.Frame
+                && decoded_key_a.valid == 1 && decoded_key_a.key == 30
+                && authority_b.valid == 1
+                && authority_b.kind == WaylandNativePendingKind.KeyboardAuthority
+                && authority_b.authority.kind == WaylandKeyboardAuthorityKind.Map
+                && authority_b.authority.generation == 2
+                && len[u8](authority_b.authority.keymap_bytes) == 2
+                && get[u8](authority_b.authority.keymap_bytes, 0) == 'b'
+                && raw_key_b.valid == 1 && raw_key_b.kind == WaylandNativePendingKind.Frame
+                && decoded_key_b.valid == 1 && decoded_key_b.key == 31
+                && len[WaylandNativeQueuedFrame](authority_queue_connection.pending_frames) == 0
+                && authority_queue_connection.pending_frame_bytes == 0,
+                "map A, key A, map B, key B retain exact stream authority order");
+            wayland_keyboard_event_free(&decoded_key_a);
+            wayland_keyboard_event_free(&decoded_key_b);
+            wayland_native_pending_event_free(&authority_a);
+            wayland_native_pending_event_free(&raw_key_a);
+            wayland_native_pending_event_free(&authority_b);
+            wayland_native_pending_event_free(&raw_key_b);
+            wire_free(&authority_ack); wire_free(&map_a_wire); wire_free(&key_a_wire);
+            wire_free(&map_b_wire); wire_free(&key_b_wire);
+            wire_free(&authority_target_configure);
+        }
+        if (map_a_memory.valid == 1) { linux_shared_memory_free(&map_a_memory); }
+        if (map_b_memory.valid == 1) { linux_shared_memory_free(&map_b_memory); }
+        wayland_disconnect(&authority_queue_connection);
+        let _close_authority_queue_peer: i64 = linux_close(authority_queue_peer.second);
+    }
+
+    let rejected_queue_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + wayland_keyboard_expect(rejected_queue_peer.ok == 1,
+        "queued rejected-keymap fixture opens a Unix socketpair");
+    if (rejected_queue_peer.ok == 1) {
+        let rejected_queue_connection: WaylandNativeConnection = wayland_empty_connection();
+        rejected_queue_connection.fd = rejected_queue_peer.first;
+        rejected_queue_connection.connected = 1;
+        rejected_queue_connection.seat_has_keyboard = 1;
+        rejected_queue_connection.keyboard_id = 630;
+        rejected_queue_connection.keyboard_version = 3;
+        let rejected_queue_window: WaylandNativeWindow = wayland_keyboard_test_window(
+            631, 632, 633, 0);
+        let rejected_fd_a: LinuxSharedMemory = linux_shared_memory_create(1);
+        let rejected_fd_b: LinuxSharedMemory = linux_shared_memory_create(1);
+        if (rejected_fd_a.valid == 1 && rejected_fd_b.valid == 1) {
+            let rejected_wire: WireBuffer = wayland_keyboard_keymap_event(630, 1, 1);
+            let rejected_fds: ArrayList[i64] = make[i64](2);
+            push[i64](&rejected_fds, rejected_fd_a.fd);
+            push[i64](&rejected_fds, rejected_fd_b.fd);
+            let rejected_sent: i64 = wayland_keyboard_send_many(
+                rejected_queue_peer.second, &rejected_wire, &rejected_fds);
+            let rejected_target: WireBuffer = wayland_xdg_surface_configure(632, 101);
+            let _rejected_target_sent: i64 = linux_send_wire(
+                rejected_queue_peer.second, &rejected_target);
+            let rejected_wait_ok: i32 = wayland_wait_window_configure(
+                &rejected_queue_connection, &rejected_queue_window, 500);
+            let rejected_ack: WireBuffer = wayland_receive_frame(
+                rejected_queue_peer.second, 100);
+            let rejected_once: WaylandNativePendingEvent =
+                wayland_connection_take_pending_event(&rejected_queue_connection);
+            let rejected_twice: WaylandNativePendingEvent =
+                wayland_connection_take_pending_event(&rejected_queue_connection);
+            failures = failures + wayland_keyboard_expect(rejected_sent == 16
+                && rejected_wait_ok == 1 && rejected_once.valid == 1
+                && rejected_once.kind == WaylandNativePendingKind.KeyboardAuthority
+                && rejected_once.authority.kind == WaylandKeyboardAuthorityKind.Rejected
+                && rejected_once.authority.generation == 1
+                && rejected_twice.valid == 0
+                && rejected_queue_connection.keyboard_authority_generation == 1,
+                "one ancillary-invalid keymap yields exactly one ordered rejection generation");
+            wayland_native_pending_event_free(&rejected_once);
+            wayland_native_pending_event_free(&rejected_twice);
+            wire_free(&rejected_ack); wire_free(&rejected_target);
+            wire_free(&rejected_wire); free[i64](&rejected_fds);
+        } else {
+            failures = failures + wayland_keyboard_expect(0,
+                "queued rejected-keymap fixture creates both descriptor sources");
+        }
+        if (rejected_fd_a.valid == 1) { linux_shared_memory_free(&rejected_fd_a); }
+        if (rejected_fd_b.valid == 1) { linux_shared_memory_free(&rejected_fd_b); }
+        wayland_disconnect(&rejected_queue_connection);
+        let _close_rejected_queue_peer: i64 = linux_close(rejected_queue_peer.second);
+    }
+
+    let partial_axis_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + wayland_keyboard_expect(partial_axis_peer.ok == 1,
+        "partial-zero configure fixture opens a Unix socketpair");
+    if (partial_axis_peer.ok == 1) {
+        let partial_axis_connection: WaylandNativeConnection = wayland_empty_connection();
+        partial_axis_connection.fd = partial_axis_peer.first;
+        partial_axis_connection.connected = 1;
+        let partial_axis_window: WaylandNativeWindow = wayland_keyboard_test_window(
+            640, 641, 642, 0);
+        let zero_width_configure: WireBuffer = wayland_xdg_toplevel_configure(642, 0, 600);
+        let zero_height_configure: WireBuffer = wayland_xdg_toplevel_configure(642, 800, 0);
+        let both_zero_configure: WireBuffer = wayland_xdg_toplevel_configure(642, 0, 0);
+        let queued_target_close: WireBuffer = wayland_empty_request(642, 1);
+        let partial_axis_target: WireBuffer = wayland_xdg_surface_configure(641, 100);
+        let partial_axis_sent: i32 = 1;
+        if (linux_send_wire(partial_axis_peer.second, &zero_width_configure)
+            != len[u8](zero_width_configure.bytes) as i64) { partial_axis_sent = 0; }
+        if (linux_send_wire(partial_axis_peer.second, &zero_height_configure)
+            != len[u8](zero_height_configure.bytes) as i64) { partial_axis_sent = 0; }
+        if (linux_send_wire(partial_axis_peer.second, &both_zero_configure)
+            != len[u8](both_zero_configure.bytes) as i64) { partial_axis_sent = 0; }
+        if (linux_send_wire(partial_axis_peer.second, &queued_target_close)
+            != len[u8](queued_target_close.bytes) as i64) { partial_axis_sent = 0; }
+        if (linux_send_wire(partial_axis_peer.second, &partial_axis_target)
+            != len[u8](partial_axis_target.bytes) as i64) { partial_axis_sent = 0; }
+        let partial_axis_ok: i32 = wayland_wait_window_configure(
+            &partial_axis_connection, &partial_axis_window, 500);
+        let partial_axis_ack: WireBuffer = wayland_receive_frame(
+            partial_axis_peer.second, 100);
+        let pending_target_close: WaylandNativePendingEvent =
+            wayland_connection_take_pending_event(&partial_axis_connection);
+        let pending_target_close_frame: WaylandFrame = wayland_decode(
+            &pending_target_close.input, 0);
+        failures = failures + wayland_keyboard_expect(partial_axis_sent == 1
+            && partial_axis_ok == 1 && partial_axis_window.width == 800
+            && partial_axis_window.height == 600
+            && partial_axis_window.close_requested == 0
+            && pending_target_close.valid == 1
+            && pending_target_close.kind == WaylandNativePendingKind.Frame
+            && pending_target_close_frame.object_id == 642
+            && pending_target_close_frame.opcode == 1
+            && partial_axis_connection.connected == 1,
+            "partial-zero configure resolves atomically while target close remains queued for app dispatch");
+        wayland_native_pending_event_free(&pending_target_close);
+        wire_free(&partial_axis_ack); wire_free(&zero_width_configure);
+        wire_free(&zero_height_configure); wire_free(&both_zero_configure);
+        wire_free(&queued_target_close); wire_free(&partial_axis_target);
+        wayland_disconnect(&partial_axis_connection);
+        let _close_partial_axis_peer: i64 = linux_close(partial_axis_peer.second);
+    }
+
+    let callback_peer: LinuxFdPair = linux_socketpair_stream();
+    if (callback_peer.ok == 1) {
+        let callback_connection: WaylandNativeConnection = wayland_empty_connection();
+        callback_connection.fd = callback_peer.first; callback_connection.connected = 1;
+        let callback_map: WaylandKeyboardEvent = wayland_empty_keyboard_event();
+        callback_map.kind = WaylandKeyboardEventKind.Keymap;
+        callback_map.keymap_format = 1; callback_map.keymap_size = 1;
+        callback_map.keymap_bytes = make[u8](1); push[u8](&callback_map.keymap_bytes, 0);
+        callback_map.valid = 1;
+        let _callback_map_stored: i32 = wayland_connection_store_pending_keymap(
+            &callback_connection, &callback_map);
+        wayland_keyboard_event_free(&callback_map);
+        let callback_queued_wire: WireBuffer = wayland_empty_request(81, 0);
+        let _callback_queued: i32 = wayland_connection_queue_pending_frame(
+            &callback_connection, &callback_queued_wire);
+        let bad_callback: WireBuffer = wayland_empty_request(3, 0);
+        let _bad_callback_sent: i64 = linux_send_wire(callback_peer.second, &bad_callback);
+        let callback_ok: i32 = wayland_finish_registry(&callback_connection, 100);
+        let callback_authority: WaylandKeyboardAuthorityUpdate =
+            wayland_connection_take_keyboard_authority(&callback_connection);
+        let callback_pending: WaylandNativeFrameReceive =
+            wayland_connection_take_pending_frame(&callback_connection);
+        failures = failures + wayland_keyboard_expect(callback_ok == 0
+            && callback_connection.connected == 0 && callback_connection.fd < 0
+            && callback_authority.valid == 0 && callback_pending.valid == 0,
+            "schema retirement clears callback setup, authority, and queued frames");
+        wayland_keyboard_authority_update_free(&callback_authority);
+        wayland_native_frame_free(&callback_pending);
+        wire_free(&bad_callback); wayland_disconnect(&callback_connection);
+        let _close_callback_peer: i64 = linux_close(callback_peer.second);
+    } else { failures = failures + wayland_keyboard_expect(0, "callback schema fixture opens"); }
+
+    let surface_schema_peer: LinuxFdPair = linux_socketpair_stream();
+    if (surface_schema_peer.ok == 1) {
+        let surface_schema_connection: WaylandNativeConnection = wayland_empty_connection();
+        surface_schema_connection.fd = surface_schema_peer.first;
+        surface_schema_connection.connected = 1;
+        let surface_schema_window: WaylandNativeWindow = wayland_keyboard_test_window(530, 531, 532, 0);
+        let bad_surface_configure: WireBuffer = wayland_empty_request(531, 0);
+        let _bad_surface_sent: i64 = linux_send_wire(surface_schema_peer.second,
+            &bad_surface_configure);
+        let surface_schema_ok: i32 = wayland_wait_window_configure(
+            &surface_schema_connection, &surface_schema_window, 100);
+        failures = failures + wayland_keyboard_expect(surface_schema_ok == 0
+            && surface_schema_window.configured == 0
+            && surface_schema_connection.connected == 0,
+            "malformed xdg_surface.configure cannot configure a window");
+        wire_free(&bad_surface_configure); wayland_disconnect(&surface_schema_connection);
+        let _close_surface_schema_peer: i64 = linux_close(surface_schema_peer.second);
+    } else { failures = failures + wayland_keyboard_expect(0, "surface schema fixture opens"); }
+
+    let toplevel_schema_peer: LinuxFdPair = linux_socketpair_stream();
+    if (toplevel_schema_peer.ok == 1) {
+        let toplevel_schema_connection: WaylandNativeConnection = wayland_empty_connection();
+        toplevel_schema_connection.fd = toplevel_schema_peer.first;
+        toplevel_schema_connection.connected = 1;
+        let toplevel_schema_window: WaylandNativeWindow = wayland_keyboard_test_window(540, 541, 542, 0);
+        let oversized_configure: WireBuffer = wayland_xdg_toplevel_configure(542,
+            surface_max_dimension() + 1, 480);
+        let _oversized_configure_sent: i64 = linux_send_wire(toplevel_schema_peer.second,
+            &oversized_configure);
+        let toplevel_schema_ok: i32 = wayland_wait_window_configure(
+            &toplevel_schema_connection, &toplevel_schema_window, 100);
+        failures = failures + wayland_keyboard_expect(toplevel_schema_ok == 0
+            && toplevel_schema_window.width == 640
+            && toplevel_schema_connection.connected == 0,
+            "oversized signed toplevel dimensions fail before state mutation");
+        wire_free(&oversized_configure); wayland_disconnect(&toplevel_schema_connection);
+        let _close_toplevel_schema_peer: i64 = linux_close(toplevel_schema_peer.second);
+    } else { failures = failures + wayland_keyboard_expect(0, "toplevel schema fixture opens"); }
+
+    let malformed_states_payload: WireBuffer = wire_new(15);
+    wire_push_i32_le(&malformed_states_payload, 640);
+    wire_push_i32_le(&malformed_states_payload, 480);
+    wire_push_u32_le(&malformed_states_payload, 3);
+    wire_push_u8(&malformed_states_payload, 1); wire_push_u8(&malformed_states_payload, 2);
+    wire_push_u8(&malformed_states_payload, 3);
+    let malformed_states_wire: WireBuffer = wayland_encode(542, 0, &malformed_states_payload);
+    let malformed_close_wire: WireBuffer = wayland_u32_request(542, 1, 1);
+    failures = failures + wayland_keyboard_expect(
+        wayland_native_toplevel_configure_valid(&malformed_states_wire,
+            wayland_decode(&malformed_states_wire, 0), 542, 640, 480) == 0
+        && wayland_native_event_exact(wayland_decode(&malformed_close_wire, 0),
+            542, 1, 8) == 0,
+        "toplevel states arrays and close events require exact schemas");
+    wire_free(&malformed_states_wire); wire_free(&malformed_states_payload);
+    wire_free(&malformed_close_wire);
+
+    let buffer_schema_peer: LinuxFdPair = linux_socketpair_stream();
+    if (buffer_schema_peer.ok == 1) {
+        let buffer_schema_connection: WaylandNativeConnection = wayland_empty_connection();
+        buffer_schema_connection.fd = buffer_schema_peer.first;
+        buffer_schema_connection.connected = 1;
+        let buffer_schema_window: WaylandNativeWindow = wayland_keyboard_test_window(550, 551, 552, 553);
+        buffer_schema_window.buffer_busy = 1;
+        let bad_release: WireBuffer = wayland_u32_request(553, 0, 1);
+        let _bad_release_sent: i64 = linux_send_wire(buffer_schema_peer.second, &bad_release);
+        let buffer_schema_ok: i32 = wayland_wait_buffer_release(&buffer_schema_connection,
+            &buffer_schema_window, 100);
+        failures = failures + wayland_keyboard_expect(buffer_schema_ok == 0
+            && buffer_schema_window.buffer_busy == 1
+            && buffer_schema_connection.connected == 0,
+            "malformed wl_buffer.release cannot release a busy buffer");
+        wire_free(&bad_release); wayland_disconnect(&buffer_schema_connection);
+        let _close_buffer_schema_peer: i64 = linux_close(buffer_schema_peer.second);
+    } else { failures = failures + wayland_keyboard_expect(0, "buffer schema fixture opens"); }
+
+    let buffer_close_peer: LinuxFdPair = linux_socketpair_stream();
+    if (buffer_close_peer.ok == 1) {
+        let buffer_close_connection: WaylandNativeConnection = wayland_empty_connection();
+        buffer_close_connection.fd = buffer_close_peer.first;
+        buffer_close_connection.connected = 1;
+        let buffer_close_window: WaylandNativeWindow = wayland_keyboard_test_window(
+            554, 555, 556, 557);
+        buffer_close_window.buffer_busy = 1;
+        let buffer_wait_close: WireBuffer = wayland_empty_request(556, 1);
+        let buffer_wait_release: WireBuffer = wayland_empty_request(557, 0);
+        let _buffer_wait_close_sent: i64 = linux_send_wire(
+            buffer_close_peer.second, &buffer_wait_close);
+        let _buffer_wait_release_sent: i64 = linux_send_wire(
+            buffer_close_peer.second, &buffer_wait_release);
+        let buffer_close_ok: i32 = wayland_wait_buffer_release(
+            &buffer_close_connection, &buffer_close_window, 500);
+        let deferred_buffer_close: WaylandNativePendingEvent =
+            wayland_connection_take_pending_event(&buffer_close_connection);
+        let deferred_buffer_close_frame: WaylandFrame = wayland_decode(
+            &deferred_buffer_close.input, 0);
+        failures = failures + wayland_keyboard_expect(buffer_close_ok == 1
+            && buffer_close_window.buffer_busy == 0
+            && buffer_close_window.close_requested == 0
+            && deferred_buffer_close.valid == 1
+            && deferred_buffer_close.kind == WaylandNativePendingKind.Frame
+            && deferred_buffer_close_frame.object_id == 556
+            && deferred_buffer_close_frame.opcode == 1,
+            "buffer-release wait preserves target close for ordered app dispatch");
+        wayland_native_pending_event_free(&deferred_buffer_close);
+        wire_free(&buffer_wait_close); wire_free(&buffer_wait_release);
+        wayland_disconnect(&buffer_close_connection);
+        let _close_buffer_close_peer: i64 = linux_close(buffer_close_peer.second);
+    } else {
+        failures = failures + wayland_keyboard_expect(0,
+            "buffer close queue fixture opens a Unix socketpair");
+    }
+
+    let ping_peer: LinuxFdPair = linux_socketpair_stream();
+    if (ping_peer.ok == 1) {
+        let ping_connection: WaylandNativeConnection = wayland_empty_connection();
+        ping_connection.fd = ping_peer.first; ping_connection.connected = 1;
+        ping_connection.wm_base_id = 560;
+        let ping_window: WaylandNativeWindow = wayland_keyboard_test_window(561, 562, 563, 564);
+        ping_window.buffer_busy = 1;
+        let ping_wire: WireBuffer = wayland_u32_request(560, 0, 9);
+        let _ping_sent: i64 = linux_send_wire(ping_peer.second, &ping_wire);
+        let _ping_peer_closed: i64 = linux_close(ping_peer.second);
+        let ping_started: i64 = linux_monotonic_ms();
+        let ping_ok: i32 = wayland_wait_buffer_release(&ping_connection, &ping_window, 500);
+        let ping_elapsed: i64 = linux_monotonic_ms() - ping_started;
+        failures = failures + wayland_keyboard_expect(ping_ok == 0
+            && ping_connection.connected == 0 && ping_connection.fd < 0
+            && ping_elapsed <= 200,
+            "failed pong retires immediately instead of spinning to the wait deadline");
+        wire_free(&ping_wire); wayland_disconnect(&ping_connection);
+    } else { failures = failures + wayland_keyboard_expect(0, "ping liveness fixture opens"); }
+
+    if (failures != 0) { return 1; }
+    _zag_println("wayland_keyboard_test: ok");
+    return 0;
+}

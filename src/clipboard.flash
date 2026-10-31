@@ -1,0 +1,84 @@
+// Backend-neutral clipboard ownership. Text bytes are owned only after strict
+// UTF-8 validation; selection identities and generations remain balanced
+// ternary values until a native backend encodes them at its wire boundary.
+
+enum ClipboardKind { Clipboard, Primary }
+
+enum ClipboardStatus {
+    Ok,
+    Unsupported,
+    InvalidWindow,
+    InvalidArgument,
+    InvalidUtf8,
+    TooLarge,
+    ResourceLimit,
+    AtomUnavailable,
+    TransportFailed,
+    OwnershipRejected,
+    NotOwner,
+    UnsupportedTarget,
+    ConversionRejected,
+    PropertyMissing,
+    PropertyTypeMismatch,
+    PropertyFormatMismatch,
+    PropertyTruncated,
+    MalformedReply,
+    Timeout,
+    NoSelection,
+    NoFocusedTextField,
+    EditRejected,
+}
+
+struct ClipboardReadResult {
+    status: ClipboardStatus,
+    text: TextBuffer,
+    valid: i32,
+}
+
+struct ClipboardOwnedText {
+    owner_window_index: i32,
+    text: TextBuffer,
+    generation: t27,
+    valid: i32,
+}
+
+fn clipboard_max_bytes() t27 { return 260100; }
+
+fn clipboard_empty_owned_text() ClipboardOwnedText {
+    return ClipboardOwnedText{ .owner_window_index = -1,
+        .text = text_buffer_empty(), .generation = 0, .valid = 0 };
+}
+
+fn clipboard_owned_text_free(owned: *ClipboardOwnedText) void {
+    text_buffer_free(&owned.*.text);
+    owned.*.owner_window_index = -1;
+    owned.*.valid = 0;
+}
+
+fn clipboard_owned_text_store(owned: *ClipboardOwnedText,
+    owner_window_index: i32, value: []u8) void {
+    // Copy before freeing so callers may pass a view of the current value.
+    let next: TextBuffer = text_buffer_copy(value);
+    let generation: t27 = 1;
+    // Zero is reserved for no authority. Deterministic headless storage has no
+    // deferred native events, so a full-domain rollover safely restarts at one.
+    if (owned.*.generation > 0
+        && owned.*.generation < flashy_t27_max()) {
+        generation = owned.*.generation + 1;
+    }
+    clipboard_owned_text_free(owned);
+    owned.*.owner_window_index = owner_window_index;
+    owned.*.text = next;
+    owned.*.generation = generation;
+    owned.*.valid = 1;
+}
+
+fn clipboard_bad_read(status: ClipboardStatus) ClipboardReadResult {
+    return ClipboardReadResult{ .status = status,
+        .text = text_buffer_empty(), .valid = 0 };
+}
+
+pub fn clipboard_read_result_free(result: *ClipboardReadResult) void {
+    text_buffer_free(&result.*.text);
+    result.*.valid = 0;
+}

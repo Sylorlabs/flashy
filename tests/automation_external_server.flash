@@ -1,0 +1,77 @@
+@import("../src/flashy.flash")
+
+fn external_server_build(window: *Window) i32 {
+    ui_begin(&window.*.ui);
+    let button: i32 = ui_button_control(&window.*.ui, 729, -1,
+        rect(3, 3, 81, 27), "Light", 91);
+    let node: Node = get[Node](window.*.ui.nodes, button);
+    node.semantics.test_id = "light-button";
+    set[Node](&window.*.ui.nodes, button, node);
+    ui_end(&window.*.ui);
+    window.*.needs_present = 0;
+    return button;
+}
+
+fn main() i32 {
+    if (_zag_argc() != 2) {
+        _zag_println("automation_external_server: expected one socket path");
+        return 2;
+    }
+    let path: []u8 = _zag_arg(1);
+    let failures: i32 = 0;
+    let app: App = app_new(BackendKind.Headless);
+    let window_index: i32 = app_open_window(&app, 82, "External Automation", 243, 81);
+    let window: *Window = app_window(&app, window_index);
+    if (window == null as *Window) {
+        app_shutdown(&app);
+        _zag_println("automation_external_server: window open failed");
+        return 1;
+    }
+    let button: i32 = external_server_build(window);
+    let server: AutomationAppServer = automation_app_server_open(path, 82, 4);
+    if (server.active == 0) {
+        let _closed_failed_server: i32 = automation_app_server_close(&server);
+        app_shutdown(&app);
+        _zag_println("automation_external_server: listener open failed");
+        return 1;
+    }
+
+    let path_status: LinuxFileStatus = linux_unix_path_status_exact(path);
+    if (button < 0 || path_status.valid == 0 || (path_status.mode % 512) != 384) {
+        failures = failures + 1;
+    }
+
+    _zag_println("automation_external_server: ready");
+    let click: AutomationResponse = automation_app_server_step(&server, &app, 8000);
+    let assertion: AutomationResponse = automation_app_server_step(&server, &app, 8000);
+    if (click.valid == 0 || click.request_id != 1001
+        || click.status != AutomationResponseStatus.Ok
+        || action_emission_count(&window.*.ui, 91) != 1) {
+        failures = failures + 1;
+    }
+    if (assertion.valid == 0 || assertion.request_id != 1002
+        || assertion.status != AutomationResponseStatus.Ok
+        || server.handled_requests != 2 || window.*.needs_present != 1) {
+        failures = failures + 1;
+    }
+
+    let accepted_fd: i64 = server.connection.fd;
+    let listener_fd: i64 = server.listener.fd;
+    if (automation_app_server_close(&server) == 0
+        || (accepted_fd >= 0 && linux_fd_flags(accepted_fd) != (0 - 9))
+        || linux_fd_flags(listener_fd) != (0 - 9)) {
+        failures = failures + 1;
+    }
+    let final_path: LinuxFileStatus = linux_unix_path_status_exact(path);
+    if (final_path.valid != 0 || final_path.error_code != (0 - 2)) {
+        failures = failures + 1;
+    }
+    app_shutdown(&app);
+
+    if (failures == 0) {
+        _zag_println("automation_external_server: ok");
+        return 0;
+    }
+    _zag_println("automation_external_server: failed");
+    return 1;
+}

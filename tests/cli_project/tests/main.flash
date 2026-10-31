@@ -1,0 +1,6 @@
+@import("flashy") as fy
+
+fn main() i32 {
+    if (fy.utf8_grapheme_count("é") != 1) { return 1; }
+    _zag_println("cli_project_tests: ok"); return 0;
+}

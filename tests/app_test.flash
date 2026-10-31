@@ -1,0 +1,1370 @@
+@import("../src/flashy.flash")
+
+fn app_expect(ok: i32, message: []u8) i32 {
+    if (ok == 0) { _zag_print("FAIL "); _zag_println(message); return 1; }
+    return 0;
+}
+
+fn build_window(window: *Window, key: t27, label: []u8) void {
+    ui_begin(&window.*.ui);
+    let root: i32 = ui_node(&window.*.ui, key, NodeKind.Root, -1,
+        rect(0, 0, window.*.width, window.*.height), theme_surface(),
+        semantics(Role.Window, label, "", label), "", Action{ .id = 0 });
+    let _button: i32 = ui_node(&window.*.ui, key + 1, NodeKind.Button, root,
+        rect(16, 16, 96, 44), theme_button(), semantics(Role.Button, "Act", "", "act"),
+        "Act", Action{ .id = 1 });
+    let _scroll: i32 = ui_node(&window.*.ui, key + 2, NodeKind.Scroll, root,
+        rect(16, 64, 120, 24), theme_surface(), semantics(Role.Group, "Feed", "", "feed"),
+        "", Action{ .id = 0 });
+    let _field: i32 = ui_text_field_control(&window.*.ui, key + 3, root,
+        rect(16, 92, 120, 44), "Input", "", 2);
+    ui_end(&window.*.ui);
+}
+
+fn app_test_wayland_poll_frame(app: *App, server_fd: i64, frame: *WireBuffer) i32 {
+    let expected: i64 = len[u8](frame.*.bytes) as i64;
+    let sent: i64 = linux_send_wire(server_fd, frame);
+    wire_free(frame);
+    if (sent != expected) { return 0; }
+    return app_poll(app, 100);
+}
+
+fn app_test_wayland_send_frame(server_fd: i64, frame: *WireBuffer) i32 {
+    let expected: i64 = len[u8](frame.*.bytes) as i64;
+    let sent: i64 = linux_send_wire(server_fd, frame);
+    wire_free(frame);
+    if (sent == expected) { return 1; }
+    return 0;
+}
+
+fn app_test_wayland_keymap(app: *App, server_fd: i64, source: []u8,
+    terminal_nuls: t27) i32 {
+    if (terminal_nuls < 0 || terminal_nuls > 2) { return 0; }
+    let memory: LinuxSharedMemory = linux_shared_memory_create(
+        (source.len as t27 + terminal_nuls) as i64);
+    if (memory.valid == 0) { return 0; }
+    let i: i32 = 0;
+    while (i < source.len) {
+        linux_shared_memory_set_byte(&memory, i as i64, source[i] as t9);
+        i = i + 1;
+    }
+    let terminal_i: t27 = 0;
+    while (terminal_i < terminal_nuls) {
+        linux_shared_memory_set_byte(&memory, (source.len as t27 + terminal_i) as i64, 0);
+        terminal_i = terminal_i + 1;
+    }
+    let frame: WireBuffer = wayland_keyboard_keymap_event(app.*.wayland.keyboard_id,
+        wayland_keyboard_keymap_format_xkb_v1(), source.len as t27 + terminal_nuls);
+    let expected: i64 = len[u8](frame.bytes) as i64;
+    let sent: i64 = linux_send_wire_fd(server_fd, &frame, memory.fd);
+    wire_free(&frame); linux_shared_memory_free(&memory);
+    if (sent != expected) { return 0; }
+    return app_poll(app, 100);
+}
+
+fn app_test_wayland_send_keymap(server_fd: i64, keyboard_id: t27,
+    source: []u8) i32 {
+    let memory: LinuxSharedMemory = linux_shared_memory_create(
+        (source.len + 1) as i64);
+    if (memory.valid == 0) { return 0; }
+    let i: i32 = 0;
+    while (i < source.len) {
+        linux_shared_memory_set_byte(&memory, i as i64, source[i] as t9);
+        i = i + 1;
+    }
+    linux_shared_memory_set_byte(&memory, source.len as i64, 0);
+    let frame: WireBuffer = wayland_keyboard_keymap_event(keyboard_id,
+        wayland_keyboard_keymap_format_xkb_v1(), (source.len + 1) as t27);
+    let expected: i64 = len[u8](frame.bytes) as i64;
+    let sent: i64 = linux_send_wire_fd(server_fd, &frame, memory.fd);
+    wire_free(&frame); linux_shared_memory_free(&memory);
+    if (sent == expected) { return 1; }
+    return 0;
+}
+
+// Test-only malicious ancillary sender. Production remains limited to the
+// single-descriptor transport API; this proves that a rejected replacement
+// cannot leave an older keymap authoritative in the application.
+fn app_test_wayland_send_many(socket_fd: i64, input: *WireBuffer,
+    fds: *ArrayList[i64]) i64 {
+    let packed: LinuxByteBuffer = linux_pack_wire(input);
+    let count: i32 = len[i64](fds.*);
+    if (socket_fd < 0 || packed.len < 1 || count < 1 || count > 16) {
+        linux_buffer_free(&packed); return 0 - 22;
+    }
+    let iovec: LinuxByteBuffer = linux_buffer_new(16);
+    linux_buffer_set_u64(&iovec, 0, packed.words.data as i64);
+    linux_buffer_set_u64(&iovec, 8, packed.len as i64);
+    let cmsg_len: i64 = 16 + (count as i64) * 4;
+    let control_len: i32 = linux_cmsg_align(cmsg_len) as i32;
+    let control: LinuxByteBuffer = linux_buffer_new(control_len);
+    linux_buffer_set_u64(&control, 0, cmsg_len);
+    linux_buffer_set_u32(&control, 8, 1); linux_buffer_set_u32(&control, 12, 1);
+    let fd_i: i32 = 0;
+    while (fd_i < count) {
+        linux_buffer_set_u32(&control, 16 + fd_i * 4, get[i64](fds.*, fd_i));
+        fd_i = fd_i + 1;
+    }
+    control.len = control_len;
+    let message: LinuxByteBuffer = linux_buffer_new(56);
+    linux_buffer_zero_storage(&message);
+    linux_buffer_set_u64(&message, 16, iovec.words.data as i64);
+    linux_buffer_set_u64(&message, 24, 1);
+    linux_buffer_set_u64(&message, 32, control.words.data as i64);
+    linux_buffer_set_u64(&message, 40, control_len as i64);
+    message.len = 56;
+    let sent: i64 = _zag_raw_syscall(linux_sys_sendmsg(), socket_fd,
+        message.words.data as i64, 0, 0, 0, 0);
+    linux_buffer_free(&message); linux_buffer_free(&control);
+    linux_buffer_free(&iovec); linux_buffer_free(&packed);
+    return sent;
+}
+
+fn app_test_store_pending_keymap(app: *App, source: []u8) i32 {
+    let event: WaylandKeyboardEvent = wayland_empty_keyboard_event();
+    event.kind = WaylandKeyboardEventKind.Keymap;
+    event.keymap_format = wayland_keyboard_keymap_format_xkb_v1();
+    event.keymap_size = (source.len + 1) as t27;
+    event.keymap_bytes = make[u8](source.len + 1);
+    let i: i32 = 0;
+    while (i < source.len) { push[u8](&event.keymap_bytes, source[i]); i = i + 1; }
+    push[u8](&event.keymap_bytes, 0 as u8);
+    event.valid = 1;
+    let stored: i32 = wayland_connection_store_pending_keymap(&app.*.wayland, &event);
+    let transferred: i32 = 0;
+    if (event.keymap_bytes.len == 0 && event.keymap_bytes.cap == 0) { transferred = 1; }
+    wayland_keyboard_event_free(&event);
+    if (stored == 1 && transferred == 1) { return 1; }
+    return 0;
+}
+
+fn app_test_x11_key(kind: X11EventKind, window: t27, keycode: t27,
+    state: t27, sequence: t27, time: t27) X11Event {
+    let response: t27 = 2;
+    if (kind == X11EventKind.KeyUp) { response = 3; }
+    return X11Event{ .kind = kind, .response_type = response, .send_event = 0,
+        .sequence = sequence, .window = window, .time = time, .state = state,
+        .x = 0, .y = 0, .width = 0, .height = 0, .detail = keycode,
+        .message_type = 0, .data0 = 0, .mapping_request = 0,
+        .owner = 0, .requestor = 0, .selection_atom = 0,
+        .target_atom = 0, .property_atom = 0, .selection_generation = 0,
+        .mapping_first_keycode = 0, .mapping_keycode_count = 0, .valid = 1 };
+}
+
+fn app_test_x11_pointer(kind: X11EventKind, window: t27,
+    x: t27, y: t27, detail: t27) X11Event {
+    let response: t27 = 6;
+    if (kind == X11EventKind.PointerDown) { response = 4; }
+    else if (kind == X11EventKind.PointerUp) { response = 5; }
+    else if (kind == X11EventKind.Enter) { response = 7; }
+    else if (kind == X11EventKind.Leave) { response = 8; }
+    else if (kind == X11EventKind.FocusIn) { response = 9; }
+    else if (kind == X11EventKind.FocusOut) { response = 10; }
+    return X11Event{ .kind = kind, .response_type = response, .send_event = 0,
+        .sequence = 0, .window = window, .time = 0, .state = 0,
+        .x = x, .y = y, .width = 0, .height = 0, .detail = detail,
+        .message_type = 0, .data0 = 0, .mapping_request = 0,
+        .owner = 0, .requestor = 0, .selection_atom = 0,
+        .target_atom = 0, .property_atom = 0, .selection_generation = 0,
+        .mapping_first_keycode = 0, .mapping_keycode_count = 0, .valid = 1 };
+}
+
+fn app_test_x11_set_sequence(input: *WireBuffer, sequence: t27) void {
+    input.*.bytes.data[2] = (sequence % 256) as u8;
+    input.*.bytes.data[3] = ((sequence / 256) % 256) as u8;
+}
+
+fn app_test_x11_mapping_notify() X11Event {
+    return X11Event{ .kind = X11EventKind.MappingNotify, .response_type = 34,
+        .send_event = 0, .sequence = 90, .window = 0, .time = 0, .state = 0,
+        .x = 0, .y = 0, .width = 0, .height = 0, .detail = 0,
+        .message_type = 0, .data0 = 0, .mapping_request = 1,
+        .owner = 0, .requestor = 0, .selection_atom = 0,
+        .target_atom = 0, .property_atom = 0, .selection_generation = 0,
+        .mapping_first_keycode = 8, .mapping_keycode_count = 3, .valid = 1 };
+}
+
+fn main() i32 {
+    let failures: i32 = 0;
+    let app: App = app_new(BackendKind.Headless);
+    let app_caps: GraphicsCapabilities = app_graphics_capabilities(&app);
+    failures = failures + app_expect(app.running == 1 && app.backend.deterministic == 1, "headless app starts explicitly");
+    failures = failures + app_expect(app_caps.acceleration == AccelerationKind.HeadlessEmulation
+        && app_caps.physical_dispatch_proven == 0 && app_caps.deterministic == 1,
+        "headless app advertises truthful emulation capability");
+    failures = failures + app_expect(app_open_window(&app, 99, "Huge", 10000, 10000) == -1
+        && len[Window](app.windows) == 0,
+        "initial window dimensions are bounded before retained-surface allocation");
+    let first: i32 = app_open_window(&app, 1, "First", 160, 100);
+    let second: i32 = app_open_window(&app, 2, "Second", 120, 80);
+    let duplicate: i32 = app_open_window(&app, 2, "Duplicate", 81, 54);
+    failures = failures + app_expect(first == 0 && second == 1
+        && duplicate == -1 && len[Window](app.windows) == 2
+        && @strEq(app.error, "window key is already open") == 1,
+        "multiple windows require unique retained keys");
+    build_window(app_window(&app, first), 10, "First");
+    build_window(app_window(&app, second), 20, "Second");
+    failures = failures + app_expect(app_present_window(&app, first, 1) == 1, "first window presents");
+    failures = failures + app_expect(app_present_window(&app, second, 1) == 1, "second window presents");
+    failures = failures + app_expect(app_present_window(&app, first, 0) == 0, "idle window suppresses redraw");
+    failures = failures + app_expect(app_close_window(&app, first) == 1, "individual window closes");
+    failures = failures + app_expect(app_window(&app, first).*.open == 0 && app_window(&app, second).*.open == 1,
+        "window ownership remains independent");
+    app_shutdown(&app);
+    failures = failures + app_expect(app.running == 0, "app shutdown completes");
+
+    let wayland_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + app_expect(wayland_peer.ok == 1, "Wayland app event peer opens");
+    if (wayland_peer.ok == 1) {
+        let wayland_app: App = app_new(BackendKind.Headless);
+        let wayland_index: i32 = app_open_window(&wayland_app, 3, "Wayland events", 160, 100);
+        let wayland_second_index: i32 = app_open_window(&wayland_app, 4, "Wayland second", 160, 100);
+        wayland_app.backend.active = BackendKind.Wayland; wayland_app.backend.deterministic = 0;
+        wayland_app.wayland.fd = wayland_peer.first; wayland_app.wayland.connected = 1;
+        wayland_app.wayland.registry_ready = 1; wayland_app.wayland.wm_base_id = 5;
+        wayland_app.wayland.seat_id = 12; wayland_app.wayland.next_id = 13;
+        let wayland_window: *Window = app_window(&wayland_app, wayland_index);
+        let wayland_second_window: *Window = app_window(&wayland_app, wayland_second_index);
+        wayland_window.*.backend = BackendKind.Wayland;
+        wayland_window.*.wayland_native.surface_id = 7;
+        wayland_window.*.wayland_native.xdg_surface_id = 8;
+        wayland_window.*.wayland_native.toplevel_id = 9;
+        wayland_window.*.wayland_native.buffer_id = 11;
+        wayland_window.*.wayland_native.live = 1;
+        wayland_window.*.wayland_native.configured = 1;
+        wayland_window.*.wayland_native.buffer_busy = 1;
+        wayland_second_window.*.backend = BackendKind.Wayland;
+        wayland_second_window.*.wayland_native.surface_id = 17;
+        wayland_second_window.*.wayland_native.xdg_surface_id = 18;
+        wayland_second_window.*.wayland_native.toplevel_id = 19;
+        wayland_second_window.*.wayland_native.buffer_id = 21;
+        wayland_second_window.*.wayland_native.live = 1;
+        wayland_second_window.*.wayland_native.configured = 1;
+        failures = failures + app_expect(wayland_connection_register_surface(
+            &wayland_app.wayland, wayland_window.*.wayland_native.surface_id) == 1
+            && wayland_connection_register_surface(&wayland_app.wayland,
+                wayland_second_window.*.wayland_native.surface_id) == 1,
+            "Wayland fake windows register bounded native surface identities");
+        build_window(wayland_window, 30, "Wayland events");
+        build_window(wayland_second_window, 40, "Wayland second");
+
+        let seat_capabilities: WireBuffer = wayland_seat_capabilities_event(wayland_app.wayland.seat_id, 1);
+        let _seat_capabilities_sent: i64 = linux_send_wire(wayland_peer.second, &seat_capabilities);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1
+            && wayland_app.wayland.pointer_id == 13 && wayland_app.wayland.seat_has_pointer == 1,
+            "Wayland app accepts seat pointer capability");
+        let get_pointer: WireBuffer = wayland_receive_frame(wayland_peer.second, 100);
+        let get_pointer_frame: WaylandFrame = wayland_decode(&get_pointer, 0);
+        failures = failures + app_expect(get_pointer_frame.object_id == wayland_app.wayland.seat_id
+            && get_pointer_frame.opcode == 0
+            && wire_read_u32_le(&get_pointer, get_pointer_frame.payload_offset) == wayland_app.wayland.pointer_id,
+            "Wayland app requests the pointer object");
+
+        let enter_unknown: WireBuffer = wayland_pointer_enter_event(
+            wayland_app.wayland.pointer_id, 50, 999, 20, 20);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &enter_unknown) == 0
+            && wayland_app.wayland.pointer_focus_surface == 0,
+            "unknown Wayland pointer surface cannot poison connection focus");
+        let enter_first: WireBuffer = wayland_pointer_enter_event(wayland_app.wayland.pointer_id,
+            51, wayland_window.*.wayland_native.surface_id, 20, 20);
+        let _enter_first_sent: i64 = linux_send_wire(wayland_peer.second, &enter_first);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1
+            && wayland_window.*.ui.hovered_node == 1 && wayland_second_window.*.ui.hovered_node == -1,
+            "Wayland pointer enter routes hover by surface");
+        let button_down: WireBuffer = wayland_pointer_button_event(wayland_app.wayland.pointer_id,
+            52, 53, 272, 1);
+        let _button_down_sent: i64 = linux_send_wire(wayland_peer.second, &button_down);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1
+            && wayland_window.*.ui.pressed_node == 1,
+            "Wayland primary button press reaches the focused surface");
+        let button_up: WireBuffer = wayland_pointer_button_event(wayland_app.wayland.pointer_id,
+            54, 55, 272, 0);
+        let _button_up_sent: i64 = linux_send_wire(wayland_peer.second, &button_up);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1
+            && wayland_window.*.ui.pressed_node == -1
+            && len[t9](wayland_window.*.ui.emitted_actions) == 1,
+            "Wayland primary button release emits the retained action");
+        let secondary_down: WireBuffer = wayland_pointer_button_event(wayland_app.wayland.pointer_id,
+            56, 57, 273, 1);
+        let _secondary_down_sent: i64 = linux_send_wire(wayland_peer.second, &secondary_down);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1
+            && wayland_window.*.ui.pressed_node == -1,
+            "Wayland non-primary button remains normalized but does not activate controls");
+        let interrupted_down: WireBuffer = wayland_pointer_button_event(wayland_app.wayland.pointer_id,
+            58, 59, 272, 1);
+        let _interrupted_down_sent: i64 = linux_send_wire(wayland_peer.second, &interrupted_down);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1
+            && wayland_window.*.ui.pressed_node == 1,
+            "Wayland primary button can begin a second press");
+        let leave_first: WireBuffer = wayland_pointer_leave_event(wayland_app.wayland.pointer_id,
+            60, wayland_window.*.wayland_native.surface_id);
+        let _leave_first_sent: i64 = linux_send_wire(wayland_peer.second, &leave_first);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1
+            && wayland_window.*.ui.hovered_node == -1 && wayland_window.*.ui.pressed_node == -1,
+            "Wayland pointer leave clears hover and an interrupted press on its surface");
+
+        let enter_second: WireBuffer = wayland_pointer_enter_event(wayland_app.wayland.pointer_id,
+            61, wayland_second_window.*.wayland_native.surface_id, 20, 20);
+        let _enter_second_sent: i64 = linux_send_wire(wayland_peer.second, &enter_second);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1
+            && wayland_second_window.*.ui.hovered_node == 1,
+            "Wayland pointer focus moves to a second native surface");
+        let motion_second: WireBuffer = wayland_pointer_motion_event(wayland_app.wayland.pointer_id, 62, 20, 70);
+        let _motion_second_sent: i64 = linux_send_wire(wayland_peer.second, &motion_second);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1,
+            "Wayland pointer motion retains second-window routing");
+        let axis_second: WireBuffer = wayland_pointer_axis_event(wayland_app.wayland.pointer_id, 63, 0, 9);
+        let _axis_second_sent: i64 = linux_send_wire(wayland_peer.second, &axis_second);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1
+            && get[Node](wayland_second_window.*.ui.nodes, 2).scroll_y == 9,
+            "Wayland vertical axis scrolls the retained node under the pointer");
+        let leave_second: WireBuffer = wayland_pointer_leave_event(wayland_app.wayland.pointer_id,
+            64, wayland_second_window.*.wayland_native.surface_id);
+        let _leave_second_sent: i64 = linux_send_wire(wayland_peer.second, &leave_second);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1
+            && wayland_second_window.*.ui.hovered_node == -1,
+            "Wayland pointer leave clears hover on the second surface");
+
+        let reenter_second: WireBuffer = wayland_pointer_enter_event(wayland_app.wayland.pointer_id,
+            65, wayland_second_window.*.wayland_native.surface_id, 20, 20);
+        let _reenter_second_sent: i64 = linux_send_wire(wayland_peer.second, &reenter_second);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1
+            && wayland_second_window.*.ui.hovered_node == 1,
+            "Wayland pointer can re-enter before a device capability change");
+        let hotplug_down: WireBuffer = wayland_pointer_button_event(wayland_app.wayland.pointer_id,
+            66, 67, 272, 1);
+        let _hotplug_down_sent: i64 = linux_send_wire(wayland_peer.second, &hotplug_down);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1
+            && wayland_second_window.*.ui.pressed_node == 1,
+            "Wayland pointer hot-unplug scenario starts with retained capture");
+        let pointer_removed: WireBuffer = wayland_seat_capabilities_event(wayland_app.wayland.seat_id, 0);
+        let _pointer_removed_sent: i64 = linux_send_wire(wayland_peer.second, &pointer_removed);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1
+            && wayland_app.wayland.seat_has_pointer == 0 && wayland_app.wayland.pointer_id == 0
+            && wayland_second_window.*.ui.hovered_node == -1
+            && wayland_second_window.*.ui.pressed_node == -1,
+            "Wayland pointer capability removal cancels hover and retained capture");
+        let pointer_restored: WireBuffer = wayland_seat_capabilities_event(wayland_app.wayland.seat_id, 1);
+        let _pointer_restored_sent: i64 = linux_send_wire(wayland_peer.second, &pointer_restored);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1
+            && wayland_app.wayland.seat_has_pointer == 1 && wayland_app.wayland.pointer_id != 0,
+            "Wayland pointer capability restoration creates a new pointer");
+        let restored_get_pointer: WireBuffer = wayland_receive_frame(wayland_peer.second, 100);
+        failures = failures + app_expect(wayland_decode(&restored_get_pointer, 0).object_id
+            == wayland_app.wayland.seat_id
+            && wire_read_u32_le(&restored_get_pointer,
+                wayland_decode(&restored_get_pointer, 0).payload_offset) == wayland_app.wayland.pointer_id,
+            "Wayland app emits get_pointer after capability restoration");
+
+        let keyboard_added: WireBuffer = wayland_seat_capabilities_event(
+            wayland_app.wayland.seat_id, 3);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &keyboard_added) == 1
+            && wayland_app.wayland.seat_has_keyboard == 1
+            && wayland_app.wayland.keyboard_id != 0,
+            "Wayland app accepts keyboard capability without disturbing the pointer");
+        let get_keyboard: WireBuffer = wayland_receive_frame(wayland_peer.second, 100);
+        let get_keyboard_frame: WaylandFrame = wayland_decode(&get_keyboard, 0);
+        failures = failures + app_expect(get_keyboard_frame.valid == 1
+            && get_keyboard_frame.object_id == wayland_app.wayland.seat_id
+            && get_keyboard_frame.opcode == 1
+            && wire_read_u32_le(&get_keyboard, get_keyboard_frame.payload_offset)
+                == wayland_app.wayland.keyboard_id,
+            "Wayland app requests the v1 keyboard object");
+        wire_free(&get_keyboard);
+
+        let keyboard_source: []u8 = "<AD01>=24; <AC01>=38; <LFSH>=50; <LCTL>=37; <LALT>=64; <UNIC>=40; key <AD01> { [ q, Q ] }; key <AC01> { [ a, A ] }; key <LFSH> { [ Shift_L, Shift_L ] }; key <LCTL> { [ Control_L, Control_L ] }; key <LALT> { [ Alt_L, Alt_L ] }; key <UNIC> { [ U03A9, U03A9 ] };";
+        failures = failures + app_expect(app_test_wayland_keymap(&wayland_app,
+            wayland_peer.second, keyboard_source, 1) == 1
+            && wayland_app.wayland_keyboard_map.valid == 1,
+            "Wayland keymap FD installs an owned bounded map and strips one terminal NUL");
+        app_clear_wayland_keyboard_map(&wayland_app);
+        failures = failures + app_expect(app_test_store_pending_keymap(
+            &wayland_app, keyboard_source) == 1
+            && wayland_app.wayland.keyboard_pending_keymap_ready == 1,
+            "Wayland configure-time keymap transfers into connection-owned pending storage");
+        let _pending_map_poll: i32 = app_poll(&wayland_app, 0);
+        failures = failures + app_expect(wayland_app.wayland_keyboard_map.valid == 1
+            && wayland_app.wayland.keyboard_pending_keymap_ready == 0
+            && wayland_app.wayland.keyboard_pending_keymap_bytes.cap == 0
+            && wayland_app.wayland.keyboard_pending_authority_ready == 0,
+            "app polling takes, installs, and frees a configure-time pending keymap exactly once");
+        wayland_connection_publish_keyboard_authority(&wayland_app.wayland,
+            WaylandKeyboardAuthorityKind.Withdrawn);
+        let _pending_withdrawal_polled: i32 = app_poll(&wayland_app, 0);
+        failures = failures + app_expect(wayland_app.wayland_keyboard_map.valid == 0
+            && wayland_app.wayland.keyboard_pending_authority_ready == 0,
+            "configure-time pending no_keymap withdrawal clears installed authority exactly once");
+        failures = failures + app_expect(app_test_wayland_keymap(&wayland_app,
+            wayland_peer.second, keyboard_source, 1) == 1,
+            "Wayland map recovers after a pending withdrawal");
+        wayland_connection_publish_keyboard_authority(&wayland_app.wayland,
+            WaylandKeyboardAuthorityKind.Rejected);
+        let _pending_rejection_polled: i32 = app_poll(&wayland_app, 0);
+        failures = failures + app_expect(wayland_app.wayland_keyboard_map.valid == 0
+            && wayland_app.wayland.keyboard_pending_authority_ready == 0
+            && @strEq(wayland_app.error, "Wayland keymap authority was rejected") == 1,
+            "configure-time pending malformed keymap invalidates old authority exactly once");
+        failures = failures + app_expect(app_test_wayland_keymap(&wayland_app,
+            wayland_peer.second, keyboard_source, 1) == 1,
+            "Wayland map recovers after a pending rejection");
+
+        let no_pressed_keys: ArrayList[t27] = make[t27](0);
+        let keyboard_enter_unknown: WireBuffer = wayland_keyboard_enter_event(
+            wayland_app.wayland.keyboard_id, 69, 999, &no_pressed_keys);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &keyboard_enter_unknown) == 0
+            && wayland_app.wayland.keyboard_focus_surface == 0,
+            "unknown Wayland keyboard surface cannot poison connection focus");
+        let keyboard_enter_second: WireBuffer = wayland_keyboard_enter_event(
+            wayland_app.wayland.keyboard_id, 70,
+            wayland_second_window.*.wayland_native.surface_id, &no_pressed_keys);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &keyboard_enter_second) == 1
+            && wayland_app.wayland.keyboard_focus_surface
+                == wayland_second_window.*.wayland_native.surface_id,
+            "Wayland keyboard focus selects the second native surface");
+        let second_field: i32 = ui_find_key(&wayland_second_window.*.ui, 43);
+        let first_field: i32 = ui_find_key(&wayland_window.*.ui, 33);
+        failures = failures + app_expect(second_field >= 0 && first_field >= 0
+            && ui_set_focus(&wayland_second_window.*.ui, second_field) == 1,
+            "Wayland keyboard fixture focuses the second-window text field");
+
+        let a_down: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 71, 72, 30, 1);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &a_down) == 1
+            && @strEq(wayland_second_window.*.ui.nodes.data[second_field].text, "a") == 1,
+            "Wayland evdev code receives the protocol-specified XKB +8 conversion");
+        let actions_after_a: i32 = len[t9](wayland_second_window.*.ui.emitted_actions);
+        let a_up: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 73, 74, 30, 0);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &a_up) == 1
+            && len[t9](wayland_second_window.*.ui.emitted_actions) == actions_after_a
+            && @strEq(wayland_second_window.*.ui.nodes.data[second_field].text, "a") == 1,
+            "Wayland key release emits neither Press nor Input");
+
+        let shift_down: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 75, 76, 42, 1);
+        let shift_modifiers: WireBuffer = wayland_keyboard_modifiers_event(
+            wayland_app.wayland.keyboard_id, 77, 1, 0, 0, 0);
+        let q_shift_down: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 78, 79, 16, 1);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &shift_down) == 1
+            && app_test_wayland_poll_frame(&wayland_app,
+                wayland_peer.second, &shift_modifiers) == 1
+            && app_test_wayland_poll_frame(&wayland_app,
+                wayland_peer.second, &q_shift_down) == 1
+            && @strEq(wayland_second_window.*.ui.nodes.data[second_field].text, "aQ") == 1,
+            "Wayland shift role comes from the parsed modifier binding and selects level two");
+        let q_shift_up: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 80, 81, 16, 0);
+        let shift_up: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 82, 83, 42, 0);
+        let shift_clear: WireBuffer = wayland_keyboard_modifiers_event(
+            wayland_app.wayland.keyboard_id, 84, 0, 0, 0, 0);
+        let _q_shift_released: i32 = app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &q_shift_up);
+        let _shift_released: i32 = app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &shift_up);
+        let _shift_cleared: i32 = app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &shift_clear);
+
+        let unicode_down: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 85, 86, 32, 1);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &unicode_down) == 1
+            && @strEq(wayland_second_window.*.ui.nodes.data[second_field].text, "aQΩ") == 1,
+            "Wayland Unicode symbol reaches Input through owned UTF-8 storage");
+        let unicode_up: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 87, 88, 32, 0);
+        let _unicode_released: i32 = app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &unicode_up);
+
+        let control_down: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 89, 90, 29, 1);
+        let control_modifiers: WireBuffer = wayland_keyboard_modifiers_event(
+            wayland_app.wayland.keyboard_id, 91, 2, 0, 0, 0);
+        let control_a_down: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 92, 93, 30, 1);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &control_down) == 1
+            && app_test_wayland_poll_frame(&wayland_app,
+                wayland_peer.second, &control_modifiers) == 1
+            && app_test_wayland_poll_frame(&wayland_app,
+                wayland_peer.second, &control_a_down) == 1
+            && @strEq(wayland_second_window.*.ui.nodes.data[second_field].text, "aQΩ") == 1
+            && locator_has_selection(&wayland_second_window.*.ui,
+                locate_key(&wayland_second_window.*.ui, 43), 0, 3) == 1,
+            "Wayland Control+A delivers semantic Press first and suppresses printable Input");
+        let control_a_up: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 94, 95, 30, 0);
+        let control_up: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 96, 97, 29, 0);
+        let control_clear: WireBuffer = wayland_keyboard_modifiers_event(
+            wayland_app.wayland.keyboard_id, 98, 0, 0, 0, 0);
+        let _control_a_released: i32 = app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &control_a_up);
+        let _control_released: i32 = app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &control_up);
+        let _control_cleared: i32 = app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &control_clear);
+
+        let alt_down: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 99, 100, 56, 1);
+        let alt_modifiers: WireBuffer = wayland_keyboard_modifiers_event(
+            wayland_app.wayland.keyboard_id, 101, 4, 0, 0, 0);
+        let alt_q_down: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 102, 103, 16, 1);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &alt_down) == 1
+            && app_test_wayland_poll_frame(&wayland_app,
+                wayland_peer.second, &alt_modifiers) == 1
+            && app_test_wayland_poll_frame(&wayland_app,
+                wayland_peer.second, &alt_q_down) == 1
+            && @strEq(wayland_second_window.*.ui.nodes.data[second_field].text, "aQΩ") == 1,
+            "Wayland Alt role is keysym-backed and suppresses printable Input");
+        let alt_q_up: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 104, 105, 16, 0);
+        let alt_up: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 106, 107, 56, 0);
+        let alt_clear: WireBuffer = wayland_keyboard_modifiers_event(
+            wayland_app.wayland.keyboard_id, 108, 0, 0, 0, 0);
+        let _alt_q_released: i32 = app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &alt_q_up);
+        let _alt_released: i32 = app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &alt_up);
+        let _alt_cleared: i32 = app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &alt_clear);
+
+        let keyboard_leave_second: WireBuffer = wayland_keyboard_leave_event(
+            wayland_app.wayland.keyboard_id, 109,
+            wayland_second_window.*.wayland_native.surface_id);
+        let _keyboard_left_second: i32 = app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &keyboard_leave_second);
+        let keyboard_enter_first: WireBuffer = wayland_keyboard_enter_event(
+            wayland_app.wayland.keyboard_id, 110,
+            wayland_window.*.wayland_native.surface_id, &no_pressed_keys);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &keyboard_enter_first) == 1
+            && ui_set_focus(&wayland_window.*.ui, first_field) == 1,
+            "Wayland keyboard focus moves independently to the first surface");
+        let first_q_down: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 111, 112, 16, 1);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &first_q_down) == 1
+            && @strEq(wayland_window.*.ui.nodes.data[first_field].text, "q") == 1
+            && @strEq(wayland_second_window.*.ui.nodes.data[second_field].text, "aQΩ") == 1,
+            "Wayland key Input routes only to the focused native surface");
+        let first_q_up: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 113, 114, 16, 0);
+        let _first_q_released: i32 = app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &first_q_up);
+
+        let malformed_source: []u8 = "<AD01>=24; key <AD01> { [ unknown_symbol, Q ] };";
+        failures = failures + app_expect(app_test_wayland_keymap(&wayland_app,
+            wayland_peer.second, malformed_source, 1) == 0
+            && wayland_app.wayland_keyboard_map.valid == 0,
+            "malformed Wayland replacement invalidates the old map instead of retaining stale text authority");
+        let stale_q_down: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 115, 116, 16, 1);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &stale_q_down) == 0
+            && @strEq(wayland_window.*.ui.nodes.data[first_field].text, "q") == 1,
+            "Wayland key press cannot use a stale map after malformed replacement");
+        let stale_q_up: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 117, 118, 16, 0);
+        let _stale_q_released: i32 = app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &stale_q_up);
+        failures = failures + app_expect(app_test_wayland_keymap(&wayland_app,
+            wayland_peer.second, keyboard_source, 1) == 1,
+            "Wayland accepts a fresh valid keymap after a rejected generation");
+        failures = failures + app_expect(app_test_wayland_keymap(&wayland_app,
+            wayland_peer.second, keyboard_source, 0) == 0
+            && wayland_app.wayland_keyboard_map.valid == 0,
+            "Wayland XKB-v1 keymap without its required terminal NUL invalidates old authority");
+        failures = failures + app_expect(app_test_wayland_keymap(&wayland_app,
+            wayland_peer.second, keyboard_source, 1) == 1,
+            "Wayland keymap recovers after a missing-terminator rejection");
+        failures = failures + app_expect(app_test_wayland_keymap(&wayland_app,
+            wayland_peer.second, keyboard_source, 2) == 0
+            && wayland_app.wayland_keyboard_map.valid == 0,
+            "Wayland XKB-v1 keymap with repeated terminal NUL remains malformed");
+        failures = failures + app_expect(app_test_wayland_keymap(&wayland_app,
+            wayland_peer.second, keyboard_source, 1) == 1,
+            "Wayland keymap recovers after a repeated-terminator rejection");
+
+        let ancillary_first: LinuxSharedMemory = linux_shared_memory_create(1);
+        let ancillary_second: LinuxSharedMemory = linux_shared_memory_create(1);
+        let ancillary_fds: ArrayList[i64] = make[i64](2);
+        let ancillary_frame: WireBuffer = wayland_keyboard_keymap_event(
+            wayland_app.wayland.keyboard_id, wayland_keyboard_keymap_format_xkb_v1(),
+            keyboard_source.len as t27 + 1);
+        let ancillary_sent: i64 = (0 as i64) - 1;
+        if (ancillary_first.valid == 1 && ancillary_second.valid == 1) {
+            push[i64](&ancillary_fds, ancillary_first.fd);
+            push[i64](&ancillary_fds, ancillary_second.fd);
+            ancillary_sent = app_test_wayland_send_many(wayland_peer.second,
+                &ancillary_frame, &ancillary_fds);
+        }
+        let ancillary_polled: i32 = 0;
+        if (ancillary_sent == len[u8](ancillary_frame.bytes)) {
+            ancillary_polled = app_poll(&wayland_app, 100);
+        }
+        wire_free(&ancillary_frame); free[i64](&ancillary_fds);
+        linux_shared_memory_free(&ancillary_first);
+        linux_shared_memory_free(&ancillary_second);
+        failures = failures + app_expect(ancillary_polled == 0
+            && wayland_app.wayland_keyboard_map.valid == 0,
+            "Wayland ancillary-invalid keymap replacement clears stale authority");
+        failures = failures + app_expect(app_test_wayland_keymap(&wayland_app,
+            wayland_peer.second, keyboard_source, 1) == 1,
+            "Wayland keymap recovers after ancillary replacement rejection");
+
+        let no_keymap: WireBuffer = wayland_keyboard_keymap_event(
+            wayland_app.wayland.keyboard_id, 0, 0);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &no_keymap) == 1
+            && wayland_app.wayland_keyboard_map.valid == 0,
+            "Wayland no_keymap explicitly withdraws text authority without a raw-code fallback");
+        let withdrawn_q_down: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 132, 133, 16, 1);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &withdrawn_q_down) == 0
+            && @strEq(wayland_window.*.ui.nodes.data[first_field].text, "q") == 1,
+            "Wayland key press remains inert after no_keymap withdrawal");
+        let withdrawn_q_up: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 134, 135, 16, 0);
+        let _withdrawn_q_released: i32 = app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &withdrawn_q_up);
+        failures = failures + app_expect(app_test_wayland_keymap(&wayland_app,
+            wayland_peer.second, keyboard_source, 1) == 1,
+            "Wayland keymap recovers after explicit no_keymap withdrawal");
+
+        let unsupported_group: WireBuffer = wayland_keyboard_modifiers_event(
+            wayland_app.wayland.keyboard_id, 119, 0, 0, 0, 1);
+        let _group_set: i32 = app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &unsupported_group);
+        let grouped_q_down: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 120, 121, 16, 1);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &grouped_q_down) == 0
+            && @strEq(wayland_window.*.ui.nodes.data[first_field].text, "q") == 1,
+            "unsupported Wayland group fails closed without guessing a layout");
+        let grouped_q_up: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 122, 123, 16, 0);
+        let _grouped_q_released: i32 = app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &grouped_q_up);
+        let group_clear: WireBuffer = wayland_keyboard_modifiers_event(
+            wayland_app.wayland.keyboard_id, 124, 0, 0, 0, 0);
+        let _group_cleared: i32 = app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &group_clear);
+
+        let old_keyboard_id: t27 = wayland_app.wayland.keyboard_id;
+        let keyboard_removed: WireBuffer = wayland_seat_capabilities_event(
+            wayland_app.wayland.seat_id, 1);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &keyboard_removed) == 1
+            && wayland_app.wayland.keyboard_id == 0
+            && wayland_app.wayland.keyboard_focus_surface == 0
+            && wayland_app.wayland_keyboard_map.valid == 0
+            && wayland_app.wayland.keyboard_pending_authority_ready == 0,
+            "Wayland keyboard capability loss clears focus, pressed state, and owned keymap authority");
+        let stale_object_key: WireBuffer = wayland_keyboard_key_event(
+            old_keyboard_id, 125, 126, 16, 1);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &stale_object_key) == 0,
+            "retired Wayland keyboard object cannot dispatch after capability loss");
+
+        let keyboard_restored: WireBuffer = wayland_seat_capabilities_event(
+            wayland_app.wayland.seat_id, 3);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &keyboard_restored) == 1
+            && wayland_app.wayland.keyboard_id != 0
+            && wayland_app.wayland.keyboard_id != old_keyboard_id,
+            "Wayland keyboard capability restoration allocates a fresh object identity");
+        let restored_get_keyboard: WireBuffer = wayland_receive_frame(wayland_peer.second, 100);
+        wire_free(&restored_get_keyboard);
+        let restored_enter_first: WireBuffer = wayland_keyboard_enter_event(
+            wayland_app.wayland.keyboard_id, 127,
+            wayland_window.*.wayland_native.surface_id, &no_pressed_keys);
+        let _restored_entered: i32 = app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &restored_enter_first);
+        let no_map_q_down: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 128, 129, 16, 1);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &no_map_q_down) == 0
+            && @strEq(wayland_window.*.ui.nodes.data[first_field].text, "q") == 1,
+            "restored Wayland keyboard remains inert until a fresh keymap arrives");
+        let no_map_q_up: WireBuffer = wayland_keyboard_key_event(
+            wayland_app.wayland.keyboard_id, 130, 131, 16, 0);
+        let _no_map_q_released: i32 = app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &no_map_q_up);
+        free[t27](&no_pressed_keys);
+
+        let malformed_ping_payload: WireBuffer = wire_new(8);
+        wire_push_u32_le(&malformed_ping_payload, 43);
+        wire_push_u32_le(&malformed_ping_payload, 99);
+        let malformed_ping: WireBuffer = wayland_encode(5, 0, &malformed_ping_payload);
+        wire_free(&malformed_ping_payload);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &malformed_ping) == 0,
+            "Wayland ping rejects trailing payload instead of emitting a pong");
+        let ping: WireBuffer = wayland_u32_request(5, 0, 44);
+        let _ping_sent: i64 = linux_send_wire(wayland_peer.second, &ping);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1, "Wayland app answers compositor ping");
+        let pong: WireBuffer = wayland_receive_frame(wayland_peer.second, 100);
+        failures = failures + app_expect(wayland_decode(&pong, 0).object_id == 5
+            && wayland_decode(&pong, 0).opcode == 3, "Wayland app emits pong");
+
+        let negative_toplevel: WireBuffer = wayland_xdg_toplevel_configure(
+            9, 4294967295, 90);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &negative_toplevel) == 0
+            && wayland_window.*.width == 160 && wayland_window.*.height == 100
+            && wayland_window.*.surface.width == 160,
+            "negative signed Wayland configure width cannot reach surface allocation");
+        let huge_toplevel: WireBuffer = wayland_xdg_toplevel_configure(9, 10000, 10000);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &huge_toplevel) == 0
+            && wayland_window.*.width == 160 && wayland_window.*.height == 100
+            && wayland_window.*.surface.pixels.len == 160 * 100 * 4,
+            "huge-area Wayland configure is bounded before retained-surface mutation");
+        let malformed_toplevel_payload: WireBuffer = wire_new(8);
+        wire_push_u32_le(&malformed_toplevel_payload, 140);
+        wire_push_u32_le(&malformed_toplevel_payload, 90);
+        let malformed_toplevel: WireBuffer = wayland_encode(9, 0,
+            &malformed_toplevel_payload);
+        wire_free(&malformed_toplevel_payload);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &malformed_toplevel) == 0
+            && wayland_window.*.width == 160 && wayland_window.*.height == 100,
+            "Wayland toplevel configure requires the complete states array envelope");
+        let resized: WireBuffer = wayland_xdg_toplevel_configure(9, 140, 90);
+        let _resize_sent: i64 = linux_send_wire(wayland_peer.second, &resized);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1
+            && wayland_window.*.width == 140 && wayland_window.*.height == 90
+            && wayland_window.*.surface.width == 140 && wayland_window.*.needs_present == 1,
+            "Wayland configure resizes retained window and surface");
+
+        wayland_window.*.wayland_native.configured = 0;
+        let malformed_surface_payload: WireBuffer = wire_new(8);
+        wire_push_u32_le(&malformed_surface_payload, 45);
+        wire_push_u32_le(&malformed_surface_payload, 99);
+        let malformed_surface: WireBuffer = wayland_encode(8, 0,
+            &malformed_surface_payload);
+        wire_free(&malformed_surface_payload);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &malformed_surface) == 0
+            && wayland_window.*.wayland_native.configured == 0,
+            "Wayland xdg_surface configure rejects trailing payload and emits no acknowledgement");
+        let configure: WireBuffer = wayland_xdg_surface_configure(8, 45);
+        let _configure_sent: i64 = linux_send_wire(wayland_peer.second, &configure);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1, "Wayland surface configure is accepted");
+        let ack: WireBuffer = wayland_receive_frame(wayland_peer.second, 100);
+        failures = failures + app_expect(wayland_decode(&ack, 0).object_id == 8
+            && wayland_decode(&ack, 0).opcode == 4, "Wayland configure acknowledgement is emitted");
+
+        let malformed_release_payload: WireBuffer = wire_new(4);
+        wire_push_u32_le(&malformed_release_payload, 1);
+        let malformed_release: WireBuffer = wayland_encode(11, 0,
+            &malformed_release_payload);
+        wire_free(&malformed_release_payload);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &malformed_release) == 0
+            && wayland_window.*.wayland_native.buffer_busy == 1,
+            "Wayland buffer release rejects non-empty payload without releasing ownership");
+        let release: WireBuffer = wayland_empty_request(11, 0);
+        let _release_sent: i64 = linux_send_wire(wayland_peer.second, &release);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1
+            && wayland_window.*.wayland_native.buffer_busy == 0, "Wayland buffer release reaches its window");
+
+        let malformed_close_payload: WireBuffer = wire_new(4);
+        wire_push_u32_le(&malformed_close_payload, 1);
+        let malformed_close: WireBuffer = wayland_encode(9, 1,
+            &malformed_close_payload);
+        wire_free(&malformed_close_payload);
+        failures = failures + app_expect(app_test_wayland_poll_frame(&wayland_app,
+            wayland_peer.second, &malformed_close) == 0
+            && wayland_window.*.open == 1,
+            "Wayland toplevel close rejects trailing payload without closing the window");
+        let close: WireBuffer = wayland_empty_request(9, 1);
+        let _close_sent: i64 = linux_send_wire(wayland_peer.second, &close);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1
+            && wayland_app.running == 1 && wayland_window.*.open == 0
+            && wayland_second_window.*.open == 1
+            && wayland_app.wayland.keyboard_focus_surface == 0,
+            "Wayland close clears matching focus and preserves another open window");
+        let close_second: WireBuffer = wayland_empty_request(19, 1);
+        let _close_second_sent: i64 = linux_send_wire(wayland_peer.second, &close_second);
+        failures = failures + app_expect(app_poll(&wayland_app, 100) == 1
+            && wayland_app.running == 0 && wayland_second_window.*.open == 0,
+            "Wayland close stops the app after the last window");
+        app_shutdown(&wayland_app);
+        let _close_wayland_server: i64 = linux_close(wayland_peer.second);
+    }
+
+    let interleaved_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + app_expect(interleaved_peer.ok == 1,
+        "Wayland ordered app-wait fixture opens a Unix socketpair");
+    if (interleaved_peer.ok == 1) {
+        let interleaved_app: App = app_new(BackendKind.Headless);
+        let retained_index: i32 = app_open_window(&interleaved_app, 70,
+            "Retained during open", 64, 64);
+        let retained_window: *Window = app_window(&interleaved_app, retained_index);
+        interleaved_app.backend.active = BackendKind.Wayland;
+        interleaved_app.backend.connected = 1;
+        interleaved_app.backend.deterministic = 0;
+        interleaved_app.wayland.fd = interleaved_peer.first;
+        interleaved_app.wayland.connected = 1;
+        interleaved_app.wayland.registry_ready = 1;
+        interleaved_app.wayland.compositor_id = 4;
+        interleaved_app.wayland.wm_base_id = 5;
+        interleaved_app.wayland.seat_id = 6;
+        interleaved_app.wayland.seat_version = 3;
+        interleaved_app.wayland.pointer_id = 10;
+        interleaved_app.wayland.pointer_version = 3;
+        interleaved_app.wayland.keyboard_id = 11;
+        interleaved_app.wayland.keyboard_version = 3;
+        interleaved_app.wayland.seat_capabilities = 3;
+        interleaved_app.wayland.seat_has_pointer = 1;
+        interleaved_app.wayland.seat_has_keyboard = 1;
+        interleaved_app.wayland.next_id = 100;
+        retained_window.*.backend = BackendKind.Wayland;
+        retained_window.*.wayland_native.surface_id = 70;
+        retained_window.*.wayland_native.xdg_surface_id = 71;
+        retained_window.*.wayland_native.toplevel_id = 72;
+        retained_window.*.wayland_native.live = 1;
+        retained_window.*.wayland_native.configured = 1;
+        failures = failures + app_expect(wayland_connection_register_surface(
+            &interleaved_app.wayland, 70) == 1,
+            "retained app window registers before deferred native input");
+        build_window(retained_window, 700, "Retained during open");
+        let retained_field: i32 = ui_find_key(&retained_window.*.ui, 703);
+        let no_interleaved_keys: ArrayList[t27] = make[t27](0);
+        let retained_enter: WireBuffer = wayland_pointer_enter_event(10, 1, 70, 20, 20);
+        let retained_down: WireBuffer = wayland_pointer_button_event(10, 2, 3, 272, 1);
+        let retained_keyboard_enter: WireBuffer = wayland_keyboard_enter_event(
+            11, 4, 70, &no_interleaved_keys);
+        failures = failures + app_expect(app_test_wayland_poll_frame(
+            &interleaved_app, interleaved_peer.second, &retained_enter) == 1
+            && app_test_wayland_poll_frame(&interleaved_app,
+                interleaved_peer.second, &retained_down) == 1
+            && ui_set_focus(&retained_window.*.ui, retained_field) == 1
+            && app_test_wayland_poll_frame(&interleaved_app,
+                interleaved_peer.second, &retained_keyboard_enter) == 1
+            && retained_window.*.ui.pressed_node >= 0
+            && interleaved_app.wayland.keyboard_focus_surface == 70,
+            "retained pointer press and keyboard focus exist before window2 wait");
+
+        let queued_ok: i32 = 1;
+        let retained_partial_height: WireBuffer = wayland_xdg_toplevel_configure(
+            72, 0, 96);
+        queued_ok = queued_ok * app_test_wayland_send_frame(interleaved_peer.second,
+            &retained_partial_height);
+        let retained_partial_width: WireBuffer = wayland_xdg_toplevel_configure(
+            72, 80, 0);
+        queued_ok = queued_ok * app_test_wayland_send_frame(interleaved_peer.second,
+            &retained_partial_width);
+        let retained_motion: WireBuffer = wayland_pointer_motion_event(10, 5, 20, 70);
+        queued_ok = queued_ok * app_test_wayland_send_frame(interleaved_peer.second,
+            &retained_motion);
+        let map_a: []u8 = "<AD01>=24; key <AD01> { [ q, q ] };";
+        let map_b: []u8 = "<AD01>=24; key <AD01> { [ U03A9, U03A9 ] };";
+        queued_ok = queued_ok * app_test_wayland_send_keymap(
+            interleaved_peer.second, 11, map_a);
+        let key_a_down: WireBuffer = wayland_keyboard_key_event(11, 6, 7, 16, 1);
+        let key_a_up: WireBuffer = wayland_keyboard_key_event(11, 8, 9, 16, 0);
+        queued_ok = queued_ok * app_test_wayland_send_frame(interleaved_peer.second,
+            &key_a_down);
+        queued_ok = queued_ok * app_test_wayland_send_frame(interleaved_peer.second,
+            &key_a_up);
+        queued_ok = queued_ok * app_test_wayland_send_keymap(
+            interleaved_peer.second, 11, map_b);
+        let key_b_down: WireBuffer = wayland_keyboard_key_event(11, 10, 11, 16, 1);
+        let key_b_up: WireBuffer = wayland_keyboard_key_event(11, 12, 13, 16, 0);
+        queued_ok = queued_ok * app_test_wayland_send_frame(interleaved_peer.second,
+            &key_b_down);
+        queued_ok = queued_ok * app_test_wayland_send_frame(interleaved_peer.second,
+            &key_b_up);
+        let deferred_capability_loss: WireBuffer = wayland_seat_capabilities_event(6, 0);
+        queued_ok = queued_ok * app_test_wayland_send_frame(interleaved_peer.second,
+            &deferred_capability_loss);
+        let retained_close: WireBuffer = wayland_empty_request(72, 1);
+        queued_ok = queued_ok * app_test_wayland_send_frame(interleaved_peer.second,
+            &retained_close);
+        // The opening window sees both legal partial-axis forms before its
+        // xdg_surface configure. Native state must resolve to 90x80 atomically.
+        let target_partial_width: WireBuffer = wayland_xdg_toplevel_configure(
+            102, 90, 0);
+        let target_partial_height: WireBuffer = wayland_xdg_toplevel_configure(
+            102, 0, 80);
+        let target_configure: WireBuffer = wayland_xdg_surface_configure(101, 14);
+        queued_ok = queued_ok * app_test_wayland_send_frame(interleaved_peer.second,
+            &target_partial_width);
+        queued_ok = queued_ok * app_test_wayland_send_frame(interleaved_peer.second,
+            &target_partial_height);
+        queued_ok = queued_ok * app_test_wayland_send_frame(interleaved_peer.second,
+            &target_configure);
+
+        let opened_during_events: i32 = app_open_window(&interleaved_app, 71,
+            "Opened during events", 64, 64);
+        let opened_window: *Window = app_window(&interleaved_app, opened_during_events);
+        failures = failures + app_expect(queued_ok == 1 && opened_during_events == 1
+            && opened_window != null as *Window
+            && opened_window.*.width == 90 && opened_window.*.height == 80
+            && opened_window.*.surface.width == 90
+            && opened_window.*.surface.height == 80,
+            "window2 open resolves both partial-zero axes within shared surface bounds");
+
+        failures = failures + app_expect(app_poll(&interleaved_app, 0) == 1
+            && retained_window.*.width == 64 && retained_window.*.height == 96
+            && retained_window.*.surface.width == 64
+            && retained_window.*.surface.height == 96,
+            "pending window1 zero-width configure drains before newer socket input");
+        failures = failures + app_expect(app_poll(&interleaved_app, 0) == 1
+            && retained_window.*.width == 80 && retained_window.*.height == 96
+            && retained_window.*.surface.width == 80
+            && retained_window.*.surface.height == 96,
+            "pending window1 zero-height configure resolves against current dimensions");
+        failures = failures + app_expect(app_poll(&interleaved_app, 0) == 1,
+            "pending pointer input drains in native stream order");
+        failures = failures + app_expect(app_poll(&interleaved_app, 0) == 1
+            && interleaved_app.wayland_keyboard_map.valid == 1,
+            "pending map A authority installs at its exact FIFO position");
+        failures = failures + app_expect(app_poll(&interleaved_app, 0) == 1
+            && @strEq(retained_window.*.ui.nodes.data[retained_field].text, "q") == 1,
+            "key A uses map A instead of a later collapsed authority");
+        failures = failures + app_expect(app_poll(&interleaved_app, 0) == 1,
+            "key A release drains without Press or Input");
+        failures = failures + app_expect(app_poll(&interleaved_app, 0) == 1
+            && interleaved_app.wayland_keyboard_map.valid == 1,
+            "pending map B authority replaces map A in FIFO order");
+        failures = failures + app_expect(app_poll(&interleaved_app, 0) == 1
+            && @strEq(retained_window.*.ui.nodes.data[retained_field].text, "qΩ") == 1,
+            "key B uses map B after map A key delivery");
+        failures = failures + app_expect(app_poll(&interleaved_app, 0) == 1,
+            "key B release drains without duplicate text");
+        failures = failures + app_expect(app_poll(&interleaved_app, 0) == 1
+            && retained_window.*.ui.pressed_node == -1
+            && interleaved_app.wayland.pointer_focus_surface == 0
+            && interleaved_app.wayland.keyboard_focus_surface == 0
+            && interleaved_app.wayland_keyboard_map.valid == 0,
+            "deferred seat loss cancels retained press and withdraws keyboard authority");
+        failures = failures + app_expect(app_poll(&interleaved_app, 0) == 1
+            && retained_window.*.open == 0 && opened_window.*.open == 1
+            && interleaved_app.running == 1
+            && len[WaylandNativeQueuedFrame](interleaved_app.wayland.pending_frames) == 0,
+            "deferred close drains last while preserving the newly opened window");
+        free[t27](&no_interleaved_keys);
+        app_shutdown(&interleaved_app);
+        let _close_interleaved_server: i64 = linux_close(interleaved_peer.second);
+    }
+
+    let oversized_open_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + app_expect(oversized_open_peer.ok == 1,
+        "Wayland oversized-open fixture opens a Unix socketpair");
+    if (oversized_open_peer.ok == 1) {
+        let oversized_open_app: App = app_new(BackendKind.Headless);
+        oversized_open_app.backend.active = BackendKind.Wayland;
+        oversized_open_app.backend.connected = 1;
+        oversized_open_app.wayland.fd = oversized_open_peer.first;
+        oversized_open_app.wayland.connected = 1;
+        oversized_open_app.wayland.registry_ready = 1;
+        oversized_open_app.wayland.compositor_id = 4;
+        oversized_open_app.wayland.wm_base_id = 5;
+        oversized_open_app.wayland.next_id = 200;
+        let oversized_initial: WireBuffer = wayland_xdg_toplevel_configure(
+            202, 10000, 10000);
+        let oversized_initial_sent: i32 = app_test_wayland_send_frame(
+            oversized_open_peer.second, &oversized_initial);
+        let oversized_initial_index: i32 = app_open_window(&oversized_open_app,
+            200, "Rejected native size", 64, 64);
+        failures = failures + app_expect(oversized_initial_sent == 1
+            && oversized_initial_index == -1
+            && len[Window](oversized_open_app.windows) == 0
+            && oversized_open_app.running == 0
+            && oversized_open_app.backend.connected == 0
+            && oversized_open_app.wayland.connected == 0
+            && len[t27](oversized_open_app.wayland.owned_surface_ids) == 0,
+            "oversized initial configure retires transport and frees unmounted app state");
+        app_shutdown(&oversized_open_app);
+        let _close_oversized_server: i64 = linux_close(oversized_open_peer.second);
+    }
+
+    let terminal_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + app_expect(terminal_peer.ok == 1,
+        "Wayland terminal-frame app peer opens");
+    if (terminal_peer.ok == 1) {
+        let terminal_app: App = app_new(BackendKind.Headless);
+        let terminal_index: i32 = app_open_window(&terminal_app, 60,
+            "Retired Wayland", 64, 64);
+        let terminal_window: *Window = app_window(&terminal_app, terminal_index);
+        build_window(terminal_window, 600, "Retired Wayland");
+        terminal_window.*.backend = BackendKind.Wayland;
+        terminal_window.*.wayland_native.surface_id = 61;
+        terminal_window.*.wayland_native.xdg_surface_id = 62;
+        terminal_window.*.wayland_native.toplevel_id = 63;
+        terminal_window.*.wayland_native.buffer_id = 64;
+        terminal_window.*.wayland_native.live = 1;
+        terminal_window.*.wayland_native.configured = 1;
+        terminal_window.*.wayland_native.memory = linux_shared_memory_create(16);
+        terminal_app.backend.active = BackendKind.Wayland;
+        terminal_app.backend.connected = 1;
+        terminal_app.wayland.fd = terminal_peer.first;
+        terminal_app.wayland.connected = 1;
+        terminal_app.wayland_keyboard_map = keyboard_map_parse_xkb_subset(
+            "<AD01>=24; key <AD01> { [ q, Q ] };", 8);
+        let partial_header: WireBuffer = wire_new(4);
+        wire_push_u32_le(&partial_header, 27);
+        let terminal_sent: i64 = linux_send_wire(terminal_peer.second, &partial_header);
+        wire_free(&partial_header);
+        let _terminal_server_closed: i64 = linux_close(terminal_peer.second);
+        let terminal_polled: i32 = app_poll(&terminal_app, 100);
+        failures = failures + app_expect(terminal_sent == 4 && terminal_polled == 0
+            && terminal_app.running == 0 && terminal_app.backend.connected == 0
+            && terminal_app.wayland.connected == 0 && terminal_app.wayland.fd == 0 - 1
+            && terminal_app.wayland_keyboard_map.valid == 0
+            && terminal_app.error.len > 0
+            && terminal_window.*.wayland_native.memory.valid == 1,
+            "partial Wayland frame retires the backend and clears keymap authority before descriptor reuse");
+        let retired_close: i32 = app_close_window(&terminal_app, terminal_index);
+        failures = failures + app_expect(retired_close == 0
+            && terminal_window.*.open == 0 && terminal_window.*.wayland_native.live == 0
+            && terminal_window.*.wayland_native.memory.valid == 0
+            && terminal_window.*.surface.pixels.cap == 0
+            && terminal_window.*.ui.nodes.cap == 0,
+            "retired Wayland close reports protocol failure after reclaiming every local window resource");
+        app_shutdown(&terminal_app);
+    }
+
+    let send_failure_app: App = app_new(BackendKind.Headless);
+    send_failure_app.backend.active = BackendKind.Wayland;
+    send_failure_app.backend.connected = 1;
+    send_failure_app.wayland.connected = 1;
+    send_failure_app.wayland.fd = 0 - 1;
+    send_failure_app.wayland_keyboard_map = keyboard_map_parse_xkb_subset(
+        "<AD01>=24; key <AD01> { [ q, Q ] };", 8);
+    let failed_pong: WireBuffer = wayland_u32_request(5, 3, 44);
+    failures = failures + app_expect(app_send_wayland_request(
+        &send_failure_app, &failed_pong) == 0
+        && send_failure_app.running == 0 && send_failure_app.backend.connected == 0
+        && send_failure_app.wayland.connected == 0
+        && send_failure_app.wayland_keyboard_map.valid == 0
+        && @strEq(send_failure_app.error, "Wayland request write was incomplete") == 1,
+        "incomplete Wayland request retires app, backend, and keyboard authority");
+    app_shutdown(&send_failure_app);
+
+    let x11_pointer_app: App = app_new(BackendKind.Headless);
+    let x11_pointer_first_index: i32 = app_open_window(
+        &x11_pointer_app, 41, "X11 pointer first", 180, 140);
+    let x11_pointer_second_index: i32 = app_open_window(
+        &x11_pointer_app, 42, "X11 pointer second", 180, 140);
+    let x11_pointer_first: *Window = app_window(
+        &x11_pointer_app, x11_pointer_first_index);
+    let x11_pointer_second: *Window = app_window(
+        &x11_pointer_app, x11_pointer_second_index);
+    build_window(x11_pointer_first, 410, "X11 pointer first");
+    build_window(x11_pointer_second, 420, "X11 pointer second");
+    let x11_pointer_first_button: i32 = ui_find_key(&x11_pointer_first.*.ui, 411);
+    let x11_pointer_first_scroll: i32 = ui_find_key(&x11_pointer_first.*.ui, 412);
+    let x11_pointer_second_button: i32 = ui_find_key(&x11_pointer_second.*.ui, 421);
+    let x11_pointer_second_scroll: i32 = ui_find_key(&x11_pointer_second.*.ui, 422);
+    x11_pointer_app.backend.active = BackendKind.X11;
+    x11_pointer_app.backend.deterministic = 0;
+    x11_pointer_app.backend.connected = 1;
+    x11_pointer_app.x11.connected = 1;
+    x11_pointer_app.x11.authenticated = 1;
+    x11_pointer_first.*.backend = BackendKind.X11;
+    x11_pointer_first.*.native.window_id = 910;
+    x11_pointer_first.*.native.live = 0;
+    x11_pointer_second.*.backend = BackendKind.X11;
+    x11_pointer_second.*.native.window_id = 911;
+    x11_pointer_second.*.native.live = 0;
+    x11_pointer_first.*.needs_present = 0;
+    x11_pointer_second.*.needs_present = 0;
+    failures = failures + app_expect(x11_pointer_first_button >= 0
+        && x11_pointer_first_scroll >= 0 && x11_pointer_second_button >= 0
+        && x11_pointer_second_scroll >= 0,
+        "X11 pointer fixture resolves independent retained controls");
+
+    push[X11Event](&x11_pointer_app.x11.pending_events,
+        app_test_x11_pointer(X11EventKind.Enter, 910, 20, 20, 0));
+    failures = failures + app_expect(app_poll(&x11_pointer_app, 0) == 1
+        && x11_pointer_first.*.ui.hovered_node == x11_pointer_first_button
+        && x11_pointer_second.*.ui.hovered_node == -1
+        && x11_pointer_first.*.needs_present == 1,
+        "X11 Enter establishes hover only in its native window");
+    x11_pointer_first.*.needs_present = 0;
+    push[X11Event](&x11_pointer_app.x11.pending_events,
+        app_test_x11_pointer(X11EventKind.PointerMove, 910, 20, 70, 0));
+    failures = failures + app_expect(app_poll(&x11_pointer_app, 0) == 1
+        && x11_pointer_first.*.ui.hovered_node == -1
+        && x11_pointer_first.*.needs_present == 1,
+        "X11 Motion clears hover when server coordinates leave interactive nodes");
+
+    let x11_inert_buttons: ArrayList[t27] = make[t27](5);
+    push[t27](&x11_inert_buttons, 2); push[t27](&x11_inert_buttons, 3);
+    push[t27](&x11_inert_buttons, 6); push[t27](&x11_inert_buttons, 7);
+    push[t27](&x11_inert_buttons, 8);
+    let x11_inert_i: i32 = 0;
+    let x11_inert_ok: i32 = 1;
+    while (x11_inert_i < len[t27](x11_inert_buttons)) {
+        x11_pointer_first.*.needs_present = 0;
+        let x11_inert_detail: t27 = get[t27](x11_inert_buttons, x11_inert_i);
+        push[X11Event](&x11_pointer_app.x11.pending_events,
+            app_test_x11_pointer(X11EventKind.PointerDown, 910, 20, 20,
+                x11_inert_detail));
+        push[X11Event](&x11_pointer_app.x11.pending_events,
+            app_test_x11_pointer(X11EventKind.PointerUp, 910, 20, 20,
+                x11_inert_detail));
+        if (app_poll(&x11_pointer_app, 0) != 1
+            || app_poll(&x11_pointer_app, 0) != 1
+            || x11_pointer_first.*.ui.pressed_node != -1
+            || x11_pointer_first.*.ui.focused_node != -1
+            || len[t9](x11_pointer_first.*.ui.emitted_actions) != 0
+            || x11_pointer_first.*.needs_present != 0) { x11_inert_ok = 0; }
+        x11_inert_i = x11_inert_i + 1;
+    }
+    failures = failures + app_expect(x11_inert_ok == 1,
+        "X11 Button2, Button3, horizontal wheel, and unknown buttons stay inert");
+    free[t27](&x11_inert_buttons);
+
+    push[X11Event](&x11_pointer_app.x11.pending_events,
+        app_test_x11_pointer(X11EventKind.PointerDown, 910, 20, 70, 5));
+    failures = failures + app_expect(app_poll(&x11_pointer_app, 0) == 1
+        && x11_pointer_first.*.ui.nodes.data[x11_pointer_first_scroll].scroll_y == 9,
+        "X11 Button5 press is one downward vertical detent");
+    x11_pointer_first.*.needs_present = 0;
+    push[X11Event](&x11_pointer_app.x11.pending_events,
+        app_test_x11_pointer(X11EventKind.PointerUp, 910, 20, 70, 5));
+    failures = failures + app_expect(app_poll(&x11_pointer_app, 0) == 1
+        && x11_pointer_first.*.ui.nodes.data[x11_pointer_first_scroll].scroll_y == 9
+        && x11_pointer_first.*.needs_present == 0,
+        "X11 Button5 release cannot duplicate its wheel detent");
+    push[X11Event](&x11_pointer_app.x11.pending_events,
+        app_test_x11_pointer(X11EventKind.PointerDown, 910, 20, 70, 4));
+    failures = failures + app_expect(app_poll(&x11_pointer_app, 0) == 1
+        && x11_pointer_first.*.ui.nodes.data[x11_pointer_first_scroll].scroll_y == 0,
+        "X11 Button4 press is one upward vertical detent");
+    x11_pointer_first.*.needs_present = 0;
+    push[X11Event](&x11_pointer_app.x11.pending_events,
+        app_test_x11_pointer(X11EventKind.PointerUp, 910, 20, 70, 4));
+    failures = failures + app_expect(app_poll(&x11_pointer_app, 0) == 1
+        && x11_pointer_first.*.ui.nodes.data[x11_pointer_first_scroll].scroll_y == 0
+        && x11_pointer_first.*.needs_present == 0,
+        "X11 Button4 release cannot duplicate its wheel detent");
+
+    push[X11Event](&x11_pointer_app.x11.pending_events,
+        app_test_x11_pointer(X11EventKind.PointerDown, 910, 20, 20, 1));
+    failures = failures + app_expect(app_poll(&x11_pointer_app, 0) == 1
+        && x11_pointer_first.*.ui.pressed_node == x11_pointer_first_button
+        && x11_pointer_first.*.ui.focused_node == x11_pointer_first_button
+        && x11_pointer_second.*.ui.pressed_node == -1,
+        "X11 Button1 press owns capture and focus in its native window");
+    x11_pointer_first.*.needs_present = 0;
+    push[X11Event](&x11_pointer_app.x11.pending_events,
+        app_test_x11_pointer(X11EventKind.PointerUp, 910, 20, 20, 2));
+    failures = failures + app_expect(app_poll(&x11_pointer_app, 0) == 1
+        && x11_pointer_first.*.ui.pressed_node == x11_pointer_first_button
+        && x11_pointer_first.*.needs_present == 0,
+        "non-primary release cannot interrupt X11 Button1 capture");
+    push[X11Event](&x11_pointer_app.x11.pending_events,
+        app_test_x11_pointer(X11EventKind.PointerUp, 911, 20, 20, 1));
+    failures = failures + app_expect(app_poll(&x11_pointer_app, 0) == 1
+        && x11_pointer_first.*.ui.pressed_node == x11_pointer_first_button
+        && x11_pointer_second.*.ui.pressed_node == -1
+        && len[t9](x11_pointer_second.*.ui.emitted_actions) == 0,
+        "primary release routed to another X11 window cannot steal capture");
+    push[X11Event](&x11_pointer_app.x11.pending_events,
+        app_test_x11_pointer(X11EventKind.Enter, 911, 20, 20, 0));
+    failures = failures + app_expect(app_poll(&x11_pointer_app, 0) == 1
+        && x11_pointer_second.*.ui.hovered_node == x11_pointer_second_button
+        && x11_pointer_first.*.ui.pressed_node == x11_pointer_first_button,
+        "multiwindow X11 hover routing preserves another window's capture");
+    push[X11Event](&x11_pointer_app.x11.pending_events,
+        app_test_x11_pointer(X11EventKind.PointerUp, 910, 20, 20, 1));
+    failures = failures + app_expect(app_poll(&x11_pointer_app, 0) == 1
+        && x11_pointer_first.*.ui.pressed_node == -1
+        && len[t9](x11_pointer_first.*.ui.emitted_actions) == 1
+        && len[t9](x11_pointer_second.*.ui.emitted_actions) == 0,
+        "X11 Button1 release completes only its owning window activation");
+
+    push[X11Event](&x11_pointer_app.x11.pending_events,
+        app_test_x11_pointer(X11EventKind.Enter, 910, 20, 20, 0));
+    let _x11_pointer_reentered: i32 = app_poll(&x11_pointer_app, 0);
+    push[X11Event](&x11_pointer_app.x11.pending_events,
+        app_test_x11_pointer(X11EventKind.PointerDown, 910, 20, 20, 1));
+    let _x11_pointer_interrupted_down: i32 = app_poll(&x11_pointer_app, 0);
+    push[X11Event](&x11_pointer_app.x11.pending_events,
+        app_test_x11_pointer(X11EventKind.Leave, 910, 20, 20, 0));
+    failures = failures + app_expect(app_poll(&x11_pointer_app, 0) == 1
+        && x11_pointer_first.*.ui.hovered_node == -1
+        && x11_pointer_first.*.ui.pressed_node == -1
+        && len[t9](x11_pointer_first.*.ui.emitted_actions) == 1
+        && x11_pointer_second.*.ui.hovered_node == x11_pointer_second_button,
+        "X11 Leave clears only its hover and cancels interrupted primary capture");
+    push[X11Event](&x11_pointer_app.x11.pending_events,
+        app_test_x11_pointer(X11EventKind.PointerUp, 910, 20, 20, 1));
+    failures = failures + app_expect(app_poll(&x11_pointer_app, 0) == 1
+        && len[t9](x11_pointer_first.*.ui.emitted_actions) == 1,
+        "release after X11 Leave cancellation cannot synthesize a stale click");
+
+    push[X11Event](&x11_pointer_app.x11.pending_events,
+        app_test_x11_pointer(X11EventKind.PointerDown, 911, 20, 20, 1));
+    push[X11Event](&x11_pointer_app.x11.pending_events,
+        app_test_x11_pointer(X11EventKind.PointerUp, 911, 20, 20, 1));
+    failures = failures + app_expect(app_poll(&x11_pointer_app, 0) == 1
+        && app_poll(&x11_pointer_app, 0) == 1
+        && x11_pointer_second.*.ui.focused_node == x11_pointer_second_button
+        && len[t9](x11_pointer_second.*.ui.emitted_actions) == 1
+        && x11_pointer_first.*.ui.focused_node == x11_pointer_first_button
+        && len[t9](x11_pointer_first.*.ui.emitted_actions) == 1,
+        "X11 multiwindow focus and actions remain independently routed");
+    app_shutdown(&x11_pointer_app);
+
+    let x11_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + app_expect(x11_peer.ok == 1, "X11 app keyboard fake peer opens");
+    if (x11_peer.ok == 1) {
+        let x11_app: App = app_new(BackendKind.Headless);
+        let x11_index: i32 = app_open_window(&x11_app, 5, "X11 keyboard", 180, 140);
+        let x11_window: *Window = app_window(&x11_app, x11_index);
+        build_window(x11_window, 50, "X11 keyboard");
+        let x11_field: i32 = ui_find_key(&x11_window.*.ui, 53);
+        let _x11_focused: i32 = ui_set_focus(&x11_window.*.ui, x11_field);
+        x11_app.backend.active = BackendKind.X11; x11_app.backend.deterministic = 0;
+        x11_window.*.backend = BackendKind.X11;
+        x11_window.*.native.window_id = 900; x11_window.*.native.live = 0;
+        x11_app.x11.fd = x11_peer.first; x11_app.x11.connected = 1;
+        x11_app.x11.authenticated = 1;
+        x11_app.x11.setup.minimum_keycode = 8; x11_app.x11.setup.maximum_keycode = 10;
+
+        let x11_keysyms: ArrayList[t27] = make[t27](6);
+        push[t27](&x11_keysyms, 97); push[t27](&x11_keysyms, 65);
+        push[t27](&x11_keysyms, 16778153); push[t27](&x11_keysyms, 16778153);
+        push[t27](&x11_keysyms, 65362); push[t27](&x11_keysyms, 65362);
+        let x11_map_reply: WireBuffer = x11_keyboard_mapping_reply(2, &x11_keysyms);
+        x11_app.x11.keyboard_mapping = x11_decode_keyboard_mapping_reply(
+            &x11_map_reply, 8, 3, 8, 10);
+        let no_modifier_codes: ArrayList[t27] = make[t27](0);
+        let x11_modifier_reply: WireBuffer = x11_modifier_mapping_reply(0, &no_modifier_codes);
+        x11_app.x11.modifier_mapping = x11_decode_modifier_mapping_reply(&x11_modifier_reply);
+        failures = failures + app_expect(x11_app.x11.keyboard_mapping.valid == 1
+            && x11_app.x11.modifier_mapping.valid == 1 && x11_field >= 0,
+            "X11 app starts from server-provided keyboard and modifier authorities");
+
+        push[X11Event](&x11_app.x11.pending_events,
+            app_test_x11_key(X11EventKind.KeyDown, 900, 8, 0, 1, 10));
+        failures = failures + app_expect(app_poll(&x11_app, 0) == 1
+            && @strEq(x11_window.*.ui.nodes.data[x11_field].text, "a") == 1,
+            "X11 base keysym produces owned Input after semantic Press");
+        let x11_actions_after_a: i32 = len[t9](x11_window.*.ui.emitted_actions);
+        push[X11Event](&x11_app.x11.pending_events,
+            app_test_x11_key(X11EventKind.KeyUp, 900, 8, 0, 2, 11));
+        failures = failures + app_expect(app_poll(&x11_app, 0) == 1
+            && len[t9](x11_window.*.ui.emitted_actions) == x11_actions_after_a
+            && @strEq(x11_window.*.ui.nodes.data[x11_field].text, "a") == 1,
+            "X11 KeyRelease emits neither Press nor Input");
+
+        push[X11Event](&x11_app.x11.pending_events,
+            app_test_x11_key(X11EventKind.KeyDown, 900, 8, 1, 3, 12));
+        failures = failures + app_expect(app_poll(&x11_app, 0) == 1
+            && @strEq(x11_window.*.ui.nodes.data[x11_field].text, "aA") == 1,
+            "X11 server Shift state selects the explicit second keysym column");
+        push[X11Event](&x11_app.x11.pending_events,
+            app_test_x11_key(X11EventKind.KeyUp, 900, 8, 1, 4, 13));
+        let _x11_shift_release: i32 = app_poll(&x11_app, 0);
+
+        push[X11Event](&x11_app.x11.pending_events,
+            app_test_x11_key(X11EventKind.KeyDown, 900, 9, 0, 5, 14));
+        failures = failures + app_expect(app_poll(&x11_app, 0) == 1
+            && @strEq(x11_window.*.ui.nodes.data[x11_field].text, "aAΩ") == 1,
+            "X11 direct Unicode keysym crosses the same validated UTF-8 boundary");
+        push[X11Event](&x11_app.x11.pending_events,
+            app_test_x11_key(X11EventKind.KeyUp, 900, 9, 0, 6, 15));
+        let _x11_unicode_release: i32 = app_poll(&x11_app, 0);
+
+        push[X11Event](&x11_app.x11.pending_events,
+            app_test_x11_key(X11EventKind.KeyDown, 900, 8, 4, 7, 16));
+        failures = failures + app_expect(app_poll(&x11_app, 0) == 1
+            && @strEq(x11_window.*.ui.nodes.data[x11_field].text, "aAΩ") == 1
+            && locator_has_selection(&x11_window.*.ui,
+                locate_key(&x11_window.*.ui, 53), 0, 3) == 1,
+            "X11 Control+A dispatches semantic Press first and suppresses Input");
+        push[X11Event](&x11_app.x11.pending_events,
+            app_test_x11_key(X11EventKind.KeyUp, 900, 8, 4, 8, 17));
+        let _x11_control_release: i32 = app_poll(&x11_app, 0);
+
+        let x11_actions_before_unresolved: i32 = len[t9](x11_window.*.ui.emitted_actions);
+        push[X11Event](&x11_app.x11.pending_events,
+            app_test_x11_key(X11EventKind.KeyDown, 900, 8, 8, 9, 18));
+        push[X11Event](&x11_app.x11.pending_events,
+            app_test_x11_key(X11EventKind.KeyDown, 900, 8, 2, 10, 19));
+        failures = failures + app_expect(app_poll(&x11_app, 0) == 1
+            && app_poll(&x11_app, 0) == 1
+            && @strEq(x11_window.*.ui.nodes.data[x11_field].text, "aAΩ") == 1
+            && len[t9](x11_window.*.ui.emitted_actions) == x11_actions_before_unresolved,
+            "X11 Lock and unresolved Mod1 state fail closed without Alt, Meta, or layout guesses");
+
+        push[X11Event](&x11_app.x11.pending_events,
+            app_test_x11_key(X11EventKind.KeyDown, 900, 10, 0, 11, 20));
+        failures = failures + app_expect(app_poll(&x11_app, 0) == 1
+            && @strEq(x11_window.*.ui.nodes.data[x11_field].text, "aAΩ") == 1,
+            "X11 ArrowUp is semantic Press with no printable Input");
+
+        let fresh_keysyms: ArrayList[t27] = make[t27](6);
+        push[t27](&fresh_keysyms, 98); push[t27](&fresh_keysyms, 66);
+        push[t27](&fresh_keysyms, 16778153); push[t27](&fresh_keysyms, 16778153);
+        push[t27](&fresh_keysyms, 65364); push[t27](&fresh_keysyms, 65364);
+        let fresh_map_reply: WireBuffer = x11_keyboard_mapping_reply(2, &fresh_keysyms);
+        let fresh_modifier_reply: WireBuffer = x11_modifier_mapping_reply(0, &no_modifier_codes);
+        app_test_x11_set_sequence(&fresh_map_reply, 1);
+        app_test_x11_set_sequence(&fresh_modifier_reply, 2);
+        let _fresh_map_sent: i64 = linux_send_wire(x11_peer.second, &fresh_map_reply);
+        let _fresh_modifiers_sent: i64 = linux_send_wire(x11_peer.second, &fresh_modifier_reply);
+        push[X11Event](&x11_app.x11.pending_events, app_test_x11_mapping_notify());
+        failures = failures + app_expect(app_poll(&x11_app, 100) == 1
+            && x11_app.x11.keyboard_mapping.valid == 1
+            && x11_app.x11.modifier_mapping.valid == 1,
+            "X11 MappingNotify refreshes both authorities before window lookup despite window zero");
+        push[X11Event](&x11_app.x11.pending_events,
+            app_test_x11_key(X11EventKind.KeyDown, 900, 8, 0, 12, 21));
+        failures = failures + app_expect(app_poll(&x11_app, 0) == 1
+            && @strEq(x11_window.*.ui.nodes.data[x11_field].text, "b") == 1,
+            "X11 event after MappingNotify uses the refreshed generation, never the stale keysym");
+        push[X11Event](&x11_app.x11.pending_events,
+            app_test_x11_key(X11EventKind.KeyDown, 900, 10, 0, 13, 22));
+        failures = failures + app_expect(app_poll(&x11_app, 0) == 1
+            && @strEq(x11_window.*.ui.nodes.data[x11_field].text, "b") == 1,
+            "X11 refreshed ArrowDown remains semantic Press without printable Input");
+
+        let malformed_reply: WireBuffer = wire_new(32);
+        wire_push_u8(&malformed_reply, 1); wire_push_u8(&malformed_reply, 0);
+        wire_push_u16_le(&malformed_reply, 0); wire_push_u32_le(&malformed_reply, 0);
+        while (len[u8](malformed_reply.bytes) < 32) { wire_push_u8(&malformed_reply, 0); }
+        app_test_x11_set_sequence(&malformed_reply, 3);
+        let _malformed_sent: i64 = linux_send_wire(x11_peer.second, &malformed_reply);
+        push[X11Event](&x11_app.x11.pending_events, app_test_x11_mapping_notify());
+        failures = failures + app_expect(app_poll(&x11_app, 100) == 0
+            && x11_app.x11.keyboard_mapping.valid == 0
+            && x11_app.x11.modifier_mapping.valid == 0,
+            "malformed X11 refresh leaves both mapping authorities invalid");
+        push[X11Event](&x11_app.x11.pending_events,
+            app_test_x11_key(X11EventKind.KeyDown, 900, 8, 0, 14, 23));
+        failures = failures + app_expect(app_poll(&x11_app, 0) == 0
+            && @strEq(x11_window.*.ui.nodes.data[x11_field].text, "b") == 1,
+            "X11 key cannot dispatch through a stale map after refresh failure");
+
+        free[t27](&x11_keysyms); free[t27](&fresh_keysyms); free[t27](&no_modifier_codes);
+        wire_free(&x11_map_reply); wire_free(&x11_modifier_reply);
+        wire_free(&fresh_map_reply); wire_free(&fresh_modifier_reply); wire_free(&malformed_reply);
+        app_shutdown(&x11_app);
+        let _x11_peer_closed: i64 = linux_close(x11_peer.second);
+    }
+    if (failures != 0) { return 1; }
+    _zag_println("app_test: ok");
+    return 0;
+}

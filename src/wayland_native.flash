@@ -1,0 +1,3283 @@
+// Direct Wayland display/registry round trip over the pure-Flash Unix transport.
+
+enum WaylandNativePendingKind { None, Frame, KeyboardAuthority, Clipboard }
+
+enum WaylandNativeClipboardAuthorityKind { None, Local, Remote }
+
+enum WaylandNativeClipboardStatus {
+    Ok,
+    Unsupported,
+    InvalidArgument,
+    InvalidUtf8,
+    TooLarge,
+    ResourceLimit,
+    TransportFailed,
+    OwnershipRejected,
+    NotOwner,
+    UnsupportedTarget,
+    Timeout,
+    NoSelection,
+    MalformedReply,
+}
+
+struct WaylandNativeClipboardReadResult {
+    status: WaylandNativeClipboardStatus,
+    bytes: ArrayList[u8],
+    valid: i32,
+}
+
+// A serial value of zero is valid after wl_display's u32 serial wraps. Validity
+// is therefore explicit and tied to the exact bound seat and focused surface.
+struct WaylandNativeClipboardSerial {
+    value: t27,
+    seat_id: t27,
+    surface_id: t27,
+    order: t27,
+    valid: i32,
+}
+
+// Text stays immutable and generation-tagged until the exact source is
+// cancelled/destroyed. A release/close destroy retains this record through its
+// wl_display.sync barrier so an earlier source.send can still be serviced.
+struct WaylandNativeClipboardSourceRecord {
+    identity: WaylandClipboardIdentity,
+    text: ArrayList[u8],
+    owner_surface_id: t27,
+    publication_order: t27,
+    destroy_barrier_id: t27,
+    cancelled: i32,
+    destroy_requested: i32,
+    destroy_sent: i32,
+    destroy_barrier_sent: i32,
+    live: i32,
+}
+
+// Clipboard transitions carry no descriptor in the pending FIFO. SourceSend is
+// serviced at receive position; only its generation-tagged status may be
+// represented later. order compares received transitions with local public
+// publication operations without draining or reentering UI callbacks.
+struct WaylandNativeClipboardTransition {
+    dispatch: WaylandClipboardDispatch,
+    order: t27,
+    local_mirror: i32,
+    valid: i32,
+}
+
+struct WaylandNativeQueuedFrame {
+    kind: WaylandNativePendingKind,
+    input: WireBuffer,
+    authority: WaylandKeyboardAuthorityUpdate,
+    clipboard: WaylandNativeClipboardTransition,
+}
+
+struct WaylandNativePendingEvent {
+    kind: WaylandNativePendingKind,
+    input: WireBuffer,
+    authority: WaylandKeyboardAuthorityUpdate,
+    clipboard: WaylandNativeClipboardTransition,
+    valid: i32,
+}
+
+struct WaylandNativeConnection {
+    fd: i64,
+    globals: ArrayList[WaylandGlobal],
+    connected: i32,
+    registry_ready: i32,
+    compositor_name: t27,
+    shm_name: t27,
+    xdg_wm_base_name: t27,
+    seat_name: t27,
+    clipboard_manager_name: t27,
+    compositor_id: t27,
+    wm_base_id: t27,
+    shm_id: t27,
+    seat_id: t27,
+    seat_version: t27,
+    clipboard_manager_id: t27,
+    clipboard_device_id: t27,
+    clipboard_available: i32,
+    clipboard_state: WaylandClipboardState,
+    clipboard_sources: ArrayList[WaylandNativeClipboardSourceRecord],
+    clipboard_serial: WaylandNativeClipboardSerial,
+    clipboard_order: t27,
+    clipboard_published_order: t27,
+    clipboard_published_kind: WaylandNativeClipboardAuthorityKind,
+    clipboard_published_identity: WaylandClipboardIdentity,
+    clipboard_published_owner_surface: t27,
+    clipboard_mirror_identity: WaylandClipboardIdentity,
+    clipboard_callback_obligations: t27,
+    clipboard_focus_probe_id: t27,
+    clipboard_focus_probe_order: t27,
+    clipboard_focus_probe_pending: i32,
+    clipboard_focus_probe_withdraw: i32,
+    clipboard_last_error: WaylandClipboardError,
+    pointer_id: t27,
+    pointer_version: t27,
+    keyboard_id: t27,
+    keyboard_version: t27,
+    seat_capabilities: t27,
+    seat_has_pointer: i32,
+    seat_has_keyboard: i32,
+    seat_has_touch: i32,
+    pointer_focus_surface: t27,
+    pointer_x: t27,
+    pointer_y: t27,
+    keyboard_focus_surface: t27,
+    keyboard_serial: t27,
+    keyboard_time: t27,
+    keyboard_key: t27,
+    keyboard_key_state: t27,
+    keyboard_mods_depressed: t27,
+    keyboard_mods_latched: t27,
+    keyboard_mods_locked: t27,
+    keyboard_group: t27,
+    keyboard_pressed_keys: ArrayList[t27],
+    keyboard_pending_keymap_format: t27,
+    keyboard_pending_keymap_size: t27,
+    keyboard_pending_keymap_bytes: ArrayList[u8],
+    keyboard_pending_keymap_ready: i32,
+    keyboard_authority_generation: t27,
+    keyboard_pending_authority_kind: WaylandKeyboardAuthorityKind,
+    keyboard_pending_authority_ready: i32,
+    registry_total_interface_bytes: t27,
+    registry_failed: i32,
+    owned_surface_ids: ArrayList[t27],
+    pending_frames: ArrayList[WaylandNativeQueuedFrame],
+    pending_frame_bytes: t27,
+    inbound_bytes: ArrayList[u8],
+    inbound_byte_start: i32,
+    inbound_fds: ArrayList[i64],
+    inbound_eof: i32,
+    next_id: t27,
+    error: []u8,
+}
+
+// recvmsg owns ancillary descriptors independently of the Wayland byte frame.
+// A caller that does not transfer received_fd to
+// wayland_process_keyboard_frame must call wayland_native_frame_free.
+struct WaylandNativeFrameReceive {
+    input: WireBuffer,
+    received_fd: i64,
+    has_fd: i32,
+    fd_count: t27,
+    closed_fd_count: t27,
+    last_closed_fd: i64,
+    cloexec_applied: i32,
+    ancillary_valid: i32,
+    keyboard_authority_cleared: i32,
+    stream_terminal: i32,
+    stream_close_error: i32,
+    valid: i32,
+}
+
+struct WaylandNativeWindow {
+    surface_id: t27,
+    xdg_surface_id: t27,
+    toplevel_id: t27,
+    width: t27,
+    height: t27,
+    live: i32,
+    configured: i32,
+    close_requested: i32,
+    buffer_id: t27,
+    buffer_width: t27,
+    buffer_height: t27,
+    memory: LinuxSharedMemory,
+    buffer_busy: i32,
+}
+
+fn wayland_native_empty_clipboard_serial() WaylandNativeClipboardSerial {
+    return WaylandNativeClipboardSerial{ .value = 0, .seat_id = 0,
+        .surface_id = 0, .order = 0, .valid = 0 };
+}
+
+fn wayland_native_empty_clipboard_transition()
+    WaylandNativeClipboardTransition {
+    return WaylandNativeClipboardTransition{
+        .dispatch = wayland_clipboard_empty_dispatch(WaylandClipboardError.None),
+        .order = 0, .local_mirror = 0, .valid = 0 };
+}
+
+fn wayland_native_clipboard_transition_free(
+    transition: *WaylandNativeClipboardTransition) void {
+    let _closed: i32 = wayland_clipboard_dispatch_close(&transition.*.dispatch);
+    transition.* = wayland_native_empty_clipboard_transition();
+}
+
+fn wayland_native_clipboard_source_record_free(
+    record: *WaylandNativeClipboardSourceRecord) void {
+    if (record.*.text.cap > 0) { free[u8](&record.*.text); }
+    record.*.text = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 };
+    record.*.identity = wayland_clipboard_bad_identity();
+    record.*.owner_surface_id = 0; record.*.publication_order = 0;
+    record.*.destroy_barrier_id = 0; record.*.cancelled = 0;
+    record.*.destroy_requested = 0; record.*.destroy_sent = 0;
+    record.*.destroy_barrier_sent = 0; record.*.live = 0;
+}
+
+fn wayland_native_clipboard_clear_sources(
+    connection: *WaylandNativeConnection) void {
+    let i: i32 = 0;
+    while (i < len[WaylandNativeClipboardSourceRecord](
+        connection.*.clipboard_sources)) {
+        wayland_native_clipboard_source_record_free(
+            &connection.*.clipboard_sources.data[i]);
+        i = i + 1;
+    }
+    connection.*.clipboard_sources.len = 0;
+}
+
+// Retire connection-owned clipboard authority while retaining the reusable
+// source-record container. Final disconnect separately frees that container.
+fn wayland_native_clipboard_retire(
+    connection: *WaylandNativeConnection) void {
+    wayland_native_clipboard_clear_sources(connection);
+    wayland_clipboard_state_free(&connection.*.clipboard_state);
+    connection.*.clipboard_state = wayland_clipboard_empty_state();
+    connection.*.clipboard_manager_id = 0; connection.*.clipboard_device_id = 0;
+    connection.*.clipboard_available = 0;
+    connection.*.clipboard_serial = wayland_native_empty_clipboard_serial();
+    connection.*.clipboard_order = 0; connection.*.clipboard_published_order = 0;
+    connection.*.clipboard_published_kind =
+        WaylandNativeClipboardAuthorityKind.None;
+    connection.*.clipboard_published_identity = wayland_clipboard_bad_identity();
+    connection.*.clipboard_published_owner_surface = 0;
+    connection.*.clipboard_mirror_identity = wayland_clipboard_bad_identity();
+    connection.*.clipboard_callback_obligations = 0;
+    connection.*.clipboard_focus_probe_id = 0;
+    connection.*.clipboard_focus_probe_order = 0;
+    connection.*.clipboard_focus_probe_pending = 0;
+    connection.*.clipboard_focus_probe_withdraw = 0;
+    connection.*.clipboard_last_error = WaylandClipboardError.None;
+}
+
+fn wayland_empty_connection() WaylandNativeConnection {
+    return WaylandNativeConnection{ .fd = 0 - 1, .globals = make[WaylandGlobal](16),
+        .connected = 0, .registry_ready = 0, .compositor_name = 0, .shm_name = 0,
+        .xdg_wm_base_name = 0, .seat_name = 0, .clipboard_manager_name = 0,
+        .compositor_id = 0, .wm_base_id = 0,
+        .shm_id = 0, .seat_id = 0, .seat_version = 0,
+        .clipboard_manager_id = 0, .clipboard_device_id = 0,
+        .clipboard_available = 0,
+        .clipboard_state = wayland_clipboard_empty_state(),
+        .clipboard_sources = make[WaylandNativeClipboardSourceRecord](4),
+        .clipboard_serial = wayland_native_empty_clipboard_serial(),
+        .clipboard_order = 0, .clipboard_published_order = 0,
+        .clipboard_published_kind = WaylandNativeClipboardAuthorityKind.None,
+        .clipboard_published_identity = wayland_clipboard_bad_identity(),
+        .clipboard_published_owner_surface = 0,
+        .clipboard_mirror_identity = wayland_clipboard_bad_identity(),
+        .clipboard_callback_obligations = 0,
+        .clipboard_focus_probe_id = 0, .clipboard_focus_probe_order = 0,
+        .clipboard_focus_probe_pending = 0,
+        .clipboard_focus_probe_withdraw = 0,
+        .clipboard_last_error = WaylandClipboardError.None,
+        .pointer_id = 0, .pointer_version = 0, .keyboard_id = 0, .keyboard_version = 0,
+        .seat_capabilities = 0,
+        .seat_has_pointer = 0, .seat_has_keyboard = 0, .seat_has_touch = 0,
+        .pointer_focus_surface = 0, .pointer_x = 0, .pointer_y = 0,
+        .keyboard_focus_surface = 0, .keyboard_serial = 0, .keyboard_time = 0,
+        .keyboard_key = 0, .keyboard_key_state = 0, .keyboard_mods_depressed = 0,
+        .keyboard_mods_latched = 0, .keyboard_mods_locked = 0, .keyboard_group = 0,
+        .keyboard_pressed_keys = make[t27](32),
+        .keyboard_pending_keymap_format = 0, .keyboard_pending_keymap_size = 0,
+        .keyboard_pending_keymap_bytes = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 },
+        .keyboard_pending_keymap_ready = 0,
+        .keyboard_authority_generation = 0,
+        .keyboard_pending_authority_kind = WaylandKeyboardAuthorityKind.None,
+        .keyboard_pending_authority_ready = 0,
+        .registry_total_interface_bytes = 0, .registry_failed = 0,
+        .owned_surface_ids = make[t27](8),
+        .pending_frames = make[WaylandNativeQueuedFrame](8), .pending_frame_bytes = 0,
+        .inbound_bytes = make[u8](8192), .inbound_byte_start = 0,
+        .inbound_fds = make[i64](4), .inbound_eof = 0,
+        .next_id = 4, .error = "Wayland connection is not active" };
+}
+
+fn wayland_native_max_owned_surfaces() t27 { return 256; }
+fn wayland_native_max_pending_frames() t27 { return 256; }
+fn wayland_native_max_pending_frame_bytes() t27 { return 1048576; }
+fn wayland_native_max_inbound_bytes() t27 { return 1048576; }
+fn wayland_native_max_inbound_fds() t27 { return 27; }
+fn wayland_native_inbound_read_capacity() i32 { return 65536; }
+fn wayland_native_max_toplevel_states() t27 { return 64; }
+fn wayland_native_max_client_object_id() t27 { return 4278190079; }
+fn wayland_native_clipboard_service_timeout() t27 { return 250; }
+
+// Wayland client IDs are dense in [2, 0xfeffffff]. Logical callback
+// obligations reserve capacity, not numeric IDs, so later objects cannot steal
+// the eventual destroy barriers and no unused ID hole reaches the wire.
+fn wayland_native_client_ids_available(
+    connection: *WaylandNativeConnection, requested_ids: t27,
+    extra_callback_obligations: t27) i32 {
+    if (requested_ids < 0 || extra_callback_obligations < 0
+        || connection.*.next_id < 2) { return 0; }
+    let last_reserved: t27 = connection.*.next_id + requested_ids
+        + connection.*.clipboard_callback_obligations
+        + extra_callback_obligations - 1;
+    if (last_reserved > wayland_native_max_client_object_id()) { return 0; }
+    return 1;
+}
+
+fn wayland_native_take_client_ids(
+    connection: *WaylandNativeConnection, count: t27) t27 {
+    if (count < 1 || wayland_native_client_ids_available(
+        connection, count, 0) == 0) { return 0; }
+    let first: t27 = connection.*.next_id;
+    connection.*.next_id = connection.*.next_id + count;
+    return first;
+}
+
+fn wayland_native_take_reserved_clipboard_callback(
+    connection: *WaylandNativeConnection) t27 {
+    if (connection.*.clipboard_callback_obligations < 1
+        || connection.*.next_id < 2
+        || connection.*.next_id > wayland_native_max_client_object_id()) {
+        return 0;
+    }
+    let callback_id: t27 = connection.*.next_id;
+    connection.*.next_id = connection.*.next_id + 1;
+    connection.*.clipboard_callback_obligations =
+        connection.*.clipboard_callback_obligations - 1;
+    return callback_id;
+}
+
+fn wayland_native_clipboard_next_order(
+    connection: *WaylandNativeConnection) t27 {
+    if (connection.*.clipboard_order >= flashy_t27_max()) { return 0; }
+    connection.*.clipboard_order = connection.*.clipboard_order + 1;
+    return connection.*.clipboard_order;
+}
+
+fn wayland_native_clipboard_source_index(
+    connection: *WaylandNativeConnection,
+    identity: WaylandClipboardIdentity) i32 {
+    let i: i32 = 0;
+    while (i < len[WaylandNativeClipboardSourceRecord](
+        connection.*.clipboard_sources)) {
+        let record: WaylandNativeClipboardSourceRecord =
+            connection.*.clipboard_sources.data[i];
+        if (record.live != 0 && wayland_clipboard_identity_equal(
+            record.identity, identity) != 0) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn wayland_native_clipboard_source_remove(
+    connection: *WaylandNativeConnection, index: i32) void {
+    if (index < 0 || index >= len[WaylandNativeClipboardSourceRecord](
+        connection.*.clipboard_sources)) { return; }
+    wayland_native_clipboard_source_record_free(
+        &connection.*.clipboard_sources.data[index]);
+    let i: i32 = index;
+    while (i + 1 < len[WaylandNativeClipboardSourceRecord](
+        connection.*.clipboard_sources)) {
+        connection.*.clipboard_sources.data[i] =
+            connection.*.clipboard_sources.data[i + 1];
+        i = i + 1;
+    }
+    connection.*.clipboard_sources.len =
+        connection.*.clipboard_sources.len - 1;
+}
+
+fn wayland_connection_queue_clipboard_transition(
+    connection: *WaylandNativeConnection,
+    transition: *WaylandNativeClipboardTransition) i32 {
+    if (transition.*.valid == 0 || transition.*.dispatch.valid == 0
+        || transition.*.dispatch.transfer_fd >= 0
+        || len[WaylandNativeQueuedFrame](connection.*.pending_frames) as t27
+            >= wayland_native_max_pending_frames()) { return 0; }
+    let queued: WaylandNativeQueuedFrame = WaylandNativeQueuedFrame{
+        .kind = WaylandNativePendingKind.Clipboard, .input = wire_new(1),
+        .authority = wayland_empty_keyboard_authority_update(),
+        .clipboard = transition.* };
+    push[WaylandNativeQueuedFrame](&connection.*.pending_frames, queued);
+    transition.* = wayland_native_empty_clipboard_transition();
+    return 1;
+}
+
+fn wayland_connection_has_surface(connection: *WaylandNativeConnection,
+    surface_id: t27) i32 {
+    let i: i32 = 0;
+    while (i < len[t27](connection.*.owned_surface_ids)) {
+        if (get[t27](connection.*.owned_surface_ids, i) == surface_id) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn wayland_connection_register_surface(connection: *WaylandNativeConnection,
+    surface_id: t27) i32 {
+    if (surface_id < 1 || wayland_connection_has_surface(connection, surface_id) != 0
+        || len[t27](connection.*.owned_surface_ids) as t27
+            >= wayland_native_max_owned_surfaces()) { return 0; }
+    push[t27](&connection.*.owned_surface_ids, surface_id);
+    return 1;
+}
+
+fn wayland_connection_forget_surface(connection: *WaylandNativeConnection,
+    surface_id: t27) void {
+    let index: i32 = -1;
+    let find_i: i32 = 0;
+    while (find_i < len[t27](connection.*.owned_surface_ids)) {
+        if (get[t27](connection.*.owned_surface_ids, find_i) == surface_id) {
+            index = find_i; find_i = len[t27](connection.*.owned_surface_ids);
+        } else { find_i = find_i + 1; }
+    }
+    if (index < 0) { return; }
+    let i: i32 = index;
+    while (i + 1 < len[t27](connection.*.owned_surface_ids)) {
+        connection.*.owned_surface_ids.data[i] = connection.*.owned_surface_ids.data[i + 1];
+        i = i + 1;
+    }
+    connection.*.owned_surface_ids.len = connection.*.owned_surface_ids.len - 1;
+}
+
+fn wayland_native_surface_dimensions_valid(width: t27, height: t27) i32 {
+    return surface_dimensions_valid(width, height);
+}
+
+fn wayland_native_configure_axis_valid(value: t27) i32 {
+    if (value >= 0 && value <= surface_max_dimension()) { return 1; }
+    return 0;
+}
+
+fn wayland_native_resolve_configure_axis(proposed: t27, current: t27) t27 {
+    if (proposed == 0) { return current; }
+    return proposed;
+}
+
+fn wayland_connection_clear_pending_frames(connection: *WaylandNativeConnection) void {
+    let i: i32 = 0;
+    while (i < len[WaylandNativeQueuedFrame](connection.*.pending_frames)) {
+        wire_free(&connection.*.pending_frames.data[i].input);
+        wayland_keyboard_authority_update_free(
+            &connection.*.pending_frames.data[i].authority);
+        wayland_native_clipboard_transition_free(
+            &connection.*.pending_frames.data[i].clipboard);
+        i = i + 1;
+    }
+    connection.*.pending_frames.len = 0; connection.*.pending_frame_bytes = 0;
+}
+
+// The display stream owns bytes and ancillary descriptors independently.
+// Retiring a connection closes every queued descriptor and resets the reusable
+// containers; final disconnect separately releases their allocations.
+fn wayland_connection_clear_inbound(
+    connection: *WaylandNativeConnection) i32 {
+    let ok: i32 = 1;
+    let fd_i: i32 = 0;
+    while (fd_i < len[i64](connection.*.inbound_fds)) {
+        if (connection.*.inbound_fds.data[fd_i] >= 0
+            && linux_close(connection.*.inbound_fds.data[fd_i]) != 0) {
+            ok = 0;
+        }
+        connection.*.inbound_fds.data[fd_i] = 0 - 1;
+        fd_i = fd_i + 1;
+    }
+    connection.*.inbound_fds.len = 0;
+    connection.*.inbound_bytes.len = 0;
+    connection.*.inbound_byte_start = 0;
+    connection.*.inbound_eof = 0;
+    return ok;
+}
+
+fn wayland_connection_queue_pending_frame(connection: *WaylandNativeConnection,
+    input: *WireBuffer) i32 {
+    let byte_count: t27 = len[u8](input.*.bytes) as t27;
+    if (input.*.error != 0 || byte_count < 8
+        || len[WaylandNativeQueuedFrame](connection.*.pending_frames) as t27
+            >= wayland_native_max_pending_frames()
+        || connection.*.pending_frame_bytes + byte_count
+            > wayland_native_max_pending_frame_bytes()) { return 0; }
+    let queued: WaylandNativeQueuedFrame = WaylandNativeQueuedFrame{
+        .kind = WaylandNativePendingKind.Frame, .input = input.*,
+        .authority = wayland_empty_keyboard_authority_update(),
+        .clipboard = wayland_native_empty_clipboard_transition() };
+    push[WaylandNativeQueuedFrame](&connection.*.pending_frames, queued);
+    connection.*.pending_frame_bytes = connection.*.pending_frame_bytes + byte_count;
+    input.*.bytes = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 };
+    input.*.error = 0;
+    return 1;
+}
+
+fn wayland_connection_queue_keyboard_authority(connection: *WaylandNativeConnection,
+    authority: *WaylandKeyboardAuthorityUpdate) i32 {
+    let byte_count: t27 = len[u8](authority.*.keymap_bytes) as t27;
+    if (authority.*.valid == 0
+        || len[WaylandNativeQueuedFrame](connection.*.pending_frames) as t27
+            >= wayland_native_max_pending_frames()
+        || connection.*.pending_frame_bytes + byte_count
+            > wayland_native_max_pending_frame_bytes()) { return 0; }
+    let queued: WaylandNativeQueuedFrame = WaylandNativeQueuedFrame{
+        .kind = WaylandNativePendingKind.KeyboardAuthority, .input = wire_new(1),
+        .authority = authority.*,
+        .clipboard = wayland_native_empty_clipboard_transition() };
+    push[WaylandNativeQueuedFrame](&connection.*.pending_frames, queued);
+    connection.*.pending_frame_bytes = connection.*.pending_frame_bytes + byte_count;
+    authority.*.keymap_bytes = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 };
+    authority.*.kind = WaylandKeyboardAuthorityKind.None; authority.*.valid = 0;
+    return 1;
+}
+
+fn wayland_empty_native_pending_event() WaylandNativePendingEvent {
+    return WaylandNativePendingEvent{ .kind = WaylandNativePendingKind.None,
+        .input = wire_new(1), .authority = wayland_empty_keyboard_authority_update(),
+        .clipboard = wayland_native_empty_clipboard_transition(),
+        .valid = 0 };
+}
+
+fn wayland_native_pending_event_free(event: *WaylandNativePendingEvent) void {
+    wire_free(&event.*.input);
+    wayland_keyboard_authority_update_free(&event.*.authority);
+    wayland_native_clipboard_transition_free(&event.*.clipboard);
+    event.*.kind = WaylandNativePendingKind.None; event.*.valid = 0;
+}
+
+fn wayland_connection_take_pending_event(connection: *WaylandNativeConnection)
+    WaylandNativePendingEvent {
+    let event: WaylandNativePendingEvent = wayland_empty_native_pending_event();
+    if (len[WaylandNativeQueuedFrame](connection.*.pending_frames) == 0) { return event; }
+    wire_free(&event.input);
+    event.kind = connection.*.pending_frames.data[0].kind;
+    event.input = connection.*.pending_frames.data[0].input;
+    event.authority = connection.*.pending_frames.data[0].authority;
+    event.clipboard = connection.*.pending_frames.data[0].clipboard;
+    event.valid = 1;
+    connection.*.pending_frame_bytes = connection.*.pending_frame_bytes
+        - len[u8](event.input.bytes) as t27
+        - len[u8](event.authority.keymap_bytes) as t27;
+    let i: i32 = 0;
+    while (i + 1 < len[WaylandNativeQueuedFrame](connection.*.pending_frames)) {
+        connection.*.pending_frames.data[i] = connection.*.pending_frames.data[i + 1];
+        i = i + 1;
+    }
+    connection.*.pending_frames.len = connection.*.pending_frames.len - 1;
+    return event;
+}
+
+fn wayland_connection_take_pending_frame(connection: *WaylandNativeConnection)
+    WaylandNativeFrameReceive {
+    let received: WaylandNativeFrameReceive = WaylandNativeFrameReceive{
+        .input = wire_new(1), .received_fd = 0 - 1, .has_fd = 0, .fd_count = 0,
+        .closed_fd_count = 0, .last_closed_fd = 0 - 1, .cloexec_applied = 0,
+        .ancillary_valid = 1, .keyboard_authority_cleared = 0,
+        .stream_terminal = 0, .stream_close_error = 0, .valid = 0 };
+    if (len[WaylandNativeQueuedFrame](connection.*.pending_frames) == 0
+        || connection.*.pending_frames.data[0].kind != WaylandNativePendingKind.Frame) {
+        return received;
+    }
+    let event: WaylandNativePendingEvent = wayland_connection_take_pending_event(connection);
+    wire_free(&received.input); received.input = event.input;
+    event.input = wire_new(1); wayland_native_pending_event_free(&event);
+    received.valid = 1;
+    return received;
+}
+
+// Clear active protocol authority without freeing the connection's container
+// allocations. Every terminal cause uses this same transition; disconnect owns
+// final allocator teardown.
+fn wayland_connection_retire_active_state(connection: *WaylandNativeConnection) void {
+    wayland_connection_clear_pending_keymap(connection);
+    wayland_connection_clear_pending_frames(connection);
+    let _inbound_closed: i32 = wayland_connection_clear_inbound(connection);
+    wayland_native_clipboard_retire(connection);
+    connection.*.owned_surface_ids.len = 0;
+    connection.*.compositor_id = 0; connection.*.wm_base_id = 0;
+    connection.*.shm_id = 0; connection.*.seat_id = 0; connection.*.seat_version = 0;
+    connection.*.seat_has_pointer = 0; connection.*.seat_has_keyboard = 0;
+    connection.*.seat_has_touch = 0; connection.*.seat_capabilities = 0;
+    connection.*.pointer_focus_surface = 0;
+    connection.*.pointer_x = 0; connection.*.pointer_y = 0;
+    connection.*.pointer_id = 0; connection.*.pointer_version = 0;
+    connection.*.keyboard_focus_surface = 0;
+    connection.*.keyboard_id = 0; connection.*.keyboard_version = 0;
+    connection.*.keyboard_serial = 0; connection.*.keyboard_time = 0;
+    connection.*.keyboard_key = 0; connection.*.keyboard_key_state = 0;
+    connection.*.keyboard_mods_depressed = 0;
+    connection.*.keyboard_mods_latched = 0;
+    connection.*.keyboard_mods_locked = 0; connection.*.keyboard_group = 0;
+    connection.*.keyboard_pressed_keys.len = 0;
+}
+
+fn wayland_native_frame_close_fd(received: *WaylandNativeFrameReceive) void {
+    if (received.*.received_fd >= 0) {
+        received.*.last_closed_fd = received.*.received_fd;
+        if (linux_close(received.*.received_fd) == 0) {
+            received.*.closed_fd_count = received.*.closed_fd_count + 1;
+        }
+        received.*.received_fd = 0 - 1;
+        received.*.has_fd = 0;
+    }
+}
+
+fn wayland_native_frame_free(received: *WaylandNativeFrameReceive) void {
+    wayland_native_frame_close_fd(received);
+    wire_free(&received.*.input);
+    received.*.valid = 0;
+}
+
+fn wayland_native_frame_retire_stream(received: *WaylandNativeFrameReceive) void {
+    received.*.stream_terminal = 1;
+}
+
+fn wayland_connection_accept_frame_receive(connection: *WaylandNativeConnection,
+    received: *WaylandNativeFrameReceive) i32 {
+    if (received.*.stream_terminal != 0) {
+        if (connection.*.connected != 0 || connection.*.fd >= 0) {
+            wayland_connection_retire_active_state(connection);
+            if (connection.*.fd >= 0 && linux_close(connection.*.fd) != 0) {
+                received.*.stream_close_error = 1;
+            }
+            connection.*.fd = 0 - 1;
+            connection.*.connected = 0;
+            connection.*.error = "Wayland stream ended inside a declared frame";
+        }
+        return 0;
+    }
+    if (received.*.ancillary_valid == 0 && len[u8](received.*.input.bytes) >= 8) {
+        let frame: WaylandFrame = wayland_decode(&received.*.input, 0);
+        if (frame.valid == 1 && connection.*.keyboard_id != 0
+            && frame.object_id == connection.*.keyboard_id && frame.opcode == 0) {
+            wayland_connection_publish_keyboard_authority(connection,
+                WaylandKeyboardAuthorityKind.Rejected);
+            received.*.keyboard_authority_cleared = 1;
+        }
+    }
+    return 1;
+}
+
+fn wayland_native_frame_absorb(result: *WaylandNativeFrameReceive,
+    native: *LinuxReceiveFdResult) i64 {
+    let got: i64 = native.*.got;
+    let i: i32 = 0;
+    while (i < native.*.data.len) {
+        wire_push_u8(&result.*.input, linux_buffer_byte(&native.*.data, i) as t27);
+        i = i + 1;
+    }
+    result.*.fd_count = result.*.fd_count + native.*.fd_count;
+    result.*.closed_fd_count = result.*.closed_fd_count + native.*.closed_fd_count;
+    if (native.*.last_closed_fd >= 0) { result.*.last_closed_fd = native.*.last_closed_fd; }
+    if (native.*.ok == 0) { result.*.ancillary_valid = 0; }
+    if (native.*.received_fd >= 0) {
+        if (result.*.received_fd < 0) {
+            result.*.received_fd = native.*.received_fd;
+            result.*.has_fd = native.*.has_fd;
+            result.*.cloexec_applied = native.*.cloexec_applied;
+        } else {
+            result.*.last_closed_fd = native.*.received_fd;
+            if (linux_close(native.*.received_fd) == 0) {
+                result.*.closed_fd_count = result.*.closed_fd_count + 1;
+            }
+            result.*.ancillary_valid = 0;
+        }
+    }
+    if (result.*.fd_count > 1) { result.*.ancillary_valid = 0; }
+    if (result.*.ancillary_valid == 0) { wayland_native_frame_close_fd(result); }
+    linux_buffer_free(&native.*.data);
+    return got;
+}
+
+// Fill a declared frame using recvmsg for every stream segment. This preserves
+// an FD even if a peer attaches SCM_RIGHTS after a fragmented header instead of
+// to its first byte. Return 1 on exact bytes, 0 on timeout, and -1 on EOF/error.
+fn wayland_native_receive_until(fd: i64, result: *WaylandNativeFrameReceive,
+    target_size: i32, deadline: i64) i32 {
+    while (len[u8](result.*.input.bytes) < target_size) {
+        let now: i64 = linux_monotonic_ms();
+        if (now > deadline) { return 0; }
+        let remaining_time: t27 = (deadline - now) as t27;
+        if (linux_poll_readable(fd, remaining_time) == 0) { return 0; }
+        let remaining: i32 = target_size - len[u8](result.*.input.bytes);
+        let native: LinuxReceiveFdResult = linux_receive_buffer_fd(fd, remaining);
+        let got: i64 = wayland_native_frame_absorb(result, &native);
+        if (got <= 0) { return -1; }
+    }
+    return 1;
+}
+
+// Test-only compatibility receiver for isolated one-frame fixtures. Production
+// connections use wayland_connection_receive_frame and its independent bounded
+// byte/FD FIFOs because SCM_RIGHTS byte attachment is not message association.
+// Receive one complete Wayland frame while retaining at most one ancillary FD.
+// Once any declared frame bytes are consumed, timeout/malformed framing retires
+// the stream: continuing at the missing tail would desynchronize object IDs and
+// descriptor association.
+fn wayland_receive_frame_with_fd(fd: i64, timeout_ms: t27) WaylandNativeFrameReceive {
+    let result: WaylandNativeFrameReceive = WaylandNativeFrameReceive{
+        .input = wire_new(8), .received_fd = 0 - 1, .has_fd = 0, .fd_count = 0,
+        .closed_fd_count = 0, .last_closed_fd = 0 - 1, .cloexec_applied = 0,
+        .ancillary_valid = 1, .keyboard_authority_cleared = 0,
+        .stream_terminal = 0, .stream_close_error = 0, .valid = 0 };
+    if (fd < 0 || timeout_ms < 0) { result.input.error = 1; return result; }
+    let deadline: i64 = linux_monotonic_ms() + timeout_ms as i64;
+    let header_status: i32 = wayland_native_receive_until(fd, &result, 8, deadline);
+    if (header_status != 1) {
+        result.input.error = 1; wayland_native_frame_close_fd(&result);
+        if (header_status < 0 || len[u8](result.input.bytes) > 0) {
+            wayland_native_frame_retire_stream(&result);
+        }
+        return result;
+    }
+    let encoded: t27 = wire_read_u32_le(&result.input, 4);
+    let size: t27 = encoded / 65536;
+    if (result.input.error != 0 || size < 8 || size > 65535 || (size % 4) != 0) {
+        result.input.error = 1; wayland_native_frame_close_fd(&result);
+        wayland_native_frame_retire_stream(&result); return result;
+    }
+    let frame_status: i32 = wayland_native_receive_until(fd, &result, size as i32, deadline);
+    if (frame_status != 1) {
+        result.input.error = 1; wayland_native_frame_close_fd(&result);
+        wayland_native_frame_retire_stream(&result); return result;
+    }
+    if (result.ancillary_valid == 0) { result.input.error = 1; return result; }
+    result.valid = 1;
+    return result;
+}
+
+fn wayland_receive_frame(fd: i64, timeout_ms: t27) WireBuffer {
+    let received: WaylandNativeFrameReceive = wayland_receive_frame_with_fd(fd, timeout_ms);
+    // This compatibility byte-only API cannot surface terminal ownership. On a
+    // partial/malformed declared frame it takes and closes fd; callers must not
+    // reuse an fd after an error. Connection owners use the structured API and
+    // wayland_connection_accept_frame_receive instead.
+    if (received.stream_terminal != 0 && fd >= 0) {
+        if (linux_close(fd) != 0) { received.stream_close_error = 1; }
+    }
+    // Byte-only callers cannot own ancillary state. Reject and close it rather
+    // than silently losing the descriptor.
+    if (received.received_fd >= 0) {
+        wayland_native_frame_close_fd(&received);
+        received.input.error = 1;
+    }
+    return received.input;
+}
+
+fn wayland_native_empty_frame_receive() WaylandNativeFrameReceive {
+    return WaylandNativeFrameReceive{
+        .input = wire_new(1), .received_fd = 0 - 1, .has_fd = 0,
+        .fd_count = 0, .closed_fd_count = 0,
+        .last_closed_fd = 0 - 1, .cloexec_applied = 0,
+        .ancillary_valid = 1, .keyboard_authority_cleared = 0,
+        .stream_terminal = 0, .stream_close_error = 0, .valid = 0 };
+}
+
+fn wayland_native_inbound_available(
+    connection: *WaylandNativeConnection) t27 {
+    let available: i32 = len[u8](connection.*.inbound_bytes)
+        - connection.*.inbound_byte_start;
+    if (available < 0) { return 0; }
+    return available as t27;
+}
+
+fn wayland_native_inbound_compact(
+    connection: *WaylandNativeConnection) i32 {
+    if (connection.*.inbound_byte_start < 0
+        || connection.*.inbound_byte_start
+            > len[u8](connection.*.inbound_bytes)) { return 0; }
+    if (connection.*.inbound_byte_start == 0) { return 1; }
+    let available: i32 = len[u8](connection.*.inbound_bytes)
+        - connection.*.inbound_byte_start;
+    let i: i32 = 0;
+    while (i < available) {
+        connection.*.inbound_bytes.data[i] =
+            connection.*.inbound_bytes.data[
+                connection.*.inbound_byte_start + i];
+        i = i + 1;
+    }
+    connection.*.inbound_bytes.len = available;
+    connection.*.inbound_byte_start = 0;
+    return 1;
+}
+
+fn wayland_native_inbound_fail(connection: *WaylandNativeConnection,
+    result: *WaylandNativeFrameReceive, reason: []u8) i32 {
+    result.*.input.error = 1; result.*.stream_terminal = 1;
+    wayland_connection_fail_protocol(connection, reason);
+    return -1;
+}
+
+// Consume one runtime recvmsg result into the independent connection FIFOs.
+// The runtime result is freed on every path; successfully transferred FDs are
+// thereafter owned only by connection.inbound_fds.
+fn wayland_native_inbound_feed(connection: *WaylandNativeConnection,
+    native: *LinuxReceiveFdsResult) i32 {
+    if (native.*.eof != 0) {
+        let valid_eof: i32 = native.*.released == 0
+            && native.*.ok == 0 && native.*.got == 0
+            && native.*.payload_received == 0
+            && native.*.data.len == 0
+            && native.*.retained_fd_count == 0
+            && native.*.fd_count == 0
+            && len[i64](native.*.fds) == 0
+            && native.*.close_attempt_count == 0
+            && native.*.closed_fd_count == 0
+            && native.*.last_closed_fd < 0
+            && native.*.message_truncated == 0
+            && native.*.control_truncated == 0
+            && native.*.control_invalid == 0
+            && native.*.fd_overflow == 0
+            && native.*.close_error_code == 0
+            && native.*.cloexec_applied_count == 0
+            && native.*.error_code == 0;
+        let cleaned_eof: i32 = linux_receive_fds_result_free(native);
+        if (valid_eof == 0 || cleaned_eof == 0) {
+            wayland_connection_fail_protocol(connection,
+                "Wayland EOF carried invalid ancillary state");
+            return 0;
+        }
+        connection.*.inbound_eof = 1; return 1;
+    }
+    let available: t27 = wayland_native_inbound_available(connection);
+    let incoming_bytes: t27 = native.*.data.len as t27;
+    let incoming_fds: t27 = native.*.retained_fd_count;
+    let valid: i32 = native.*.ok != 0 && native.*.released == 0
+        && native.*.payload_received != 0 && native.*.got > 0
+        && native.*.got == native.*.data.len as i64
+        && native.*.fd_count == incoming_fds
+        && len[i64](native.*.fds) as t27 == incoming_fds
+        && native.*.message_truncated == 0
+        && native.*.control_truncated == 0
+        && native.*.control_invalid == 0 && native.*.fd_overflow == 0
+        && native.*.error_code == 0 && native.*.close_error_code == 0
+        && native.*.cloexec_applied_count == incoming_fds
+        && connection.*.inbound_eof == 0
+        && available + incoming_bytes <= wayland_native_max_inbound_bytes()
+        && len[i64](connection.*.inbound_fds) as t27 + incoming_fds
+            <= wayland_native_max_inbound_fds();
+    if (valid == 0 || wayland_native_inbound_compact(connection) == 0) {
+        let _cleaned_invalid: i32 = linux_receive_fds_result_free(native);
+        wayland_connection_fail_protocol(connection,
+            "Wayland inbound byte or FD stream exceeded validated bounds");
+        return 0;
+    }
+    let byte_i: i32 = 0;
+    while (byte_i < native.*.data.len) {
+        push[u8](&connection.*.inbound_bytes,
+            linux_buffer_byte(&native.*.data, byte_i) as u8);
+        byte_i = byte_i + 1;
+    }
+    let transferred_fds: t27 = 0;
+    let fd_i: t27 = 0;
+    while (fd_i < len[i64](native.*.fds) as t27) {
+        let owned_fd: i64 = linux_receive_fds_take_at(native, fd_i);
+        if (owned_fd >= 0) {
+            push[i64](&connection.*.inbound_fds, owned_fd);
+            transferred_fds = transferred_fds + 1;
+        }
+        fd_i = fd_i + 1;
+    }
+    let cleaned: i32 = linux_receive_fds_result_free(native);
+    if (transferred_fds != incoming_fds || cleaned == 0) {
+        wayland_connection_fail_protocol(connection,
+            "Wayland inbound FD ownership transfer failed");
+        return 0;
+    }
+    return 1;
+}
+
+fn wayland_native_inbound_read_once(
+    connection: *WaylandNativeConnection) i32 {
+    let remaining_bytes: t27 = wayland_native_max_inbound_bytes()
+        - wayland_native_inbound_available(connection);
+    let remaining_fds: t27 = wayland_native_max_inbound_fds()
+        - len[i64](connection.*.inbound_fds) as t27;
+    if (connection.*.connected == 0 || connection.*.fd < 0
+        || remaining_bytes < 1 || remaining_fds < 0) {
+        wayland_connection_fail_protocol(connection,
+            "Wayland inbound FIFO has no remaining receive capacity");
+        return 0;
+    }
+    let capacity: i32 = wayland_native_inbound_read_capacity();
+    if (remaining_bytes < capacity as t27) {
+        capacity = remaining_bytes as i32;
+    }
+    let native: LinuxReceiveFdsResult = linux_receive_buffer_fds(
+        connection.*.fd, capacity, remaining_fds);
+    return wayland_native_inbound_feed(connection, &native);
+}
+
+fn wayland_native_inbound_u32(connection: *WaylandNativeConnection,
+    relative_offset: i32) t27 {
+    let offset: i32 = connection.*.inbound_byte_start + relative_offset;
+    if (relative_offset < 0 || offset < 0
+        || offset + 4 > len[u8](connection.*.inbound_bytes)) { return 0; }
+    return connection.*.inbound_bytes.data[offset] as t27
+        + (connection.*.inbound_bytes.data[offset + 1] as t27) * 256
+        + (connection.*.inbound_bytes.data[offset + 2] as t27) * 65536
+        + (connection.*.inbound_bytes.data[offset + 3] as t27) * 16777216;
+}
+
+// Descriptor schema is derived from live protocol object roles, never from
+// recvmsg byte position. Only wl_keyboard.keymap and wl_data_source.send carry
+// one inbound FD in the protocols bound by this client.
+fn wayland_native_inbound_expected_fds(
+    connection: *WaylandNativeConnection, object_id: t27,
+    opcode: t27) t27 {
+    if (connection.*.keyboard_id != 0
+        && object_id == connection.*.keyboard_id && opcode == 0) { return 1; }
+    if (connection.*.clipboard_available != 0
+        && wayland_clipboard_source_index(
+            &connection.*.clipboard_state, object_id) >= 0
+        && opcode == 1) { return 1; }
+    return 0;
+}
+
+// Extract exactly one complete frame in stream order. A complete one-FD frame
+// remains buffered until the next ordered descriptor exists; zero-FD frames
+// pass even when descriptors for later schema are already queued.
+fn wayland_native_inbound_extract(connection: *WaylandNativeConnection,
+    result: *WaylandNativeFrameReceive) i32 {
+    let available: t27 = wayland_native_inbound_available(connection);
+    if (available == 0) {
+        if (connection.*.inbound_eof != 0) {
+            if (len[i64](connection.*.inbound_fds) > 0) {
+                return wayland_native_inbound_fail(connection, result,
+                    "Wayland EOF left unmatched ancillary descriptors");
+            }
+            return wayland_native_inbound_fail(connection, result,
+                "Wayland display stream reached EOF");
+        }
+        return 0;
+    }
+    if (available < 8) {
+        if (connection.*.inbound_eof != 0) {
+            return wayland_native_inbound_fail(connection, result,
+                "Wayland EOF truncated a frame header");
+        }
+        return 0;
+    }
+    let object_id: t27 = wayland_native_inbound_u32(connection, 0);
+    let encoded: t27 = wayland_native_inbound_u32(connection, 4);
+    let opcode: t27 = encoded % 65536;
+    let size: t27 = encoded / 65536;
+    if (object_id < 1 || size < 8 || size > 65535 || (size % 4) != 0) {
+        return wayland_native_inbound_fail(connection, result,
+            "Wayland inbound frame header was malformed");
+    }
+    if (available < size) {
+        if (connection.*.inbound_eof != 0) {
+            return wayland_native_inbound_fail(connection, result,
+                "Wayland EOF truncated a declared frame");
+        }
+        return 0;
+    }
+    let expected_fds: t27 = wayland_native_inbound_expected_fds(
+        connection, object_id, opcode);
+    if (expected_fds == 1
+        && len[i64](connection.*.inbound_fds) == 0) {
+        if (connection.*.inbound_eof != 0) {
+            return wayland_native_inbound_fail(connection, result,
+                "Wayland EOF omitted a required frame descriptor");
+        }
+        return 0;
+    }
+    let frame_bytes: WireBuffer = wire_new(size as i32);
+    let byte_i: i32 = 0;
+    while (byte_i < size as i32) {
+        wire_push_u8(&frame_bytes, connection.*.inbound_bytes.data[
+            connection.*.inbound_byte_start + byte_i] as t27);
+        byte_i = byte_i + 1;
+    }
+    let frame: WaylandFrame = wayland_decode(&frame_bytes, 0);
+    if (frame_bytes.error != 0 || frame.valid == 0
+        || frame.object_id != object_id || frame.opcode != opcode
+        || frame.size != size
+        || frame.size != len[u8](frame_bytes.bytes) as t27) {
+        wire_free(&frame_bytes);
+        return wayland_native_inbound_fail(connection, result,
+            "Wayland inbound frame failed exact decode");
+    }
+    connection.*.inbound_byte_start =
+        connection.*.inbound_byte_start + size as i32;
+    if (connection.*.inbound_byte_start
+            == len[u8](connection.*.inbound_bytes)) {
+        connection.*.inbound_bytes.len = 0;
+        connection.*.inbound_byte_start = 0;
+    }
+    wire_free(&result.*.input); result.*.input = frame_bytes;
+    if (expected_fds == 1) {
+        result.*.received_fd = connection.*.inbound_fds.data[0];
+        let fd_i: i32 = 0;
+        while (fd_i + 1 < len[i64](connection.*.inbound_fds)) {
+            connection.*.inbound_fds.data[fd_i] =
+                connection.*.inbound_fds.data[fd_i + 1];
+            fd_i = fd_i + 1;
+        }
+        connection.*.inbound_fds.len =
+            connection.*.inbound_fds.len - 1;
+        result.*.has_fd = 1; result.*.fd_count = 1;
+        result.*.cloexec_applied = 1;
+    }
+    result.*.valid = 1; return 1;
+}
+
+// Production connection receiver. Timeouts preserve every partial byte and FD
+// for the next call; EOF, malformed framing, or FIFO overflow terminally closes
+// all connection-owned resources.
+fn wayland_connection_receive_frame(connection: *WaylandNativeConnection,
+    timeout_ms: t27) WaylandNativeFrameReceive {
+    let result: WaylandNativeFrameReceive = wayland_native_empty_frame_receive();
+    if (timeout_ms < 0 || connection.*.connected == 0
+        || connection.*.fd < 0) {
+        result.input.error = 1; return result;
+    }
+    let deadline: i64 = linux_monotonic_ms() + timeout_ms as i64;
+    while (1 != 0) {
+        let extracted: i32 = wayland_native_inbound_extract(
+            connection, &result);
+        if (extracted != 0) { return result; }
+        let now: i64 = linux_monotonic_ms();
+        if (now > deadline) { result.input.error = 1; return result; }
+        let remaining: t27 = (deadline - now) as t27;
+        if (linux_poll_readable(connection.*.fd, remaining) == 0) {
+            result.input.error = 1; return result;
+        }
+        if (wayland_native_inbound_read_once(connection) == 0) {
+            result.input.error = 1; result.stream_terminal = 1; return result;
+        }
+    }
+    return result;
+}
+
+// Always frees request, including disabled/failure paths. enabled carries the
+// prior send result so request sequences stop mutating the wire after failure
+// without leaking buffers that were already constructed.
+fn wayland_native_send_request(connection: *WaylandNativeConnection,
+    request: *WireBuffer, enabled: i32) i32 {
+    let ok: i32 = 0;
+    if (enabled != 0 && request.*.error == 0) {
+        let expected: i64 = len[u8](request.*.bytes) as i64;
+        let sent: LinuxWriteAllResult = linux_send_wire_all(connection.*.fd, request);
+        if (sent.complete != 0 && sent.written == expected) { ok = 1; }
+    }
+    if (enabled != 0 && ok == 0) {
+        // A short stream write leaves a request prefix on the wire. Retire the
+        // connection immediately; a later request must never append to it.
+        if (connection.*.fd >= 0) { let _closed_short_write: i64 = linux_close(connection.*.fd); }
+        wayland_connection_retire_active_state(connection);
+        connection.*.fd = 0 - 1; connection.*.connected = 0;
+        connection.*.error = "Wayland request write was incomplete";
+    }
+    wire_free(request);
+    return ok;
+}
+
+fn wayland_native_send_request_until(connection: *WaylandNativeConnection,
+    request: *WireBuffer, deadline: i64) LinuxWriteAllResult {
+    let result: LinuxWriteAllResult = LinuxWriteAllResult{
+        .written = 0, .error_code = 0 - 22, .complete = 0 };
+    if (connection.*.connected != 0 && connection.*.fd >= 0
+        && request.*.error == 0) {
+        result = linux_send_wire_all_strict_until(
+            connection.*.fd, request, deadline);
+    }
+    let expected: i64 = len[u8](request.*.bytes) as i64;
+    wire_free(request);
+    if (result.complete != 0 && result.written == expected) { return result; }
+    if (result.written == 0 && result.error_code == (0 - 110)) {
+        return result;
+    }
+    wayland_connection_fail_protocol(connection,
+        "Wayland request write was incomplete");
+    return result;
+}
+
+// passed_fd remains caller-owned. The request buffer is always freed. A failed
+// or partial SCM_RIGHTS request retires the display stream just like a byte-only
+// request, because appending another request would corrupt frame boundaries.
+fn wayland_native_send_request_fd(connection: *WaylandNativeConnection,
+    request: *WireBuffer, passed_fd: i64, enabled: i32) i32 {
+    let ok: i32 = 0;
+    if (enabled != 0 && request.*.error == 0 && passed_fd >= 0) {
+        let expected: i64 = len[u8](request.*.bytes) as i64;
+        let sent: LinuxWriteAllResult = linux_send_wire_fd_all(
+            connection.*.fd, request, passed_fd);
+        if (sent.complete != 0 && sent.written == expected) { ok = 1; }
+    }
+    if (enabled != 0 && ok == 0) {
+        if (connection.*.fd >= 0) { let _closed_fd_write: i64 = linux_close(connection.*.fd); }
+        wayland_connection_retire_active_state(connection);
+        connection.*.fd = 0 - 1; connection.*.connected = 0;
+        connection.*.error = "Wayland descriptor request write was incomplete";
+    }
+    wire_free(request);
+    return ok;
+}
+
+// Owning strict-deadline descriptor sender used by clipboard receive. An
+// expiry before the first byte is a bounded operation failure and leaves the
+// display stream synchronized. Every partial request or other transport error
+// retires the connection because no later frame may follow its prefix.
+fn wayland_native_send_request_fd_until(
+    connection: *WaylandNativeConnection, request: *WireBuffer,
+    passed_fd: i64, deadline: i64) LinuxWriteAllResult {
+    let result: LinuxWriteAllResult = LinuxWriteAllResult{
+        .written = 0, .error_code = 0 - 22, .complete = 0 };
+    if (connection.*.connected != 0 && connection.*.fd >= 0
+        && request.*.error == 0 && passed_fd >= 0) {
+        result = linux_send_wire_fd_all_until(connection.*.fd,
+            request, passed_fd, deadline);
+    }
+    let expected: i64 = len[u8](request.*.bytes) as i64;
+    wire_free(request);
+    if (result.complete != 0 && result.written == expected) { return result; }
+    if (result.written == 0 && result.error_code == (0 - 110)) {
+        return result;
+    }
+    wayland_connection_fail_protocol(connection,
+        "Wayland descriptor request write was incomplete");
+    return result;
+}
+
+fn wayland_begin_registry(connection: *WaylandNativeConnection) i32 {
+    if (connection.*.fd < 0) { return 0; }
+    let registry: WireBuffer = wayland_display_get_registry(2);
+    let sync: WireBuffer = wayland_display_sync(3);
+    let ok: i32 = wayland_native_send_request(connection, &registry, 1);
+    ok = wayland_native_send_request(connection, &sync, ok);
+    return ok;
+}
+
+fn wayland_registry_max_globals() t27 { return 256; }
+fn wayland_registry_max_interface_bytes() t27 { return 128; }
+fn wayland_registry_max_total_interface_bytes() t27 { return 8192; }
+
+fn wayland_connection_fail_protocol(connection: *WaylandNativeConnection, reason: []u8) void {
+    if (connection.*.fd >= 0) { let _closed_protocol: i64 = linux_close(connection.*.fd); }
+    wayland_connection_retire_active_state(connection);
+    connection.*.fd = 0 - 1; connection.*.connected = 0;
+    connection.*.registry_failed = 1; connection.*.error = reason;
+}
+
+fn wayland_record_global(connection: *WaylandNativeConnection, advertised: WaylandGlobal) i32 {
+    if (connection.*.registry_failed != 0 || advertised.valid == 0 || advertised.name < 1
+        || advertised.version < 1 || advertised.interface.len < 1
+        || advertised.interface.len as t27 > wayland_registry_max_interface_bytes()
+        || len[WaylandGlobal](connection.*.globals) as t27 >= wayland_registry_max_globals()
+        || connection.*.registry_total_interface_bytes + advertised.interface.len as t27
+            > wayland_registry_max_total_interface_bytes()) { return 0; }
+    let existing_i: i32 = 0;
+    while (existing_i < len[WaylandGlobal](connection.*.globals)) {
+        if (get[WaylandGlobal](connection.*.globals, existing_i).name == advertised.name) { return 0; }
+        existing_i = existing_i + 1;
+    }
+    let stable: WaylandGlobal = advertised;
+    stable.interface_storage = make[u8](advertised.interface.len);
+    let byte_i: i32 = 0;
+    while (byte_i < advertised.interface.len) {
+        let byte: t27 = advertised.interface[byte_i] as t27;
+        if (byte < 33 || byte > 126) {
+            free[u8](&stable.interface_storage); return 0;
+        }
+        push[u8](&stable.interface_storage, advertised.interface[byte_i]);
+        byte_i = byte_i + 1;
+    }
+    stable.interface = stable.interface_storage.data[0..len[u8](stable.interface_storage)];
+    push[WaylandGlobal](&connection.*.globals, stable);
+    connection.*.registry_total_interface_bytes = connection.*.registry_total_interface_bytes
+        + advertised.interface.len as t27;
+    if (@strEq(stable.interface, "wl_compositor") == 1) { connection.*.compositor_name = stable.name; }
+    else if (@strEq(stable.interface, "wl_shm") == 1) { connection.*.shm_name = stable.name; }
+    else if (@strEq(stable.interface, "xdg_wm_base") == 1) { connection.*.xdg_wm_base_name = stable.name; }
+    else if (@strEq(stable.interface, "wl_seat") == 1) { connection.*.seat_name = stable.name; }
+    else if (@strEq(stable.interface, "wl_data_device_manager") == 1) {
+        connection.*.clipboard_manager_name = stable.name;
+    }
+    return 1;
+}
+
+fn wayland_global_version(connection: *WaylandNativeConnection, name: t27) t27 {
+    let i: i32 = 0;
+    while (i < len[WaylandGlobal](connection.*.globals)) {
+        let advertised: WaylandGlobal = get[WaylandGlobal](connection.*.globals, i);
+        if (advertised.name == name) { return advertised.version; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn wayland_native_event_exact(frame: WaylandFrame, object_id: t27,
+    opcode: t27, size: t27) i32 {
+    if (frame.valid == 1 && frame.object_id == object_id
+        && frame.opcode == opcode && frame.size == size) { return 1; }
+    return 0;
+}
+
+fn wayland_native_toplevel_configure_valid(input: *WireBuffer,
+    frame: WaylandFrame, toplevel_id: t27,
+    current_width: t27, current_height: t27) i32 {
+    if (input.*.error != 0 || frame.valid == 0 || frame.object_id != toplevel_id
+        || frame.opcode != 0 || frame.size < 20 || frame.payload_offset < 0
+        || frame.payload_offset + 12 > len[u8](input.*.bytes)) { return 0; }
+    let proposed_width: t27 = wire_read_i32_le(input, frame.payload_offset);
+    let proposed_height: t27 = wire_read_i32_le(input, frame.payload_offset + 4);
+    let states_bytes: t27 = wire_read_u32_le(input, frame.payload_offset + 8);
+    let width: t27 = wayland_native_resolve_configure_axis(
+        proposed_width, current_width);
+    let height: t27 = wayland_native_resolve_configure_axis(
+        proposed_height, current_height);
+    if (input.*.error != 0
+        || wayland_native_configure_axis_valid(proposed_width) == 0
+        || wayland_native_configure_axis_valid(proposed_height) == 0
+        || wayland_native_surface_dimensions_valid(width, height) == 0
+        || (states_bytes % 4) != 0
+        || states_bytes / 4 > wayland_native_max_toplevel_states()
+        || frame.size != 20 + states_bytes
+        || frame.payload_offset + 12 + states_bytes as i32 > len[u8](input.*.bytes)) {
+        return 0;
+    }
+    // Read each enum lane to keep structural validation at the wire boundary.
+    // Values remain forward-compatible and are not interpreted by this layer.
+    let state_i: i32 = 0;
+    while (state_i < (states_bytes / 4) as i32) {
+        let _state: t27 = wire_read_u32_le(input,
+            frame.payload_offset + 12 + state_i * 4);
+        state_i = state_i + 1;
+    }
+    if (input.*.error != 0) { return 0; }
+    return 1;
+}
+
+fn wayland_native_reject_frame(connection: *WaylandNativeConnection,
+    input: *WireBuffer, reason: []u8) i32 {
+    wire_free(input); wayland_connection_fail_protocol(connection, reason); return 0;
+}
+
+fn wayland_native_clipboard_frame_owned(
+    connection: *WaylandNativeConnection, frame: WaylandFrame) i32 {
+    if (connection.*.clipboard_available == 0
+        || connection.*.clipboard_state.valid == 0 || frame.valid == 0) {
+        return 0;
+    }
+    if (frame.object_id == connection.*.clipboard_device_id
+        || wayland_clipboard_offer_index(&connection.*.clipboard_state,
+            frame.object_id) >= 0
+        || wayland_clipboard_source_index(&connection.*.clipboard_state,
+            frame.object_id) >= 0) { return 1; }
+    return 0;
+}
+
+// Retiring sources remain a causal self-mirror epoch through destroy_requested
+// until cancellation or the destroy barrier removes the exact generation.
+fn wayland_native_clipboard_mirror_epoch_live(
+    connection: *WaylandNativeConnection) i32 {
+    let identity: WaylandClipboardIdentity = connection.*.clipboard_mirror_identity;
+    let index: i32 = wayland_native_clipboard_source_index(connection, identity);
+    if (identity.valid != 0 && index >= 0
+        && connection.*.clipboard_sources.data[index].cancelled == 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn wayland_native_clipboard_public_local_active(
+    connection: *WaylandNativeConnection) i32 {
+    if (connection.*.clipboard_published_kind
+            != WaylandNativeClipboardAuthorityKind.Local) { return 0; }
+    let index: i32 = wayland_native_clipboard_source_index(connection,
+        connection.*.clipboard_published_identity);
+    if (index >= 0 && connection.*.clipboard_sources.data[index].cancelled == 0
+        && connection.*.clipboard_sources.data[index].destroy_requested == 0) {
+        return 1;
+    }
+    return 0;
+}
+
+// Drain the low-level retirement FIFO, not only dispatch.replaced. A selection
+// NULL can retire both pending and current offers, and every exact destroy is
+// committed only after its complete transport write.
+fn wayland_native_clipboard_drain_retired_offers(
+    connection: *WaylandNativeConnection, deadline: i64) i32 {
+    while (connection.*.clipboard_available != 0
+        && connection.*.clipboard_state.terminal == 0) {
+        let identity: WaylandClipboardIdentity =
+            wayland_clipboard_take_retired_offer(
+                &connection.*.clipboard_state);
+        if (identity.valid == 0) { return 1; }
+        let destroy: WireBuffer = wayland_clipboard_destroy_offer(
+            &connection.*.clipboard_state, identity);
+        let sent: LinuxWriteAllResult = wayland_native_send_request_until(
+            connection, &destroy, deadline);
+        if (sent.complete == 0) {
+            if (connection.*.connected != 0) {
+                wayland_connection_fail_protocol(connection,
+                    "Wayland retired clipboard offer destroy timed out");
+            }
+            return 0;
+        }
+        if (wayland_clipboard_destroy_offer_commit(
+            &connection.*.clipboard_state, identity, 1) == 0) {
+            wayland_connection_fail_protocol(connection,
+                "Wayland retired clipboard offer commit failed");
+            return 0;
+        }
+    }
+    return 0;
+}
+
+fn wayland_native_clipboard_service_source_send(
+    connection: *WaylandNativeConnection,
+    dispatch: *WaylandClipboardDispatch) i32 {
+    let index: i32 = wayland_native_clipboard_source_index(
+        connection, dispatch.*.identity);
+    if (index < 0) {
+        let _closed_missing: i32 = wayland_clipboard_dispatch_close(dispatch);
+        wayland_connection_fail_protocol(connection,
+            "Wayland source.send referenced missing generation bytes");
+        return 0;
+    }
+    let value: []u8 = "";
+    if (len[u8](connection.*.clipboard_sources.data[index].text) > 0) {
+        value = connection.*.clipboard_sources.data[index].text.data[0..
+            len[u8](connection.*.clipboard_sources.data[index].text)];
+    }
+    let deadline: i64 = linux_monotonic_ms()
+        + wayland_native_clipboard_service_timeout() as i64;
+    let error: WaylandClipboardError = wayland_clipboard_dispatch_write_text(
+        dispatch, value, deadline);
+    connection.*.clipboard_last_error = error;
+    // A receiver closing or stalling its transfer pipe does not corrupt the
+    // Wayland display stream. The exact FD is nevertheless closed on every path.
+    return 1;
+}
+
+fn wayland_native_clipboard_schedule_source_destroy_until(
+    connection: *WaylandNativeConnection,
+    identity: WaylandClipboardIdentity, deadline: i64) i32 {
+    let index: i32 = wayland_native_clipboard_source_index(connection, identity);
+    if (index < 0 || connection.*.clipboard_available == 0) { return 0; }
+    if (connection.*.clipboard_sources.data[index].destroy_requested == 0) {
+        // Source creation retained one logical callback obligation. Numeric
+        // allocation waits until sync is actually emitted, preserving Wayland's
+        // strict dense client-ID sequence.
+        connection.*.clipboard_sources.data[index].destroy_requested = 1;
+    }
+    if (connection.*.clipboard_sources.data[index].destroy_sent == 0) {
+        let destroy: WireBuffer = wayland_clipboard_destroy_source(
+            &connection.*.clipboard_state, identity);
+        let sent_destroy: LinuxWriteAllResult =
+            wayland_native_send_request_until(connection, &destroy, deadline);
+        if (sent_destroy.complete == 0) { return 0; }
+        connection.*.clipboard_sources.data[index].destroy_sent = 1;
+    }
+    if (connection.*.clipboard_sources.data[index].destroy_barrier_sent == 0) {
+        let callback_id: t27 =
+            wayland_native_take_reserved_clipboard_callback(connection);
+        if (callback_id == 0) {
+            wayland_connection_fail_protocol(connection,
+                "Wayland clipboard destroy callback reservation was lost");
+            return 0;
+        }
+        let barrier: WireBuffer = wayland_display_sync(callback_id);
+        let sent_barrier: LinuxWriteAllResult =
+            wayland_native_send_request_until(connection, &barrier, deadline);
+        if (sent_barrier.complete == 0) {
+            if (connection.*.connected != 0 && sent_barrier.written == 0
+                && sent_barrier.error_code == (0 - 110)) {
+                // No bytes made the callback visible. Serialized allocation may
+                // roll back exactly one dense ID and restore its obligation.
+                connection.*.next_id = callback_id;
+                connection.*.clipboard_callback_obligations =
+                    connection.*.clipboard_callback_obligations + 1;
+            }
+            return 0;
+        }
+        connection.*.clipboard_sources.data[index].destroy_barrier_id = callback_id;
+        connection.*.clipboard_sources.data[index].destroy_barrier_sent = 1;
+    }
+    return 1;
+}
+
+fn wayland_native_clipboard_schedule_source_destroy(
+    connection: *WaylandNativeConnection,
+    identity: WaylandClipboardIdentity) i32 {
+    return wayland_native_clipboard_schedule_source_destroy_until(
+        connection, identity, linux_monotonic_ms()
+            + wayland_native_clipboard_service_timeout() as i64);
+}
+
+fn wayland_native_clipboard_barrier_index(
+    connection: *WaylandNativeConnection, object_id: t27) i32 {
+    let i: i32 = 0;
+    while (i < len[WaylandNativeClipboardSourceRecord](
+        connection.*.clipboard_sources)) {
+        if (connection.*.clipboard_sources.data[i].live != 0
+            && connection.*.clipboard_sources.data[i].destroy_requested != 0
+            && connection.*.clipboard_sources.data[i].destroy_barrier_sent != 0
+            && connection.*.clipboard_sources.data[i].destroy_barrier_id
+                == object_id) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// A callback.done barrier proves every source.send preceding the destroy has
+// been demarshalled and serviced. Only then may low state and immutable bytes
+// for the exact generation be removed.
+fn wayland_native_clipboard_process_destroy_barrier(
+    connection: *WaylandNativeConnection, input: *WireBuffer,
+    received_fd: i64, fd_count: t27, ancillary_valid: i32) i32 {
+    let frame: WaylandFrame = wayland_decode(input, 0);
+    let index: i32 = wayland_native_clipboard_barrier_index(
+        connection, frame.object_id);
+    if (index < 0) { return 0; }
+    if (received_fd >= 0) { let _closed_barrier_fd: i64 = linux_close(received_fd); }
+    if (fd_count != 0 || ancillary_valid == 0
+        || wayland_native_event_exact(frame, frame.object_id, 0, 12) == 0
+        || frame.size != len[u8](input.*.bytes) as t27) {
+        wayland_connection_fail_protocol(connection,
+            "Wayland clipboard destroy barrier was malformed");
+        return -1;
+    }
+    let _callback_data: t27 = wire_read_u32_le(input, frame.payload_offset);
+    let identity: WaylandClipboardIdentity =
+        connection.*.clipboard_sources.data[index].identity;
+    if (input.*.error != 0 || wayland_clipboard_destroy_source_commit(
+        &connection.*.clipboard_state, identity, 1) == 0) {
+        wayland_connection_fail_protocol(connection,
+            "Wayland clipboard source destroy commit failed");
+        return -1;
+    }
+    wayland_native_clipboard_source_remove(connection, index);
+    if (wayland_clipboard_identity_equal(
+        connection.*.clipboard_mirror_identity, identity) != 0) {
+        connection.*.clipboard_mirror_identity = wayland_clipboard_bad_identity();
+    }
+    return 1;
+}
+
+// A keyboard leave is not proof that the client lost selection authority: a
+// compositor may immediately enter another surface owned by this connection.
+// Keep exactly one callback object pending. A later Enter cancels withdrawal
+// without forgetting the callback identity; a subsequent Leave may reactivate
+// that same ordered probe until callback.done reaches the wire FIFO.
+fn wayland_native_clipboard_begin_focus_probe_until(
+    connection: *WaylandNativeConnection, order: t27,
+    deadline: i64) i32 {
+    if (connection.*.clipboard_available == 0) { return 1; }
+    if (connection.*.clipboard_focus_probe_pending != 0) {
+        connection.*.clipboard_focus_probe_order = order;
+        connection.*.clipboard_focus_probe_withdraw = 1;
+        return 1;
+    }
+    let callback_id: t27 = wayland_native_take_client_ids(connection, 1);
+    if (callback_id == 0) {
+        wayland_connection_fail_protocol(connection,
+            "Wayland clipboard focus callback identity exhausted");
+        return 0;
+    }
+    connection.*.clipboard_focus_probe_id = callback_id;
+    connection.*.clipboard_focus_probe_order = order;
+    connection.*.clipboard_focus_probe_pending = 1;
+    connection.*.clipboard_focus_probe_withdraw = 1;
+    let request: WireBuffer = wayland_display_sync(callback_id);
+    let sent: LinuxWriteAllResult = wayland_native_send_request_until(
+        connection, &request, deadline);
+    if (sent.complete == 0) {
+        if (connection.*.connected != 0) {
+            wayland_connection_fail_protocol(connection,
+                "Wayland clipboard focus probe timed out");
+        }
+        return 0;
+    }
+    return 1;
+}
+
+fn wayland_native_clipboard_begin_focus_probe(
+    connection: *WaylandNativeConnection, order: t27) i32 {
+    return wayland_native_clipboard_begin_focus_probe_until(connection, order,
+        linux_monotonic_ms()
+            + wayland_native_clipboard_service_timeout() as i64);
+}
+
+fn wayland_native_clipboard_cancel_focus_probe(
+    connection: *WaylandNativeConnection) void {
+    if (connection.*.clipboard_focus_probe_pending != 0) {
+        connection.*.clipboard_focus_probe_withdraw = 0;
+    }
+}
+
+fn wayland_native_clipboard_process_focus_probe(
+    connection: *WaylandNativeConnection, input: *WireBuffer,
+    received_fd: i64, fd_count: t27, ancillary_valid: i32) i32 {
+    let frame: WaylandFrame = wayland_decode(input, 0);
+    if (connection.*.clipboard_focus_probe_pending == 0
+        || frame.object_id != connection.*.clipboard_focus_probe_id) {
+        return 0;
+    }
+    if (received_fd >= 0) {
+        let _closed_focus_fd: i64 = linux_close(received_fd);
+    }
+    if (fd_count != 0 || ancillary_valid == 0
+        || wayland_native_event_exact(frame, frame.object_id, 0, 12) == 0
+        || frame.size != len[u8](input.*.bytes) as t27) {
+        wayland_connection_fail_protocol(connection,
+            "Wayland clipboard focus probe was malformed");
+        return -1;
+    }
+    let _callback_data: t27 = wire_read_u32_le(input, frame.payload_offset);
+    if (input.*.error != 0) {
+        wayland_connection_fail_protocol(connection,
+            "Wayland clipboard focus probe payload was malformed");
+        return -1;
+    }
+    let withdraw: i32 = connection.*.clipboard_focus_probe_withdraw;
+    connection.*.clipboard_focus_probe_id = 0;
+    connection.*.clipboard_focus_probe_order = 0;
+    connection.*.clipboard_focus_probe_pending = 0;
+    connection.*.clipboard_focus_probe_withdraw = 0;
+    if (withdraw == 0 || connection.*.keyboard_focus_surface != 0
+        || connection.*.clipboard_serial.valid != 0) { return 1; }
+    let order: t27 = wayland_native_clipboard_next_order(connection);
+    if (order == 0) {
+        wayland_connection_fail_protocol(connection,
+            "Wayland clipboard focus callback order exhausted");
+        return -1;
+    }
+    if (wayland_native_clipboard_queue_focus_withdrawal(
+        connection, order) == 0) { return -1; }
+    return 1;
+}
+
+fn wayland_native_clipboard_process_callback_frame(
+    connection: *WaylandNativeConnection, input: *WireBuffer,
+    received_fd: i64, fd_count: t27, ancillary_valid: i32) i32 {
+    let focus: i32 = wayland_native_clipboard_process_focus_probe(connection,
+        input, received_fd, fd_count, ancillary_valid);
+    if (focus != 0) { return focus; }
+    return wayland_native_clipboard_process_destroy_barrier(connection,
+        input, received_fd, fd_count, ancillary_valid);
+}
+
+// Returns 1 when a clipboard/callback frame was consumed, 0 on terminal
+// rejection, and -1 when the frame and descriptor remain caller-owned.
+fn wayland_native_clipboard_route_received(
+    connection: *WaylandNativeConnection, input: *WireBuffer,
+    received: *WaylandNativeFrameReceive) i32 {
+    let callback: i32 = wayland_native_clipboard_process_callback_frame(
+        connection, input, received.*.received_fd, received.*.fd_count,
+        received.*.ancillary_valid);
+    if (callback != 0) {
+        received.*.received_fd = 0 - 1; received.*.has_fd = 0;
+        if (callback < 0) { return 0; }
+        return 1;
+    }
+    let clipboard: i32 = wayland_native_clipboard_process_frame(
+        connection, input, received.*.received_fd, received.*.fd_count,
+        received.*.ancillary_valid);
+    if (clipboard != 0) {
+        received.*.received_fd = 0 - 1; received.*.has_fd = 0;
+        if (clipboard < 0) { return 0; }
+        return 1;
+    }
+    return -1;
+}
+
+// Schema-driven clipboard demarshal entry. A recognized clipboard frame takes
+// received_fd on every path; an unrecognized frame leaves it with the caller.
+// Future connection byte/FD FIFOs supply the descriptor selected by protocol
+// argument order rather than by recvmsg byte position.
+fn wayland_native_clipboard_process_frame(
+    connection: *WaylandNativeConnection, input: *WireBuffer,
+    received_fd: i64, fd_count: t27, ancillary_valid: i32) i32 {
+    let frame: WaylandFrame = wayland_decode(input, 0);
+    if (wayland_native_clipboard_frame_owned(connection, frame) == 0) {
+        return 0;
+    }
+    let dispatch: WaylandClipboardDispatch = wayland_clipboard_process_frame(
+        &connection.*.clipboard_state, input, received_fd,
+        fd_count, ancillary_valid);
+    if (dispatch.valid == 0 || connection.*.clipboard_state.terminal != 0) {
+        let _closed_bad_dispatch: i32 = wayland_clipboard_dispatch_close(&dispatch);
+        wayland_connection_fail_protocol(connection,
+            "Wayland clipboard protocol frame was rejected");
+        return -1;
+    }
+    let order: t27 = wayland_native_clipboard_next_order(connection);
+    if (order == 0) {
+        let _closed_order: i32 = wayland_clipboard_dispatch_close(&dispatch);
+        wayland_connection_fail_protocol(connection,
+            "Wayland clipboard operation order exhausted");
+        return -1;
+    }
+    if (dispatch.kind == WaylandClipboardEventKind.SourceSend) {
+        if (wayland_native_clipboard_service_source_send(
+            connection, &dispatch) == 0) { return -1; }
+        if (wayland_native_clipboard_drain_retired_offers(connection,
+            linux_monotonic_ms()
+                + wayland_native_clipboard_service_timeout() as i64) == 0) {
+            return -1;
+        }
+        return 1;
+    }
+
+    // Offer/MIME/DnD/target notifications mutate only bounded low state and
+    // retired resources. Queueing all 27x27 valid MIME transitions would exceed
+    // the shared 256-event publication FIFO without adding App authority.
+    if (dispatch.kind != WaylandClipboardEventKind.SelectionSet
+        && dispatch.kind != WaylandClipboardEventKind.SelectionCleared
+        && dispatch.kind != WaylandClipboardEventKind.SourceCancelled) {
+        if (wayland_native_clipboard_drain_retired_offers(connection,
+            linux_monotonic_ms()
+                + wayland_native_clipboard_service_timeout() as i64) == 0) {
+            let _closed_resource_failure: i32 =
+                wayland_clipboard_dispatch_close(&dispatch);
+            return -1;
+        }
+        let _closed_resource_dispatch: i32 =
+            wayland_clipboard_dispatch_close(&dispatch);
+        return 1;
+    }
+
+    let transition: WaylandNativeClipboardTransition =
+        wayland_native_empty_clipboard_transition();
+    transition.dispatch = dispatch; transition.order = order;
+    transition.valid = 1;
+    if ((dispatch.kind == WaylandClipboardEventKind.SelectionSet
+            || dispatch.kind == WaylandClipboardEventKind.SelectionCleared)
+        && wayland_native_clipboard_mirror_epoch_live(connection) != 0) {
+        transition.local_mirror = 1;
+        if (dispatch.kind == WaylandClipboardEventKind.SelectionSet) {
+            let _retired_mirror: WaylandClipboardIdentity =
+                wayland_clipboard_retire_current_offer(
+                    &connection.*.clipboard_state);
+        }
+    }
+    if (dispatch.kind == WaylandClipboardEventKind.SourceCancelled) {
+        let source_index: i32 = wayland_native_clipboard_source_index(
+            connection, dispatch.identity);
+        if (source_index < 0) {
+            wayland_native_clipboard_transition_free(&transition);
+            wayland_connection_fail_protocol(connection,
+                "Wayland source cancellation lost generation ownership");
+            return -1;
+        }
+        connection.*.clipboard_sources.data[source_index].cancelled = 1;
+        if (wayland_clipboard_identity_equal(
+            connection.*.clipboard_mirror_identity,
+            dispatch.identity) != 0) {
+            connection.*.clipboard_mirror_identity =
+                wayland_clipboard_bad_identity();
+        }
+    }
+    if (wayland_native_clipboard_drain_retired_offers(connection,
+        linux_monotonic_ms()
+            + wayland_native_clipboard_service_timeout() as i64) == 0) {
+        wayland_native_clipboard_transition_free(&transition); return -1;
+    }
+    if (wayland_connection_queue_clipboard_transition(
+        connection, &transition) == 0) {
+        wayland_native_clipboard_transition_free(&transition);
+        wayland_connection_fail_protocol(connection,
+            "Wayland pending clipboard transition queue exceeded its bound");
+        return -1;
+    }
+    if (dispatch.kind == WaylandClipboardEventKind.SourceCancelled
+        && wayland_native_clipboard_schedule_source_destroy(
+            connection, dispatch.identity) == 0) {
+        if (connection.*.connected != 0) {
+            wayland_connection_fail_protocol(connection,
+                "Wayland cancelled clipboard source could not be destroyed");
+        }
+        return -1;
+    }
+    return 1;
+}
+
+fn wayland_native_clipboard_queue_focus_withdrawal(
+    connection: *WaylandNativeConnection, order: t27) i32 {
+    if (connection.*.clipboard_available == 0) { return 1; }
+    let _retired_count: i32 = wayland_clipboard_selection_focus_lost(
+        &connection.*.clipboard_state);
+    if (connection.*.clipboard_state.terminal != 0
+        || wayland_native_clipboard_drain_retired_offers(connection,
+            linux_monotonic_ms()
+                + wayland_native_clipboard_service_timeout() as i64) == 0) {
+        if (connection.*.connected != 0) {
+            wayland_connection_fail_protocol(connection,
+                "Wayland clipboard focus withdrawal failed");
+        }
+        return 0;
+    }
+    let transition: WaylandNativeClipboardTransition =
+        wayland_native_empty_clipboard_transition();
+    transition.dispatch.kind = WaylandClipboardEventKind.SelectionCleared;
+    transition.dispatch.valid = 1;
+    transition.order = order; transition.valid = 1;
+    if (wayland_native_clipboard_mirror_epoch_live(connection) != 0) {
+        transition.local_mirror = 1;
+    }
+    if (wayland_connection_queue_clipboard_transition(
+        connection, &transition) == 0) {
+        wayland_native_clipboard_transition_free(&transition);
+        wayland_connection_fail_protocol(connection,
+            "Wayland clipboard focus transition queue exceeded its bound");
+        return 0;
+    }
+    return 1;
+}
+
+// Observe already schema-decoded keyboard authority at its connection order.
+// A selection may validly arrive immediately before Enter, so Enter preserves
+// it while installing a fresh serial (including numeric zero). Leave suspends
+// remote authority behind a sync probe; Enter on another owned surface cancels
+// withdrawal while the callback object remains tracked until done.
+fn wayland_native_clipboard_observe_keyboard_event(
+    connection: *WaylandNativeConnection,
+    event: *WaylandKeyboardEvent) i32 {
+    if (event.*.valid == 0 || event.*.kind == WaylandKeyboardEventKind.Keymap) {
+        return 1;
+    }
+    let order: t27 = wayland_native_clipboard_next_order(connection);
+    if (order == 0) {
+        wayland_connection_fail_protocol(connection,
+            "Wayland clipboard focus order exhausted");
+        return 0;
+    }
+    if (event.*.kind == WaylandKeyboardEventKind.Enter) {
+        if (event.*.surface_id == 0 || wayland_connection_has_surface(
+            connection, event.*.surface_id) == 0) { return 0; }
+        connection.*.clipboard_serial = WaylandNativeClipboardSerial{
+            .value = event.*.serial, .seat_id = connection.*.seat_id,
+            .surface_id = event.*.surface_id, .order = order, .valid = 1 };
+        wayland_native_clipboard_cancel_focus_probe(connection);
+        return 1;
+    }
+    if (event.*.kind == WaylandKeyboardEventKind.Leave) {
+        if (connection.*.clipboard_serial.valid == 0
+            || connection.*.clipboard_serial.seat_id != connection.*.seat_id
+            || connection.*.clipboard_serial.surface_id != event.*.surface_id) {
+            return 0;
+        }
+        connection.*.clipboard_serial = wayland_native_empty_clipboard_serial();
+        return wayland_native_clipboard_begin_focus_probe(
+            connection, order);
+    }
+    if (event.*.kind == WaylandKeyboardEventKind.Key
+        || event.*.kind == WaylandKeyboardEventKind.Modifiers) {
+        if (connection.*.clipboard_serial.valid == 0
+            || connection.*.clipboard_serial.seat_id != connection.*.seat_id
+            || event.*.surface_id == 0
+            || connection.*.clipboard_serial.surface_id != event.*.surface_id) {
+            return 0;
+        }
+        connection.*.clipboard_serial.value = event.*.serial;
+        connection.*.clipboard_serial.order = order;
+        return 1;
+    }
+    return 1;
+}
+
+fn wayland_native_clipboard_observe_keyboard_withdrawal(
+    connection: *WaylandNativeConnection) i32 {
+    let order: t27 = wayland_native_clipboard_next_order(connection);
+    if (order == 0) {
+        wayland_connection_fail_protocol(connection,
+            "Wayland clipboard focus order exhausted");
+        return 0;
+    }
+    connection.*.clipboard_serial = wayland_native_empty_clipboard_serial();
+    return wayland_native_clipboard_begin_focus_probe(connection, order);
+}
+
+// Publish one FIFO transition without invoking UI callbacks. Older received
+// transitions may still clean exact resources, but cannot overwrite a later
+// successful local copy/release publication.
+fn wayland_native_clipboard_apply_transition(
+    connection: *WaylandNativeConnection,
+    transition: *WaylandNativeClipboardTransition) i32 {
+    if (transition.*.valid == 0 || transition.*.dispatch.valid == 0) {
+        return 0;
+    }
+    if (transition.*.order <= connection.*.clipboard_published_order) {
+        wayland_native_clipboard_transition_free(transition); return 1;
+    }
+    let kind: WaylandClipboardEventKind = transition.*.dispatch.kind;
+    if (kind == WaylandClipboardEventKind.SelectionSet) {
+        if (transition.*.local_mirror == 0) {
+            connection.*.clipboard_published_kind =
+                WaylandNativeClipboardAuthorityKind.Remote;
+            connection.*.clipboard_published_identity =
+                transition.*.dispatch.identity;
+            connection.*.clipboard_published_owner_surface = 0;
+        }
+        connection.*.clipboard_published_order = transition.*.order;
+    } else if (kind == WaylandClipboardEventKind.SelectionCleared) {
+        if (transition.*.local_mirror == 0
+            || connection.*.clipboard_published_kind
+                != WaylandNativeClipboardAuthorityKind.Local) {
+            connection.*.clipboard_published_kind =
+                WaylandNativeClipboardAuthorityKind.None;
+            connection.*.clipboard_published_identity =
+                wayland_clipboard_bad_identity();
+            connection.*.clipboard_published_owner_surface = 0;
+        }
+        connection.*.clipboard_published_order = transition.*.order;
+    } else if (kind == WaylandClipboardEventKind.SourceCancelled) {
+        if (connection.*.clipboard_published_kind
+                == WaylandNativeClipboardAuthorityKind.Local
+            && wayland_clipboard_identity_equal(
+                connection.*.clipboard_published_identity,
+                transition.*.dispatch.identity) != 0) {
+            connection.*.clipboard_published_kind =
+                WaylandNativeClipboardAuthorityKind.None;
+            connection.*.clipboard_published_identity =
+                wayland_clipboard_bad_identity();
+            connection.*.clipboard_published_owner_surface = 0;
+        }
+        connection.*.clipboard_published_order = transition.*.order;
+    }
+    wayland_native_clipboard_transition_free(transition);
+    return 1;
+}
+
+fn wayland_native_clipboard_bad_read(
+    status: WaylandNativeClipboardStatus) WaylandNativeClipboardReadResult {
+    return WaylandNativeClipboardReadResult{ .status = status,
+        .bytes = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 },
+        .valid = 0 };
+}
+
+fn wayland_native_clipboard_read_result_free(
+    result: *WaylandNativeClipboardReadResult) void {
+    if (result.*.bytes.cap > 0) { free[u8](&result.*.bytes); }
+    result.*.bytes = ArrayList[u8]{
+        .data = null as *u8, .len = 0, .cap = 0 };
+    result.*.valid = 0;
+}
+
+fn wayland_native_clipboard_status_from_error(
+    error: WaylandClipboardError) WaylandNativeClipboardStatus {
+    if (error == WaylandClipboardError.None) {
+        return WaylandNativeClipboardStatus.Ok;
+    }
+    if (error == WaylandClipboardError.InvalidArgument) {
+        return WaylandNativeClipboardStatus.InvalidArgument;
+    }
+    if (error == WaylandClipboardError.InvalidUtf8) {
+        return WaylandNativeClipboardStatus.InvalidUtf8;
+    }
+    if (error == WaylandClipboardError.TooLarge) {
+        return WaylandNativeClipboardStatus.TooLarge;
+    }
+    if (error == WaylandClipboardError.MimeLimit) {
+        return WaylandNativeClipboardStatus.ResourceLimit;
+    }
+    if (error == WaylandClipboardError.Timeout) {
+        return WaylandNativeClipboardStatus.Timeout;
+    }
+    if (error == WaylandClipboardError.InvalidMime) {
+        return WaylandNativeClipboardStatus.UnsupportedTarget;
+    }
+    if (error == WaylandClipboardError.InvalidSelection) {
+        return WaylandNativeClipboardStatus.NoSelection;
+    }
+    if (error == WaylandClipboardError.TransferFailed
+        || error == WaylandClipboardError.InvalidFd) {
+        return WaylandNativeClipboardStatus.TransportFailed;
+    }
+    return WaylandNativeClipboardStatus.MalformedReply;
+}
+
+// Preserve the immutable low-level construction cause before releasing any
+// allocation-free or partially-owned receive request sentinel.
+fn wayland_native_clipboard_abort_receive_request(
+    transfer: *WaylandClipboardReceiveRequest) WaylandNativeClipboardStatus {
+    let status: WaylandNativeClipboardStatus =
+        wayland_native_clipboard_status_from_error(transfer.*.error);
+    let _aborted: i32 = wayland_clipboard_receive_request_abort(transfer);
+    return status;
+}
+
+fn wayland_native_clipboard_status_from_send(
+    connection: *WaylandNativeConnection,
+    sent: LinuxWriteAllResult) WaylandNativeClipboardStatus {
+    if (sent.complete != 0) { return WaylandNativeClipboardStatus.Ok; }
+    if (connection.*.connected != 0 && sent.written == 0
+        && sent.error_code == (0 - 110)) {
+        return WaylandNativeClipboardStatus.Timeout;
+    }
+    return WaylandNativeClipboardStatus.TransportFailed;
+}
+
+// Public clipboard calls never synchronously drain the UI/input FIFO. Any raw
+// frame retained by a native wait could contain a newer focus transition, so
+// serial-authorized mutation fails closed until app_poll consumes it. Already
+// decoded clipboard publications are generation/order tagged and need not be
+// drained for a later local copy/release to supersede them safely.
+fn wayland_native_clipboard_has_deferred_raw_frame(
+    connection: *WaylandNativeConnection) i32 {
+    let i: i32 = 0;
+    while (i < len[WaylandNativeQueuedFrame](connection.*.pending_frames)) {
+        if (connection.*.pending_frames.data[i].kind
+            == WaylandNativePendingKind.Frame) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn wayland_native_clipboard_serial_authorizes(
+    connection: *WaylandNativeConnection, surface_id: t27) i32 {
+    if (connection.*.clipboard_serial.valid == 0
+        || connection.*.clipboard_serial.value < 0
+        || connection.*.clipboard_serial.value > 4294967295
+        || connection.*.clipboard_serial.seat_id != connection.*.seat_id
+        || connection.*.clipboard_serial.surface_id != surface_id
+        || connection.*.clipboard_serial.order <= 0
+        || connection.*.keyboard_focus_surface != surface_id
+        || connection.*.seat_has_keyboard == 0
+        || connection.*.clipboard_focus_probe_withdraw != 0
+        || wayland_native_clipboard_has_deferred_raw_frame(connection) != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+fn wayland_native_clipboard_ready(
+    connection: *WaylandNativeConnection) WaylandNativeClipboardStatus {
+    if (connection.*.connected == 0 || connection.*.fd < 0) {
+        return WaylandNativeClipboardStatus.TransportFailed;
+    }
+    if (connection.*.clipboard_available == 0
+        || connection.*.clipboard_state.valid == 0) {
+        return WaylandNativeClipboardStatus.Unsupported;
+    }
+    if (connection.*.clipboard_state.terminal != 0) {
+        return WaylandNativeClipboardStatus.TransportFailed;
+    }
+    return WaylandNativeClipboardStatus.Ok;
+}
+
+fn wayland_native_clipboard_copy(
+    connection: *WaylandNativeConnection, surface_id: t27,
+    value: []u8, timeout_ms: t27) WaylandNativeClipboardStatus {
+    if (surface_id < 1 || timeout_ms < 0) {
+        return WaylandNativeClipboardStatus.InvalidArgument;
+    }
+    let ready: WaylandNativeClipboardStatus =
+        wayland_native_clipboard_ready(connection);
+    if (ready != WaylandNativeClipboardStatus.Ok) { return ready; }
+    if (value.len as t27 > wayland_clipboard_max_transfer_bytes()) {
+        return WaylandNativeClipboardStatus.TooLarge;
+    }
+    if (utf8_validate(value).valid == 0) {
+        return WaylandNativeClipboardStatus.InvalidUtf8;
+    }
+    if (wayland_connection_has_surface(connection, surface_id) == 0
+        || wayland_native_clipboard_serial_authorizes(
+            connection, surface_id) == 0) {
+        return WaylandNativeClipboardStatus.OwnershipRejected;
+    }
+    if (len[WaylandNativeClipboardSourceRecord](
+            connection.*.clipboard_sources) as t27
+            >= wayland_clipboard_max_sources()
+        || wayland_native_client_ids_available(
+            connection, 1, 1) == 0) {
+        return WaylandNativeClipboardStatus.ResourceLimit;
+    }
+    let order: t27 = wayland_native_clipboard_next_order(connection);
+    if (order == 0) { return WaylandNativeClipboardStatus.ResourceLimit; }
+    let deadline: i64 = linux_monotonic_ms() + timeout_ms as i64;
+    let source_id: t27 = connection.*.next_id;
+    let create: WireBuffer = wayland_clipboard_prepare_source(
+        &connection.*.clipboard_state, source_id);
+    let identity: WaylandClipboardIdentity =
+        connection.*.clipboard_state.prepared_source;
+    if (create.error != 0 || identity.valid == 0) {
+        wire_free(&create);
+        return WaylandNativeClipboardStatus.ResourceLimit;
+    }
+    let allocated_source_id: t27 = wayland_native_take_client_ids(
+        connection, 1);
+    if (allocated_source_id != source_id) {
+        let _aborted_allocation: WaylandClipboardIdentity =
+            wayland_clipboard_register_source_commit(
+                &connection.*.clipboard_state, source_id, 0);
+        wire_free(&create);
+        return WaylandNativeClipboardStatus.ResourceLimit;
+    }
+    connection.*.clipboard_callback_obligations =
+        connection.*.clipboard_callback_obligations + 1;
+    let copied: ArrayList[u8] = make[u8](value.len);
+    let copy_i: i32 = 0;
+    while (copy_i < value.len) {
+        push[u8](&copied, value[copy_i]); copy_i = copy_i + 1;
+    }
+    push[WaylandNativeClipboardSourceRecord](&connection.*.clipboard_sources,
+        WaylandNativeClipboardSourceRecord{ .identity = identity,
+            .text = copied, .owner_surface_id = surface_id,
+            .publication_order = order,
+            .destroy_barrier_id = 0,
+            .cancelled = 0, .destroy_requested = 0, .destroy_sent = 0,
+            .destroy_barrier_sent = 0, .live = 1 });
+    let sent_create: LinuxWriteAllResult = wayland_native_send_request_until(
+        connection, &create, deadline);
+    if (sent_create.complete == 0) {
+        if (connection.*.connected != 0) {
+            let _aborted: WaylandClipboardIdentity =
+                wayland_clipboard_register_source_commit(
+                    &connection.*.clipboard_state, source_id, 0);
+            let native_index: i32 = wayland_native_clipboard_source_index(
+                connection, identity);
+            if (native_index >= 0) {
+                wayland_native_clipboard_source_remove(connection, native_index);
+            }
+            connection.*.next_id = source_id;
+            connection.*.clipboard_callback_obligations =
+                connection.*.clipboard_callback_obligations - 1;
+        }
+        return wayland_native_clipboard_status_from_send(
+            connection, sent_create);
+    }
+    let committed: WaylandClipboardIdentity =
+        wayland_clipboard_register_source_commit(
+            &connection.*.clipboard_state, source_id, 1);
+    if (wayland_clipboard_identity_equal(committed, identity) == 0) {
+        wayland_connection_fail_protocol(connection,
+            "Wayland clipboard source reservation commit failed");
+        return WaylandNativeClipboardStatus.TransportFailed;
+    }
+
+    let offer: WireBuffer = wayland_clipboard_source_offer(
+        &connection.*.clipboard_state, identity,
+        wayland_clipboard_text_mime());
+    let sent_offer: LinuxWriteAllResult = wayland_native_send_request_until(
+        connection, &offer, deadline);
+    if (sent_offer.complete == 0) {
+        if (connection.*.connected != 0) {
+            let _cleanup_offer: i32 =
+                wayland_native_clipboard_schedule_source_destroy_until(
+                    connection, identity, deadline);
+        }
+        return wayland_native_clipboard_status_from_send(connection, sent_offer);
+    }
+    if (wayland_clipboard_source_offer_commit(
+        &connection.*.clipboard_state, identity, 1) == 0) {
+        wayland_connection_fail_protocol(connection,
+            "Wayland clipboard source MIME commit failed");
+        return WaylandNativeClipboardStatus.TransportFailed;
+    }
+    let select: WireBuffer = wayland_clipboard_set_source_selection(
+        &connection.*.clipboard_state, identity,
+        connection.*.clipboard_serial.value);
+    let sent_select: LinuxWriteAllResult = wayland_native_send_request_until(
+        connection, &select, deadline);
+    if (sent_select.complete == 0) {
+        if (connection.*.connected != 0) {
+            let _cleanup_select: i32 =
+                wayland_native_clipboard_schedule_source_destroy_until(
+                    connection, identity, deadline);
+        }
+        return wayland_native_clipboard_status_from_send(connection, sent_select);
+    }
+    if (wayland_clipboard_set_source_selection_commit(
+        &connection.*.clipboard_state, identity, 1) == 0) {
+        wayland_connection_fail_protocol(connection,
+            "Wayland clipboard selection commit failed");
+        return WaylandNativeClipboardStatus.TransportFailed;
+    }
+
+    // Publication follows the complete set_selection request. Older received
+    // transitions may still release exact resources but cannot overwrite this
+    // later local operation when app_poll applies them.
+    connection.*.clipboard_mirror_identity = identity;
+    connection.*.clipboard_published_kind =
+        WaylandNativeClipboardAuthorityKind.Local;
+    connection.*.clipboard_published_identity = identity;
+    connection.*.clipboard_published_owner_surface = surface_id;
+    connection.*.clipboard_published_order = order;
+    let _retired_prior_remote: WaylandClipboardIdentity =
+        wayland_clipboard_retire_current_offer(
+            &connection.*.clipboard_state);
+    if (wayland_native_clipboard_drain_retired_offers(
+        connection, deadline) == 0) {
+        if (connection.*.connected != 0) {
+            return WaylandNativeClipboardStatus.Timeout;
+        }
+        return WaylandNativeClipboardStatus.TransportFailed;
+    }
+    return WaylandNativeClipboardStatus.Ok;
+}
+
+fn wayland_native_clipboard_release(
+    connection: *WaylandNativeConnection, surface_id: t27,
+    timeout_ms: t27) WaylandNativeClipboardStatus {
+    if (surface_id < 1 || timeout_ms < 0) {
+        return WaylandNativeClipboardStatus.InvalidArgument;
+    }
+    let ready: WaylandNativeClipboardStatus =
+        wayland_native_clipboard_ready(connection);
+    if (ready != WaylandNativeClipboardStatus.Ok) { return ready; }
+    if (wayland_native_clipboard_public_local_active(connection) == 0
+        || connection.*.clipboard_published_owner_surface != surface_id) {
+        return WaylandNativeClipboardStatus.NotOwner;
+    }
+    let identity: WaylandClipboardIdentity =
+        connection.*.clipboard_published_identity;
+    let order: t27 = wayland_native_clipboard_next_order(connection);
+    if (order == 0) { return WaylandNativeClipboardStatus.ResourceLimit; }
+    let deadline: i64 = linux_monotonic_ms() + timeout_ms as i64;
+    // wl_data_source.destroy is unconditional. Public release requires the
+    // exact stable owner only; it never fabricates or reuses a focus serial and
+    // never emits set_selection(NULL).
+    connection.*.clipboard_published_kind =
+        WaylandNativeClipboardAuthorityKind.None;
+    connection.*.clipboard_published_identity = wayland_clipboard_bad_identity();
+    connection.*.clipboard_published_owner_surface = 0;
+    connection.*.clipboard_published_order = order;
+    if (wayland_native_clipboard_schedule_source_destroy_until(
+        connection, identity, deadline) == 0) {
+        if (connection.*.connected != 0) {
+            return WaylandNativeClipboardStatus.Timeout;
+        }
+        return WaylandNativeClipboardStatus.TransportFailed;
+    }
+    return WaylandNativeClipboardStatus.Ok;
+}
+
+fn wayland_native_clipboard_read(
+    connection: *WaylandNativeConnection, surface_id: t27,
+    timeout_ms: t27, maximum_bytes: t27)
+    WaylandNativeClipboardReadResult {
+    if (surface_id < 1 || timeout_ms < 0 || maximum_bytes < 1
+        || maximum_bytes > wayland_clipboard_max_transfer_bytes()) {
+        return wayland_native_clipboard_bad_read(
+            WaylandNativeClipboardStatus.InvalidArgument);
+    }
+    let ready: WaylandNativeClipboardStatus =
+        wayland_native_clipboard_ready(connection);
+    if (ready != WaylandNativeClipboardStatus.Ok) {
+        return wayland_native_clipboard_bad_read(ready);
+    }
+    if (wayland_connection_has_surface(connection, surface_id) == 0) {
+        return wayland_native_clipboard_bad_read(
+            WaylandNativeClipboardStatus.OwnershipRejected);
+    }
+    if (wayland_native_clipboard_serial_authorizes(
+        connection, surface_id) == 0) {
+        return wayland_native_clipboard_bad_read(
+            WaylandNativeClipboardStatus.OwnershipRejected);
+    }
+    if (connection.*.clipboard_published_kind
+        == WaylandNativeClipboardAuthorityKind.Local) {
+        if (wayland_native_clipboard_public_local_active(connection) == 0) {
+            return wayland_native_clipboard_bad_read(
+                WaylandNativeClipboardStatus.NoSelection);
+        }
+        let source_index: i32 = wayland_native_clipboard_source_index(
+            connection, connection.*.clipboard_published_identity);
+        if (source_index < 0) {
+            return wayland_native_clipboard_bad_read(
+                WaylandNativeClipboardStatus.MalformedReply);
+        }
+        if (len[u8](connection.*.clipboard_sources.data[source_index].text)
+            as t27 > maximum_bytes) {
+            return wayland_native_clipboard_bad_read(
+                WaylandNativeClipboardStatus.TooLarge);
+        }
+        let bytes: ArrayList[u8] = make[u8](len[u8](
+            connection.*.clipboard_sources.data[source_index].text));
+        let i: i32 = 0;
+        while (i < len[u8](
+            connection.*.clipboard_sources.data[source_index].text)) {
+            push[u8](&bytes,
+                connection.*.clipboard_sources.data[source_index].text.data[i]);
+            i = i + 1;
+        }
+        return WaylandNativeClipboardReadResult{
+            .status = WaylandNativeClipboardStatus.Ok,
+            .bytes = bytes, .valid = 1 };
+    }
+    if (connection.*.clipboard_published_kind
+            != WaylandNativeClipboardAuthorityKind.Remote
+        || connection.*.clipboard_focus_probe_withdraw != 0
+        ) {
+        return wayland_native_clipboard_bad_read(
+            WaylandNativeClipboardStatus.NoSelection);
+    }
+    let identity: WaylandClipboardIdentity =
+        connection.*.clipboard_published_identity;
+    if (wayland_clipboard_identity_equal(identity,
+        connection.*.clipboard_state.current_offer) == 0) {
+        return wayland_native_clipboard_bad_read(
+            WaylandNativeClipboardStatus.NoSelection);
+    }
+    let deadline: i64 = linux_monotonic_ms() + timeout_ms as i64;
+    let transfer: WaylandClipboardReceiveRequest =
+        wayland_clipboard_begin_receive(&connection.*.clipboard_state, identity);
+    if (transfer.valid == 0) {
+        return wayland_native_clipboard_bad_read(
+            wayland_native_clipboard_abort_receive_request(&transfer));
+    }
+    let request: WireBuffer = wayland_clipboard_receive_request_take_wire(
+        &transfer);
+    let sent: LinuxWriteAllResult = wayland_native_send_request_fd_until(
+        connection, &request, transfer.write_fd, deadline);
+    if (sent.complete == 0) {
+        let _marked_failed: i32 =
+            wayland_clipboard_receive_request_mark_sent(&transfer, 0);
+        return wayland_native_clipboard_bad_read(
+            wayland_native_clipboard_status_from_send(connection, sent));
+    }
+    if (wayland_clipboard_receive_request_mark_sent(&transfer, 1) == 0) {
+        wayland_clipboard_receive_request_abort(&transfer);
+        return wayland_native_clipboard_bad_read(
+            WaylandNativeClipboardStatus.TransportFailed);
+    }
+    let read_fd: i64 = wayland_clipboard_receive_request_take_read_fd(
+        &transfer);
+    let text: WaylandClipboardTextResult = wayland_clipboard_read_text_fd(
+        read_fd, maximum_bytes, deadline);
+    if (text.valid == 0 || text.error != WaylandClipboardError.None) {
+        let status: WaylandNativeClipboardStatus =
+            wayland_native_clipboard_status_from_error(text.error);
+        wayland_clipboard_text_result_free(&text);
+        return wayland_native_clipboard_bad_read(status);
+    }
+    let result: WaylandNativeClipboardReadResult =
+        WaylandNativeClipboardReadResult{
+            .status = WaylandNativeClipboardStatus.Ok,
+            .bytes = text.bytes, .valid = 1 };
+    text.bytes = ArrayList[u8]{
+        .data = null as *u8, .len = 0, .cap = 0 };
+    wayland_clipboard_text_result_free(&text);
+    return result;
+}
+
+// Window close revokes public Local authority immediately but never fabricates
+// a set_selection serial. wl_data_source.destroy is unconditional; the exact
+// immutable generation remains a mirror-suppression epoch until cancellation
+// or its callback barrier commits. Remote focus loss is separately probed so a
+// same-client multiwindow handoff does not destroy the offer.
+fn wayland_native_clipboard_close_surface_until(
+    connection: *WaylandNativeConnection, surface_id: t27,
+    deadline: i64) WaylandNativeClipboardStatus {
+    if (surface_id < 1) {
+        return WaylandNativeClipboardStatus.InvalidArgument;
+    }
+    if (connection.*.clipboard_available == 0
+        || connection.*.clipboard_state.valid == 0) {
+        return WaylandNativeClipboardStatus.Unsupported;
+    }
+    let order: t27 = wayland_native_clipboard_next_order(connection);
+    if (order == 0) { return WaylandNativeClipboardStatus.ResourceLimit; }
+    let status: WaylandNativeClipboardStatus = WaylandNativeClipboardStatus.Ok;
+    if (connection.*.clipboard_published_kind
+            == WaylandNativeClipboardAuthorityKind.Local
+        && connection.*.clipboard_published_owner_surface == surface_id) {
+        connection.*.clipboard_published_kind =
+            WaylandNativeClipboardAuthorityKind.None;
+        connection.*.clipboard_published_identity =
+            wayland_clipboard_bad_identity();
+        connection.*.clipboard_published_owner_surface = 0;
+        connection.*.clipboard_published_order = order;
+    }
+    // A surface can own several retained generations while cancellation and
+    // destroy barriers drain. Closing it schedules every exact generation;
+    // otherwise an older SourceSend could outlive the stable owner identity.
+    let source_i: i32 = 0;
+    while (source_i < len[WaylandNativeClipboardSourceRecord](
+        connection.*.clipboard_sources)) {
+        let record: WaylandNativeClipboardSourceRecord =
+            connection.*.clipboard_sources.data[source_i];
+        if (record.live != 0 && record.owner_surface_id == surface_id
+            && wayland_native_clipboard_schedule_source_destroy_until(
+                connection, record.identity, deadline) == 0) {
+            if (connection.*.connected != 0) {
+                status = WaylandNativeClipboardStatus.Timeout;
+            } else {
+                return WaylandNativeClipboardStatus.TransportFailed;
+            }
+        }
+        source_i = source_i + 1;
+    }
+    if (connection.*.clipboard_serial.valid != 0
+        && connection.*.clipboard_serial.surface_id == surface_id) {
+        connection.*.clipboard_serial = wayland_native_empty_clipboard_serial();
+        if (wayland_native_clipboard_begin_focus_probe_until(
+            connection, order, deadline) == 0) {
+            return WaylandNativeClipboardStatus.TransportFailed;
+        }
+    }
+    return status;
+}
+
+fn wayland_native_clipboard_service_pending_destroy(
+    connection: *WaylandNativeConnection) i32 {
+    let i: i32 = 0;
+    while (i < len[WaylandNativeClipboardSourceRecord](
+        connection.*.clipboard_sources)) {
+        let record: WaylandNativeClipboardSourceRecord =
+            connection.*.clipboard_sources.data[i];
+        if (record.live != 0 && record.destroy_requested != 0
+            && record.destroy_barrier_sent == 0) {
+            return wayland_native_clipboard_schedule_source_destroy_until(
+                connection, record.identity, linux_monotonic_ms()
+                    + wayland_native_clipboard_service_timeout() as i64);
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn wayland_finish_registry(connection: *WaylandNativeConnection, timeout_ms: t27) i32 {
+    let deadline: i64 = linux_monotonic_ms() + timeout_ms as i64;
+    while (linux_monotonic_ms() <= deadline) {
+        let received: WaylandNativeFrameReceive =
+            wayland_connection_receive_frame(connection, 20);
+        let input: WireBuffer = received.input;
+        if (wayland_connection_accept_frame_receive(connection, &received) == 0) {
+            wire_free(&input); return 0;
+        }
+        if (received.received_fd >= 0) {
+            wayland_native_frame_close_fd(&received); input.error = 1;
+        }
+        if (input.error == 0) {
+            let frame: WaylandFrame = wayland_decode(&input, 0);
+            if (frame.valid == 1 && frame.object_id == 2 && frame.opcode == 0) {
+                let advertised: WaylandGlobal = wayland_decode_global(&input, frame, 2);
+                if (advertised.valid == 0 || wayland_record_global(connection, advertised) == 0) {
+                    wire_free(&input);
+                    wayland_connection_fail_protocol(connection,
+                        "Wayland registry exceeded validated bounds");
+                    return 0;
+                }
+            } else if (frame.valid == 1 && frame.object_id == 3) {
+                if (wayland_native_event_exact(frame, 3, 0, 12) == 0) {
+                    wire_free(&input);
+                    wayland_connection_fail_protocol(connection,
+                        "Wayland callback.done frame has an invalid schema");
+                    return 0;
+                }
+                connection.*.registry_ready = 1; wire_free(&input); return 1;
+            }
+            wire_free(&input);
+        } else {
+            wire_free(&input);
+        }
+    }
+    connection.*.error = "Wayland registry round trip timed out";
+    return 0;
+}
+
+fn wayland_bind_shell(connection: *WaylandNativeConnection) i32 {
+    if (connection.*.registry_ready == 0 || connection.*.compositor_name == 0
+        || connection.*.xdg_wm_base_name == 0 || connection.*.shm_name == 0) { return 0; }
+    let bind_count: t27 = 3;
+    if (connection.*.seat_name != 0
+        && wayland_global_version(connection, connection.*.seat_name) >= 1) {
+        bind_count = 4;
+    }
+    let first_bind_id: t27 = wayland_native_take_client_ids(
+        connection, bind_count);
+    if (first_bind_id == 0) { return 0; }
+    connection.*.compositor_id = first_bind_id;
+    connection.*.wm_base_id = first_bind_id + 1;
+    connection.*.shm_id = first_bind_id + 2;
+    if (bind_count == 4) {
+        connection.*.seat_id = first_bind_id + 3;
+        connection.*.seat_version = wayland_global_version(connection, connection.*.seat_name);
+        if (connection.*.seat_version > 3) { connection.*.seat_version = 3; }
+    }
+    let compositor_version: t27 = wayland_global_version(connection, connection.*.compositor_name);
+    if (compositor_version > 6) { compositor_version = 6; }
+    let shell_version: t27 = wayland_global_version(connection, connection.*.xdg_wm_base_name);
+    if (shell_version > 6) { shell_version = 6; }
+    let bind_compositor: WireBuffer = wayland_registry_bind(2, connection.*.compositor_name,
+        "wl_compositor", compositor_version, connection.*.compositor_id);
+    let bind_shell: WireBuffer = wayland_registry_bind(2, connection.*.xdg_wm_base_name,
+        "xdg_wm_base", shell_version, connection.*.wm_base_id);
+    let bind_shm: WireBuffer = wayland_registry_bind(2, connection.*.shm_name, "wl_shm", 1, connection.*.shm_id);
+    let ok: i32 = wayland_native_send_request(connection, &bind_compositor, 1);
+    ok = wayland_native_send_request(connection, &bind_shell, ok);
+    ok = wayland_native_send_request(connection, &bind_shm, ok);
+    if (connection.*.seat_id != 0) {
+        let bind_seat: WireBuffer = wayland_registry_bind(2, connection.*.seat_name,
+            "wl_seat", connection.*.seat_version, connection.*.seat_id);
+        ok = wayland_native_send_request(connection, &bind_seat, ok);
+    }
+    // Core clipboard support is optional. Bind exactly manager v1 and obtain
+    // one client-global data device only when the already-bound seat exists.
+    if (ok != 0 && connection.*.seat_id != 0
+        && connection.*.clipboard_manager_name != 0
+        && wayland_global_version(connection,
+            connection.*.clipboard_manager_name) >= wayland_clipboard_version()
+        && wayland_native_client_ids_available(connection, 2, 0) != 0) {
+        let manager_id: t27 = wayland_native_take_client_ids(connection, 2);
+        let device_id: t27 = manager_id + 1;
+        let provisional: WaylandClipboardState = wayland_clipboard_state_new(
+            manager_id, device_id, connection.*.seat_id);
+        if (provisional.valid == 0 || provisional.terminal != 0) {
+            wayland_clipboard_state_free(&provisional);
+            wayland_connection_fail_protocol(connection,
+                "Wayland clipboard object identities were rejected");
+            return 0;
+        }
+        let bind_manager: WireBuffer = wayland_registry_bind(2,
+            connection.*.clipboard_manager_name, "wl_data_device_manager",
+            wayland_clipboard_version(), manager_id);
+        let get_device: WireBuffer = wayland_clipboard_manager_get_device_request(
+            manager_id, device_id, connection.*.seat_id);
+        ok = wayland_native_send_request(connection, &bind_manager, ok);
+        ok = wayland_native_send_request(connection, &get_device, ok);
+        if (ok == 0) {
+            wayland_clipboard_state_free(&provisional); return 0;
+        }
+        connection.*.clipboard_manager_id = manager_id;
+        connection.*.clipboard_device_id = device_id;
+        connection.*.clipboard_state = provisional;
+        connection.*.clipboard_available = 1;
+    }
+    return ok;
+}
+
+fn wayland_process_seat_frame(connection: *WaylandNativeConnection,
+    input: *WireBuffer, frame: WaylandFrame) i32 {
+    let send_ok: i32 = 1;
+    if (connection.*.seat_id == 0) { return 0; }
+    if (frame.opcode == 1) {
+        return wayland_seat_name_event_valid(input, frame, connection.*.seat_id);
+    }
+    let capabilities: WaylandSeatCapabilities = wayland_decode_seat_capabilities(input, frame, connection.*.seat_id);
+    if (capabilities.valid == 0) { return 0; }
+    connection.*.seat_capabilities = capabilities.raw;
+    connection.*.seat_has_pointer = capabilities.pointer;
+    connection.*.seat_has_keyboard = capabilities.keyboard;
+    connection.*.seat_has_touch = capabilities.touch;
+    if (capabilities.pointer == 0) {
+        if (connection.*.pointer_id != 0 && connection.*.pointer_version >= 3) {
+            let release_pointer: WireBuffer = wayland_empty_request(connection.*.pointer_id, 1);
+            if (wayland_native_send_request(connection, &release_pointer, 1) == 0) {
+                send_ok = 0;
+            }
+        }
+        connection.*.pointer_focus_surface = 0;
+        connection.*.pointer_id = 0;
+        connection.*.pointer_version = 0;
+    }
+    if (capabilities.pointer == 1 && connection.*.pointer_id == 0) {
+        let pointer_id: t27 = wayland_native_take_client_ids(connection, 1);
+        if (pointer_id == 0) { return 0; }
+        let get_pointer: WireBuffer = wayland_seat_get_pointer(connection.*.seat_id, pointer_id);
+        if (wayland_native_send_request(connection, &get_pointer, send_ok) == 0) { return 0; }
+        connection.*.pointer_id = pointer_id;
+        connection.*.pointer_version = connection.*.seat_version;
+    }
+    if (capabilities.keyboard == 0) {
+        let withdrew_keyboard: i32 = connection.*.keyboard_id != 0;
+        if (connection.*.keyboard_id != 0 && connection.*.keyboard_version >= 3) {
+            let release_keyboard: WireBuffer = wayland_empty_request(connection.*.keyboard_id, 0);
+            if (wayland_native_send_request(connection, &release_keyboard, 1) == 0) {
+                send_ok = 0;
+            }
+        }
+        connection.*.keyboard_id = 0;
+        connection.*.keyboard_version = 0;
+        connection.*.keyboard_focus_surface = 0;
+        connection.*.keyboard_serial = 0; connection.*.keyboard_time = 0;
+        connection.*.keyboard_key = 0; connection.*.keyboard_key_state = 0;
+        connection.*.keyboard_mods_depressed = 0; connection.*.keyboard_mods_latched = 0;
+        connection.*.keyboard_mods_locked = 0; connection.*.keyboard_group = 0;
+        connection.*.keyboard_pressed_keys.len = 0;
+        if (withdrew_keyboard != 0) {
+            if (wayland_native_clipboard_observe_keyboard_withdrawal(
+                connection) == 0) { send_ok = 0; }
+            wayland_connection_publish_keyboard_authority(connection,
+                WaylandKeyboardAuthorityKind.Withdrawn);
+        }
+    }
+    if (capabilities.keyboard == 1 && connection.*.keyboard_id == 0) {
+        let keyboard_id: t27 = wayland_native_take_client_ids(connection, 1);
+        if (keyboard_id == 0) { return 0; }
+        let get_keyboard: WireBuffer = wayland_seat_get_keyboard(connection.*.seat_id, keyboard_id);
+        if (wayland_native_send_request(connection, &get_keyboard, send_ok) == 0) { return 0; }
+        connection.*.keyboard_id = keyboard_id;
+        connection.*.keyboard_version = connection.*.seat_version;
+    }
+    return send_ok;
+}
+
+fn wayland_process_pointer_frame(connection: *WaylandNativeConnection,
+    input: *WireBuffer, frame: WaylandFrame) WaylandPointerEvent {
+    if (connection.*.seat_has_pointer == 0 || connection.*.pointer_id == 0) {
+        return wayland_empty_pointer_event();
+    }
+    let event: WaylandPointerEvent = wayland_decode_pointer_event(input, frame, connection.*.pointer_id);
+    if (event.valid == 0) { return event; }
+    if (event.kind == WaylandPointerEventKind.Enter) {
+        if (wayland_connection_has_surface(connection, event.surface_id) == 0
+            || (connection.*.pointer_focus_surface != 0
+                && connection.*.pointer_focus_surface != event.surface_id)) {
+            return wayland_empty_pointer_event();
+        }
+        connection.*.pointer_focus_surface = event.surface_id;
+        connection.*.pointer_x = event.x; connection.*.pointer_y = event.y;
+    } else if (event.kind == WaylandPointerEventKind.Leave) {
+        if (connection.*.pointer_focus_surface == 0
+            || event.surface_id != connection.*.pointer_focus_surface) {
+            return wayland_empty_pointer_event();
+        }
+        event.x = connection.*.pointer_x; event.y = connection.*.pointer_y;
+        connection.*.pointer_focus_surface = 0;
+    } else {
+        if (connection.*.pointer_focus_surface == 0) { return wayland_empty_pointer_event(); }
+        event.surface_id = connection.*.pointer_focus_surface;
+        if (event.kind == WaylandPointerEventKind.Motion) {
+            connection.*.pointer_x = event.x; connection.*.pointer_y = event.y;
+        } else {
+            event.x = connection.*.pointer_x; event.y = connection.*.pointer_y;
+        }
+    }
+    return event;
+}
+
+fn wayland_connection_pressed_key_index(connection: *WaylandNativeConnection, key: t27) i32 {
+    let i: i32 = 0;
+    while (i < len[t27](connection.*.keyboard_pressed_keys)) {
+        if (get[t27](connection.*.keyboard_pressed_keys, i) == key) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn wayland_connection_remove_pressed_key(connection: *WaylandNativeConnection, index: i32) void {
+    if (index < 0 || index >= len[t27](connection.*.keyboard_pressed_keys)) { return; }
+    let i: i32 = index;
+    while (i + 1 < len[t27](connection.*.keyboard_pressed_keys)) {
+        connection.*.keyboard_pressed_keys.data[i] = connection.*.keyboard_pressed_keys.data[i + 1];
+        i = i + 1;
+    }
+    connection.*.keyboard_pressed_keys.len = connection.*.keyboard_pressed_keys.len - 1;
+}
+
+fn wayland_connection_clear_pending_keymap(connection: *WaylandNativeConnection) void {
+    if (connection.*.keyboard_pending_keymap_bytes.cap > 0) {
+        free[u8](&connection.*.keyboard_pending_keymap_bytes);
+    }
+    connection.*.keyboard_pending_keymap_bytes = ArrayList[u8]{
+        .data = null as *u8, .len = 0, .cap = 0 };
+    connection.*.keyboard_pending_keymap_format = 0;
+    connection.*.keyboard_pending_keymap_size = 0;
+    connection.*.keyboard_pending_keymap_ready = 0;
+    connection.*.keyboard_pending_authority_kind = WaylandKeyboardAuthorityKind.None;
+    connection.*.keyboard_pending_authority_ready = 0;
+}
+
+fn wayland_connection_publish_keyboard_authority(connection: *WaylandNativeConnection,
+    kind: WaylandKeyboardAuthorityKind) void {
+    wayland_connection_clear_pending_keymap(connection);
+    connection.*.keyboard_authority_generation = connection.*.keyboard_authority_generation + 1;
+    connection.*.keyboard_pending_authority_kind = kind;
+    connection.*.keyboard_pending_authority_ready = 1;
+}
+
+fn wayland_keyboard_read_keymap(event: *WaylandKeyboardEvent, received_fd: i64) i32 {
+    if (received_fd < 0 || event.*.keymap_format != wayland_keyboard_keymap_format_xkb_v1()
+        || event.*.keymap_size < 1 || event.*.keymap_size > wayland_keyboard_keymap_max_size()) {
+        if (received_fd >= 0) { let _closed_invalid: i64 = linux_close(received_fd); }
+        return 0;
+    }
+    // Map exactly the protocol-advertised byte count from file offset zero.
+    // XKB v1 includes a trailing NUL in that count; it remains in the raw owned
+    // bytes for the shared parser to validate instead of being rewritten here.
+    let mapping: LinuxReadOnlyMapping = linux_readonly_map_fd_take(received_fd,
+        event.*.keymap_size as i64, wayland_keyboard_keymap_max_size() as i64);
+    if (mapping.valid == 0) { return 0; }
+    event.*.keymap_bytes = make[u8](event.*.keymap_size as i32);
+    let i: i64 = 0 as i64;
+    while (i < mapping.len) {
+        push[u8](&event.*.keymap_bytes, linux_readonly_mapping_byte(&mapping, i) as u8);
+        i = i + 1;
+    }
+    let released: i32 = linux_readonly_mapping_free(&mapping);
+    if (released == 0 || len[u8](event.*.keymap_bytes) != event.*.keymap_size as i32) {
+        if (event.*.keymap_bytes.cap > 0) { free[u8](&event.*.keymap_bytes); }
+        event.*.keymap_bytes = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 };
+        return 0;
+    }
+    return 1;
+}
+
+// Internal event loops that run before the shared keyboard parser is attached
+// can retain exactly one keymap without copying it. The event relinquishes its
+// byte ownership; capability loss and disconnect clear the pending map.
+fn wayland_connection_store_pending_keymap(connection: *WaylandNativeConnection,
+    event: *WaylandKeyboardEvent) i32 {
+    if (event.*.valid == 0 || event.*.kind != WaylandKeyboardEventKind.Keymap) { return 0; }
+    if (event.*.keymap_format == 0) {
+        wayland_connection_publish_keyboard_authority(connection,
+            WaylandKeyboardAuthorityKind.Withdrawn);
+        return 1;
+    }
+    if (len[u8](event.*.keymap_bytes) != event.*.keymap_size as i32) {
+        return 0;
+    }
+    wayland_connection_clear_pending_keymap(connection);
+    connection.*.keyboard_authority_generation = connection.*.keyboard_authority_generation + 1;
+    connection.*.keyboard_pending_keymap_format = event.*.keymap_format;
+    connection.*.keyboard_pending_keymap_size = event.*.keymap_size;
+    connection.*.keyboard_pending_keymap_bytes = event.*.keymap_bytes;
+    connection.*.keyboard_pending_keymap_ready = 1;
+    connection.*.keyboard_pending_authority_kind = WaylandKeyboardAuthorityKind.Map;
+    connection.*.keyboard_pending_authority_ready = 1;
+    event.*.keymap_bytes = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 };
+    return 1;
+}
+
+fn wayland_connection_take_keyboard_authority(connection: *WaylandNativeConnection) WaylandKeyboardAuthorityUpdate {
+    let update: WaylandKeyboardAuthorityUpdate = wayland_empty_keyboard_authority_update();
+    if (connection.*.keyboard_pending_authority_ready == 0) { return update; }
+    update.kind = connection.*.keyboard_pending_authority_kind;
+    update.generation = connection.*.keyboard_authority_generation;
+    update.keymap_format = connection.*.keyboard_pending_keymap_format;
+    update.keymap_size = connection.*.keyboard_pending_keymap_size;
+    update.keymap_bytes = connection.*.keyboard_pending_keymap_bytes;
+    update.valid = 1;
+    connection.*.keyboard_pending_keymap_bytes = ArrayList[u8]{
+        .data = null as *u8, .len = 0, .cap = 0 };
+    connection.*.keyboard_pending_keymap_format = 0;
+    connection.*.keyboard_pending_keymap_size = 0;
+    connection.*.keyboard_pending_keymap_ready = 0;
+    connection.*.keyboard_pending_authority_kind = WaylandKeyboardAuthorityKind.None;
+    connection.*.keyboard_pending_authority_ready = 0;
+    return update;
+}
+
+// Internal synchronous waits must not collapse keyboard authority into the
+// singleton side channel while later input is queued. Move the current update
+// into the same owned FIFO as raw frames at its exact stream position.
+fn wayland_connection_queue_current_keyboard_authority(
+    connection: *WaylandNativeConnection) i32 {
+    let update: WaylandKeyboardAuthorityUpdate =
+        wayland_connection_take_keyboard_authority(connection);
+    if (update.valid == 0) { return 1; }
+    let queued: i32 = wayland_connection_queue_keyboard_authority(
+        connection, &update);
+    wayland_keyboard_authority_update_free(&update);
+    return queued;
+}
+
+fn wayland_connection_take_pending_keymap(connection: *WaylandNativeConnection) WaylandKeyboardEvent {
+    let event: WaylandKeyboardEvent = wayland_empty_keyboard_event();
+    if (connection.*.keyboard_pending_keymap_ready == 0) { return event; }
+    event.kind = WaylandKeyboardEventKind.Keymap;
+    event.keymap_format = connection.*.keyboard_pending_keymap_format;
+    event.keymap_size = connection.*.keyboard_pending_keymap_size;
+    event.keymap_bytes = connection.*.keyboard_pending_keymap_bytes;
+    event.valid = 1;
+    connection.*.keyboard_pending_keymap_format = 0;
+    connection.*.keyboard_pending_keymap_size = 0;
+    connection.*.keyboard_pending_keymap_bytes = ArrayList[u8]{
+        .data = null as *u8, .len = 0, .cap = 0 };
+    connection.*.keyboard_pending_keymap_ready = 0;
+    connection.*.keyboard_pending_authority_kind = WaylandKeyboardAuthorityKind.None;
+    connection.*.keyboard_pending_authority_ready = 0;
+    return event;
+}
+
+// Takes ownership of received_fd on every path. For Keymap, the returned event
+// owns keymap_bytes; callers must eventually call wayland_keyboard_event_free.
+fn wayland_process_keyboard_frame(connection: *WaylandNativeConnection,
+    input: *WireBuffer, frame: WaylandFrame, received_fd: i64) WaylandKeyboardEvent {
+    let event: WaylandKeyboardEvent = wayland_empty_keyboard_event();
+    if (connection.*.seat_has_keyboard == 0 || connection.*.keyboard_id == 0) {
+        if (received_fd >= 0) { let _closed_inactive: i64 = linux_close(received_fd); }
+        return event;
+    }
+    if (frame.valid == 1 && frame.object_id == connection.*.keyboard_id
+        && frame.opcode == 0) {
+        // Every keymap opcode replaces authority. Clear before decoding so an
+        // unsupported format, malformed size, or ancillary failure can never
+        // leave an older XKB map active.
+        wayland_connection_clear_pending_keymap(connection);
+    }
+    event = wayland_decode_keyboard_event(input, frame, connection.*.keyboard_id);
+    if (event.valid == 0) {
+        if (received_fd >= 0) { let _closed_malformed: i64 = linux_close(received_fd); }
+        if (frame.valid == 1 && frame.object_id == connection.*.keyboard_id
+            && frame.opcode == 0) {
+            wayland_connection_publish_keyboard_authority(connection,
+                WaylandKeyboardAuthorityKind.Rejected);
+        }
+        return event;
+    }
+    if (event.kind == WaylandKeyboardEventKind.Keymap) {
+        if (event.keymap_format == 0) {
+            // no_keymap is an authoritative withdrawal. Some peers omit the
+            // otherwise typed FD for this zero-sized event; if one is present,
+            // take and close it without exposing bytes.
+            if (received_fd >= 0 && linux_close(received_fd) != 0) {
+                wayland_keyboard_event_free(&event);
+                return wayland_empty_keyboard_event();
+            }
+            return event;
+        }
+        if (wayland_keyboard_read_keymap(&event, received_fd) == 0) {
+            wayland_keyboard_event_free(&event);
+            wayland_connection_publish_keyboard_authority(connection,
+                WaylandKeyboardAuthorityKind.Rejected);
+            return wayland_empty_keyboard_event();
+        }
+        return event;
+    }
+    if (received_fd >= 0) {
+        let _closed_unexpected: i64 = linux_close(received_fd);
+        wayland_keyboard_event_free(&event);
+        return wayland_empty_keyboard_event();
+    }
+    if (event.kind == WaylandKeyboardEventKind.Enter) {
+        if (wayland_connection_has_surface(connection, event.surface_id) == 0
+            || connection.*.keyboard_focus_surface != 0) {
+            wayland_keyboard_event_free(&event);
+            return wayland_empty_keyboard_event();
+        }
+        connection.*.keyboard_focus_surface = event.surface_id;
+        connection.*.keyboard_serial = event.serial;
+        connection.*.keyboard_time = 0; connection.*.keyboard_key = 0;
+        connection.*.keyboard_key_state = 0;
+        connection.*.keyboard_mods_depressed = 0; connection.*.keyboard_mods_latched = 0;
+        connection.*.keyboard_mods_locked = 0; connection.*.keyboard_group = 0;
+        connection.*.keyboard_pressed_keys.len = 0;
+        let i: i32 = 0;
+        while (i < len[t27](event.pressed_keys)) {
+            push[t27](&connection.*.keyboard_pressed_keys, get[t27](event.pressed_keys, i));
+            i = i + 1;
+        }
+    } else if (event.kind == WaylandKeyboardEventKind.Leave) {
+        if (connection.*.keyboard_focus_surface == 0
+            || connection.*.keyboard_focus_surface != event.surface_id) {
+            return wayland_empty_keyboard_event();
+        }
+        connection.*.keyboard_focus_surface = 0;
+        connection.*.keyboard_serial = event.serial;
+        connection.*.keyboard_time = 0; connection.*.keyboard_key = 0;
+        connection.*.keyboard_key_state = 0;
+        connection.*.keyboard_mods_depressed = 0; connection.*.keyboard_mods_latched = 0;
+        connection.*.keyboard_mods_locked = 0; connection.*.keyboard_group = 0;
+        connection.*.keyboard_pressed_keys.len = 0;
+    } else if (event.kind == WaylandKeyboardEventKind.Key) {
+        if (connection.*.keyboard_focus_surface == 0) { return wayland_empty_keyboard_event(); }
+        let pressed_index: i32 = wayland_connection_pressed_key_index(connection, event.key);
+        if ((event.key_state == 1 && pressed_index >= 0)
+            || (event.key_state == 0 && pressed_index < 0)) {
+            return wayland_empty_keyboard_event();
+        }
+        if (event.key_state == 1
+            && len[t27](connection.*.keyboard_pressed_keys) as t27
+                >= wayland_keyboard_max_pressed_keys()) {
+            return wayland_empty_keyboard_event();
+        }
+        if (event.key_state == 1) { push[t27](&connection.*.keyboard_pressed_keys, event.key); }
+        else { wayland_connection_remove_pressed_key(connection, pressed_index); }
+        event.surface_id = connection.*.keyboard_focus_surface;
+        connection.*.keyboard_serial = event.serial; connection.*.keyboard_time = event.time;
+        connection.*.keyboard_key = event.key; connection.*.keyboard_key_state = event.key_state;
+    } else if (event.kind == WaylandKeyboardEventKind.Modifiers) {
+        if (connection.*.keyboard_focus_surface == 0) { return wayland_empty_keyboard_event(); }
+        event.surface_id = connection.*.keyboard_focus_surface;
+        connection.*.keyboard_serial = event.serial;
+        connection.*.keyboard_mods_depressed = event.mods_depressed;
+        connection.*.keyboard_mods_latched = event.mods_latched;
+        connection.*.keyboard_mods_locked = event.mods_locked;
+        connection.*.keyboard_group = event.group;
+    }
+    return event;
+}
+
+// Takes received_fd on every path. A keymap/no_keymap/rejected replacement is
+// decoded immediately so no descriptor survives the receive boundary, then an
+// owned authority marker is appended to the ordered pending-event FIFO.
+fn wayland_connection_queue_keyboard_keymap_frame(
+    connection: *WaylandNativeConnection, input: *WireBuffer,
+    frame: WaylandFrame, received_fd: i64) i32 {
+    let event: WaylandKeyboardEvent = wayland_process_keyboard_frame(
+        connection, input, frame, received_fd);
+    let published: i32 = 0;
+    if (event.valid == 1 && event.kind == WaylandKeyboardEventKind.Keymap) {
+        published = wayland_connection_store_pending_keymap(connection, &event);
+    } else if (connection.*.keyboard_pending_authority_ready != 0) {
+        published = 1;
+    }
+    wayland_keyboard_event_free(&event);
+    if (published == 0) { return 0; }
+    return wayland_connection_queue_current_keyboard_authority(connection);
+}
+
+fn wayland_open_window(connection: *WaylandNativeConnection, title: []u8, width: t27, height: t27) WaylandNativeWindow {
+    let window: WaylandNativeWindow = WaylandNativeWindow{ .surface_id = 0, .xdg_surface_id = 0,
+        .toplevel_id = 0, .width = width, .height = height, .live = 0, .configured = 0,
+        .close_requested = 0, .buffer_id = 0, .buffer_width = 0, .buffer_height = 0,
+        .memory = LinuxSharedMemory{ .fd = 0 - 1, .address = 0, .len = 0, .valid = 0 }, .buffer_busy = 0 };
+    if (connection.*.compositor_id == 0 || connection.*.wm_base_id == 0
+        || width < 1 || height < 1
+        || wayland_native_surface_dimensions_valid(width, height) == 0
+        || len[t27](connection.*.owned_surface_ids) as t27
+            >= wayland_native_max_owned_surfaces()) { return window; }
+    let first_window_id: t27 = wayland_native_take_client_ids(connection, 3);
+    if (first_window_id == 0) { return window; }
+    window.surface_id = first_window_id;
+    window.xdg_surface_id = first_window_id + 1;
+    window.toplevel_id = first_window_id + 2;
+    let create_surface: WireBuffer = wayland_new_id_request(connection.*.compositor_id, 0, window.surface_id);
+    let get_xdg_surface: WireBuffer = wayland_xdg_get_surface(connection.*.wm_base_id, window.xdg_surface_id, window.surface_id);
+    let get_toplevel: WireBuffer = wayland_new_id_request(window.xdg_surface_id, 1, window.toplevel_id);
+    let set_title: WireBuffer = wayland_string_request(window.toplevel_id, 2, title);
+    let commit: WireBuffer = wayland_empty_request(window.surface_id, 6);
+    let request_ok: i32 = wayland_native_send_request(connection, &create_surface, 1);
+    request_ok = wayland_native_send_request(connection, &get_xdg_surface, request_ok);
+    request_ok = wayland_native_send_request(connection, &get_toplevel, request_ok);
+    request_ok = wayland_native_send_request(connection, &set_title, request_ok);
+    request_ok = wayland_native_send_request(connection, &commit, request_ok);
+    if (request_ok == 0) { return window; }
+    if (wayland_connection_register_surface(connection, window.surface_id) == 0) {
+        wayland_connection_fail_protocol(connection,
+            "Wayland surface identity registry rejected a created surface");
+        return window;
+    }
+    window.live = 1; return window;
+}
+
+fn wayland_wait_window_configure(connection: *WaylandNativeConnection, window: *WaylandNativeWindow, timeout_ms: t27) i32 {
+    if (connection.*.connected == 0 || connection.*.fd < 0) { return 0; }
+    if (wayland_connection_queue_current_keyboard_authority(connection) == 0) {
+        wayland_connection_fail_protocol(connection,
+            "Wayland pending keyboard authority queue exceeded its bound");
+        return 0;
+    }
+    let deadline: i64 = linux_monotonic_ms() + timeout_ms as i64;
+    while (linux_monotonic_ms() <= deadline) {
+        let received: WaylandNativeFrameReceive =
+            wayland_connection_receive_frame(connection, 20);
+        let input: WireBuffer = received.input;
+        if (wayland_connection_accept_frame_receive(connection, &received) == 0) {
+            wire_free(&input); return 0;
+        }
+        if (received.keyboard_authority_cleared != 0
+            && wayland_connection_queue_current_keyboard_authority(connection) == 0) {
+            return wayland_native_reject_frame(connection, &input,
+                "Wayland pending rejected keymap queue exceeded its bound");
+        }
+        if (input.error == 0) {
+            let frame: WaylandFrame = wayland_decode(&input, 0);
+            let clipboard_routed: i32 =
+                wayland_native_clipboard_route_received(
+                    connection, &input, &received);
+            if (clipboard_routed >= 0) {
+                wire_free(&input);
+                if (clipboard_routed == 0) { return 0; }
+                continue;
+            }
+            if (received.received_fd >= 0 && frame.object_id != connection.*.keyboard_id) {
+                wayland_native_frame_close_fd(&received); input.error = 1; frame.valid = 0;
+            }
+            let retained: i32 = 0;
+            if (frame.valid == 1 && connection.*.wm_base_id != 0
+                && frame.object_id == connection.*.wm_base_id) {
+                if (wayland_native_event_exact(frame, connection.*.wm_base_id, 0, 12) == 0) {
+                    return wayland_native_reject_frame(connection, &input,
+                        "Wayland xdg_wm_base.ping frame has an invalid schema");
+                }
+                let serial: t27 = wire_read_u32_le(&input, frame.payload_offset);
+                let pong: WireBuffer = wayland_u32_request(connection.*.wm_base_id, 3, serial);
+                if (input.error != 0 || wayland_native_send_request(connection, &pong, 1) == 0) {
+                    wire_free(&input); return 0;
+                }
+            } else if (frame.valid == 1 && frame.object_id == connection.*.seat_id) {
+                if (wayland_seat_event_valid(&input, frame, connection.*.seat_id) == 0) {
+                    return wayland_native_reject_frame(connection, &input,
+                        "Wayland wl_seat event has an invalid schema");
+                }
+                if (wayland_connection_queue_pending_frame(connection, &input) == 0) {
+                    return wayland_native_reject_frame(connection, &input,
+                        "Wayland pending seat frame queue exceeded its bound");
+                }
+                retained = 1;
+            } else if (frame.valid == 1 && frame.object_id == connection.*.pointer_id) {
+                if (wayland_connection_queue_pending_frame(connection, &input) == 0) {
+                    return wayland_native_reject_frame(connection, &input,
+                        "Wayland pending pointer frame queue exceeded its bound");
+                }
+                retained = 1;
+            } else if (frame.valid == 1 && frame.object_id == connection.*.keyboard_id) {
+                if (frame.opcode == 0) {
+                    // Ancillary-invalid keymaps were already converted to one
+                    // Rejected marker by accept_frame_receive. Never decode the
+                    // same wire replacement into a second generation.
+                    if (received.keyboard_authority_cleared == 0) {
+                        let keymap_queued: i32 =
+                            wayland_connection_queue_keyboard_keymap_frame(
+                                connection, &input, frame, received.received_fd);
+                        received.received_fd = 0 - 1; received.has_fd = 0;
+                        if (keymap_queued == 0) {
+                            return wayland_native_reject_frame(connection, &input,
+                                "Wayland keymap authority could not be queued");
+                        }
+                    }
+                } else {
+                    if (received.received_fd >= 0) {
+                        wayland_native_frame_close_fd(&received);
+                        return wayland_native_reject_frame(connection, &input,
+                            "Wayland non-keymap keyboard event carried an FD");
+                    }
+                    if (wayland_connection_queue_pending_frame(connection, &input) == 0) {
+                        return wayland_native_reject_frame(connection, &input,
+                            "Wayland pending keyboard frame queue exceeded its bound");
+                    }
+                    retained = 1;
+                }
+            } else if (frame.valid == 1 && frame.object_id == window.*.xdg_surface_id) {
+                if (wayland_native_event_exact(frame, window.*.xdg_surface_id, 0, 12) == 0) {
+                    return wayland_native_reject_frame(connection, &input,
+                        "Wayland xdg_surface.configure frame has an invalid schema");
+                }
+                let serial: t27 = wire_read_u32_le(&input, frame.payload_offset);
+                let ack: WireBuffer = wayland_u32_request(window.*.xdg_surface_id, 4, serial);
+                if (wayland_native_send_request(connection, &ack, 1) == 1) {
+                    window.*.configured = 1; wire_free(&input); return 1;
+                }
+                wire_free(&input); return 0;
+            } else if (frame.valid == 1 && frame.object_id == window.*.toplevel_id) {
+                if (frame.opcode == 0) {
+                    if (wayland_native_toplevel_configure_valid(&input, frame,
+                        window.*.toplevel_id, window.*.width, window.*.height) == 0) {
+                        return wayland_native_reject_frame(connection, &input,
+                            "Wayland xdg_toplevel.configure frame has an invalid schema");
+                    }
+                    let proposed_width: t27 = wire_read_i32_le(&input, frame.payload_offset);
+                    let proposed_height: t27 = wire_read_i32_le(&input,
+                        frame.payload_offset + 4);
+                    let configured_width: t27 = wayland_native_resolve_configure_axis(
+                        proposed_width, window.*.width);
+                    let configured_height: t27 = wayland_native_resolve_configure_axis(
+                        proposed_height, window.*.height);
+                    window.*.width = configured_width;
+                    window.*.height = configured_height;
+                } else if (frame.opcode == 1) {
+                    if (wayland_native_event_exact(frame, window.*.toplevel_id, 1, 8) == 0) {
+                        return wayland_native_reject_frame(connection, &input,
+                            "Wayland xdg_toplevel.close frame has an invalid schema");
+                    }
+                    if (wayland_connection_queue_pending_frame(connection, &input) == 0) {
+                        return wayland_native_reject_frame(connection, &input,
+                            "Wayland pending close frame queue exceeded its bound");
+                    }
+                    retained = 1;
+                } else {
+                    if (wayland_connection_queue_pending_frame(connection, &input) == 0) {
+                        return wayland_native_reject_frame(connection, &input,
+                            "Wayland pending frame queue exceeded its bound");
+                    }
+                    retained = 1;
+                }
+            } else if (frame.valid == 1) {
+                if (wayland_connection_queue_pending_frame(connection, &input) == 0) {
+                    return wayland_native_reject_frame(connection, &input,
+                        "Wayland pending frame queue exceeded its bound");
+                }
+                retained = 1;
+            }
+            if (retained == 0) { wire_free(&input); }
+        } else { wire_free(&input); }
+        if (connection.*.connected == 0 || connection.*.fd < 0) { return 0; }
+    }
+    return 0;
+}
+
+fn wayland_wait_buffer_release(connection: *WaylandNativeConnection, window: *WaylandNativeWindow, timeout_ms: t27) i32 {
+    if (window.*.buffer_busy == 0) { return 1; }
+    if (connection.*.connected == 0 || connection.*.fd < 0) { return 0; }
+    if (wayland_connection_queue_current_keyboard_authority(connection) == 0) {
+        wayland_connection_fail_protocol(connection,
+            "Wayland pending keyboard authority queue exceeded its bound");
+        return 0;
+    }
+    let deadline: i64 = linux_monotonic_ms() + timeout_ms as i64;
+    while (linux_monotonic_ms() <= deadline) {
+        let received: WaylandNativeFrameReceive =
+            wayland_connection_receive_frame(connection, 20);
+        let input: WireBuffer = received.input;
+        if (wayland_connection_accept_frame_receive(connection, &received) == 0) {
+            wire_free(&input); return 0;
+        }
+        if (received.keyboard_authority_cleared != 0
+            && wayland_connection_queue_current_keyboard_authority(connection) == 0) {
+            return wayland_native_reject_frame(connection, &input,
+                "Wayland pending rejected keymap queue exceeded its bound");
+        }
+        if (input.error == 0) {
+            let frame: WaylandFrame = wayland_decode(&input, 0);
+            let clipboard_routed: i32 =
+                wayland_native_clipboard_route_received(
+                    connection, &input, &received);
+            if (clipboard_routed >= 0) {
+                wire_free(&input);
+                if (clipboard_routed == 0) { return 0; }
+                continue;
+            }
+            if (received.received_fd >= 0 && frame.object_id != connection.*.keyboard_id) {
+                wayland_native_frame_close_fd(&received); input.error = 1; frame.valid = 0;
+            }
+            let retained: i32 = 0;
+            if (frame.valid == 1 && frame.object_id == window.*.buffer_id) {
+                if (wayland_native_event_exact(frame, window.*.buffer_id, 0, 8) == 0) {
+                    return wayland_native_reject_frame(connection, &input,
+                        "Wayland wl_buffer.release frame has an invalid schema");
+                }
+                window.*.buffer_busy = 0; wire_free(&input); return 1;
+            }
+            if (frame.valid == 1 && connection.*.wm_base_id != 0
+                && frame.object_id == connection.*.wm_base_id) {
+                if (wayland_native_event_exact(frame, connection.*.wm_base_id, 0, 12) == 0) {
+                    return wayland_native_reject_frame(connection, &input,
+                        "Wayland xdg_wm_base.ping frame has an invalid schema");
+                }
+                let serial: t27 = wire_read_u32_le(&input, frame.payload_offset);
+                let pong: WireBuffer = wayland_u32_request(connection.*.wm_base_id, 3, serial);
+                if (input.error != 0 || wayland_native_send_request(connection, &pong, 1) == 0) {
+                    wire_free(&input); return 0;
+                }
+            } else if (frame.valid == 1 && frame.object_id == connection.*.seat_id) {
+                if (wayland_seat_event_valid(&input, frame, connection.*.seat_id) == 0) {
+                    return wayland_native_reject_frame(connection, &input,
+                        "Wayland wl_seat event has an invalid schema");
+                }
+                if (wayland_connection_queue_pending_frame(connection, &input) == 0) {
+                    return wayland_native_reject_frame(connection, &input,
+                        "Wayland pending seat frame queue exceeded its bound");
+                }
+                retained = 1;
+            } else if (frame.valid == 1 && frame.object_id == connection.*.pointer_id) {
+                if (wayland_connection_queue_pending_frame(connection, &input) == 0) {
+                    return wayland_native_reject_frame(connection, &input,
+                        "Wayland pending pointer frame queue exceeded its bound");
+                }
+                retained = 1;
+            } else if (frame.valid == 1 && frame.object_id == connection.*.keyboard_id) {
+                if (frame.opcode == 0) {
+                    if (received.keyboard_authority_cleared == 0) {
+                        let keymap_queued: i32 =
+                            wayland_connection_queue_keyboard_keymap_frame(
+                                connection, &input, frame, received.received_fd);
+                        received.received_fd = 0 - 1; received.has_fd = 0;
+                        if (keymap_queued == 0) {
+                            return wayland_native_reject_frame(connection, &input,
+                                "Wayland keymap authority could not be queued");
+                        }
+                    }
+                } else {
+                    if (received.received_fd >= 0) {
+                        wayland_native_frame_close_fd(&received);
+                        return wayland_native_reject_frame(connection, &input,
+                            "Wayland non-keymap keyboard event carried an FD");
+                    }
+                    if (wayland_connection_queue_pending_frame(connection, &input) == 0) {
+                        return wayland_native_reject_frame(connection, &input,
+                            "Wayland pending keyboard frame queue exceeded its bound");
+                    }
+                    retained = 1;
+                }
+            } else if (frame.valid == 1 && frame.object_id == window.*.xdg_surface_id) {
+                if (wayland_native_event_exact(frame, window.*.xdg_surface_id, 0, 12) == 0) {
+                    return wayland_native_reject_frame(connection, &input,
+                        "Wayland xdg_surface.configure frame has an invalid schema");
+                }
+                if (wayland_connection_queue_pending_frame(connection, &input) == 0) {
+                    return wayland_native_reject_frame(connection, &input,
+                        "Wayland pending configure frame queue exceeded its bound");
+                }
+                retained = 1;
+            } else if (frame.valid == 1 && frame.object_id == window.*.toplevel_id) {
+                if (frame.opcode == 0) {
+                    if (wayland_native_toplevel_configure_valid(&input, frame,
+                        window.*.toplevel_id, window.*.width, window.*.height) == 0) {
+                        return wayland_native_reject_frame(connection, &input,
+                            "Wayland xdg_toplevel.configure frame has an invalid schema");
+                    }
+                    if (wayland_connection_queue_pending_frame(connection, &input) == 0) {
+                        return wayland_native_reject_frame(connection, &input,
+                            "Wayland pending toplevel frame queue exceeded its bound");
+                    }
+                    retained = 1;
+                } else if (frame.opcode == 1) {
+                    if (wayland_native_event_exact(frame, window.*.toplevel_id, 1, 8) == 0) {
+                        return wayland_native_reject_frame(connection, &input,
+                            "Wayland xdg_toplevel.close frame has an invalid schema");
+                    }
+                    if (wayland_connection_queue_pending_frame(connection, &input) == 0) {
+                        return wayland_native_reject_frame(connection, &input,
+                            "Wayland pending close frame queue exceeded its bound");
+                    }
+                    retained = 1;
+                } else {
+                    if (wayland_connection_queue_pending_frame(connection, &input) == 0) {
+                        return wayland_native_reject_frame(connection, &input,
+                            "Wayland pending toplevel frame queue exceeded its bound");
+                    }
+                    retained = 1;
+                }
+            } else if (frame.valid == 1) {
+                if (wayland_connection_queue_pending_frame(connection, &input) == 0) {
+                    return wayland_native_reject_frame(connection, &input,
+                        "Wayland pending frame queue exceeded its bound");
+                }
+                retained = 1;
+            }
+            if (retained == 0) { wire_free(&input); }
+        } else { wire_free(&input); }
+        if (connection.*.connected == 0 || connection.*.fd < 0) { return 0; }
+    }
+    return 0;
+}
+
+fn wayland_close_window(connection: *WaylandNativeConnection, window: *WaylandNativeWindow) i32 {
+    if (window.*.surface_id != 0
+        && connection.*.pointer_focus_surface == window.*.surface_id) {
+        connection.*.pointer_focus_surface = 0;
+        connection.*.pointer_x = 0; connection.*.pointer_y = 0;
+    }
+    if (window.*.surface_id != 0
+        && connection.*.keyboard_focus_surface == window.*.surface_id) {
+        connection.*.keyboard_focus_surface = 0;
+        connection.*.keyboard_serial = 0; connection.*.keyboard_time = 0;
+        connection.*.keyboard_key = 0; connection.*.keyboard_key_state = 0;
+        connection.*.keyboard_mods_depressed = 0;
+        connection.*.keyboard_mods_latched = 0;
+        connection.*.keyboard_mods_locked = 0; connection.*.keyboard_group = 0;
+        connection.*.keyboard_pressed_keys.len = 0;
+    }
+    wayland_connection_forget_surface(connection, window.*.surface_id);
+    if (window.*.live == 0) {
+        linux_shared_memory_free(&window.*.memory);
+        window.*.buffer_id = 0; window.*.buffer_width = 0; window.*.buffer_height = 0;
+        return 0;
+    }
+    let destroy_ok: i32 = connection.*.connected;
+    if (window.*.buffer_id != 0) {
+        let destroy_buffer: WireBuffer = wayland_empty_request(window.*.buffer_id, 0);
+        destroy_ok = wayland_native_send_request(connection, &destroy_buffer, destroy_ok);
+        window.*.buffer_id = 0;
+        window.*.buffer_width = 0; window.*.buffer_height = 0;
+    }
+    // Local mmap/memfd ownership is independent of whether the compositor can
+    // still accept object-destruction requests.
+    linux_shared_memory_free(&window.*.memory);
+    let destroy_toplevel: WireBuffer = wayland_empty_request(window.*.toplevel_id, 0);
+    let destroy_xdg_surface: WireBuffer = wayland_empty_request(window.*.xdg_surface_id, 0);
+    let destroy_surface: WireBuffer = wayland_empty_request(window.*.surface_id, 0);
+    destroy_ok = wayland_native_send_request(connection, &destroy_toplevel, destroy_ok);
+    destroy_ok = wayland_native_send_request(connection, &destroy_xdg_surface, destroy_ok);
+    destroy_ok = wayland_native_send_request(connection, &destroy_surface, destroy_ok);
+    window.*.live = 0; window.*.configured = 0; window.*.buffer_busy = 0;
+    return destroy_ok;
+}
+
+fn wayland_connect_local() WaylandNativeConnection {
+    let connection: WaylandNativeConnection = wayland_empty_connection();
+    let display: []u8 = _zag_getenv("WAYLAND_DISPLAY");
+    let runtime_dir: []u8 = _zag_getenv("XDG_RUNTIME_DIR");
+    if (display.len == 0) { connection.error = "WAYLAND_DISPLAY is not set"; return connection; }
+    if (runtime_dir.len == 0 && display[0] != '/') { connection.error = "XDG_RUNTIME_DIR is not set"; return connection; }
+    let transport: LinuxConnectResult = LinuxConnectResult{
+        .fd = 0 - 1, .error_code = 0, .connected = 0 };
+    if (display[0] == '/') {
+        transport = linux_unix_connect(display);
+    } else {
+        // linux_unix_connect borrows this one owned buffer for the syscall.
+        // This avoids leaking either half of a nested allocating concat.
+        let path_storage: WireBuffer = wire_new(runtime_dir.len + display.len + 1);
+        let path_i: i32 = 0;
+        while (path_i < runtime_dir.len) {
+            wire_push_u8(&path_storage, runtime_dir[path_i] as t27);
+            path_i = path_i + 1;
+        }
+        wire_push_u8(&path_storage, '/' as t27);
+        let display_i: i32 = 0;
+        while (display_i < display.len) {
+            wire_push_u8(&path_storage, display[display_i] as t27);
+            display_i = display_i + 1;
+        }
+        transport = linux_unix_connect(
+            path_storage.bytes.data[0..len[u8](path_storage.bytes)]);
+        wire_free(&path_storage);
+    }
+    if (transport.connected == 0) { connection.error = "Wayland Unix socket connection failed"; return connection; }
+    connection.fd = transport.fd; connection.connected = 1;
+    if (wayland_begin_registry(&connection) == 0 || wayland_finish_registry(&connection, 2000) == 0) {
+        let reason: []u8 = connection.error;
+        if (reason.len == 0) { reason = "Wayland registry request failed"; }
+        if (connection.fd >= 0) { let _closed: i64 = linux_close(connection.fd); }
+        connection.fd = 0 - 1; connection.connected = 0; connection.error = reason; return connection;
+    }
+    connection.error = ""; return connection;
+}
+
+fn wayland_disconnect(connection: *WaylandNativeConnection) void {
+    if (connection.*.fd >= 0) { let _closed: i64 = linux_close(connection.*.fd); }
+    connection.*.fd = 0 - 1; connection.*.connected = 0; connection.*.registry_ready = 0;
+    connection.*.seat_id = 0; connection.*.seat_version = 0;
+    connection.*.pointer_id = 0; connection.*.pointer_version = 0;
+    connection.*.keyboard_id = 0; connection.*.keyboard_version = 0;
+    connection.*.seat_capabilities = 0;
+    connection.*.seat_has_pointer = 0; connection.*.seat_has_keyboard = 0; connection.*.seat_has_touch = 0;
+    connection.*.pointer_focus_surface = 0; connection.*.pointer_x = 0; connection.*.pointer_y = 0;
+    connection.*.keyboard_focus_surface = 0; connection.*.keyboard_serial = 0;
+    connection.*.keyboard_time = 0; connection.*.keyboard_key = 0; connection.*.keyboard_key_state = 0;
+    connection.*.keyboard_mods_depressed = 0; connection.*.keyboard_mods_latched = 0;
+    connection.*.keyboard_mods_locked = 0; connection.*.keyboard_group = 0;
+    wayland_connection_clear_pending_frames(connection);
+    let _inbound_closed: i32 = wayland_connection_clear_inbound(connection);
+    wayland_native_clipboard_retire(connection);
+    let global_i: i32 = 0;
+    while (global_i < len[WaylandGlobal](connection.*.globals)) {
+        if (connection.*.globals.data[global_i].interface_storage.cap > 0) {
+            free[u8](&connection.*.globals.data[global_i].interface_storage);
+        }
+        global_i = global_i + 1;
+    }
+    if (connection.*.globals.cap > 0) { free[WaylandGlobal](&connection.*.globals); }
+    connection.*.globals = ArrayList[WaylandGlobal]{
+        .data = null as *WaylandGlobal, .len = 0, .cap = 0 };
+    if (connection.*.keyboard_pressed_keys.cap > 0) { free[t27](&connection.*.keyboard_pressed_keys); }
+    if (connection.*.owned_surface_ids.cap > 0) { free[t27](&connection.*.owned_surface_ids); }
+    if (connection.*.pending_frames.cap > 0) {
+        free[WaylandNativeQueuedFrame](&connection.*.pending_frames);
+    }
+    if (connection.*.inbound_bytes.cap > 0) {
+        free[u8](&connection.*.inbound_bytes);
+    }
+    if (connection.*.inbound_fds.cap > 0) {
+        free[i64](&connection.*.inbound_fds);
+    }
+    if (connection.*.clipboard_sources.cap > 0) {
+        free[WaylandNativeClipboardSourceRecord](&connection.*.clipboard_sources);
+    }
+    if (connection.*.keyboard_pending_keymap_bytes.cap > 0) {
+        free[u8](&connection.*.keyboard_pending_keymap_bytes);
+    }
+    connection.*.keyboard_pressed_keys = ArrayList[t27]{
+        .data = null as *t27, .len = 0, .cap = 0 };
+    connection.*.owned_surface_ids = ArrayList[t27]{
+        .data = null as *t27, .len = 0, .cap = 0 };
+    connection.*.pending_frames = ArrayList[WaylandNativeQueuedFrame]{
+        .data = null as *WaylandNativeQueuedFrame, .len = 0, .cap = 0 };
+    connection.*.inbound_bytes = ArrayList[u8]{
+        .data = null as *u8, .len = 0, .cap = 0 };
+    connection.*.inbound_fds = ArrayList[i64]{
+        .data = null as *i64, .len = 0, .cap = 0 };
+    connection.*.inbound_byte_start = 0; connection.*.inbound_eof = 0;
+    connection.*.clipboard_sources = ArrayList[WaylandNativeClipboardSourceRecord]{
+        .data = null as *WaylandNativeClipboardSourceRecord, .len = 0, .cap = 0 };
+    connection.*.pending_frame_bytes = 0;
+    connection.*.keyboard_pending_keymap_bytes = ArrayList[u8]{
+        .data = null as *u8, .len = 0, .cap = 0 };
+    connection.*.keyboard_pending_keymap_format = 0;
+    connection.*.keyboard_pending_keymap_size = 0;
+    connection.*.keyboard_pending_keymap_ready = 0;
+    connection.*.keyboard_pending_authority_kind = WaylandKeyboardAuthorityKind.None;
+    connection.*.keyboard_pending_authority_ready = 0;
+    connection.*.keyboard_authority_generation = 0;
+    connection.*.clipboard_manager_name = 0;
+    connection.*.registry_total_interface_bytes = 0; connection.*.registry_failed = 0;
+}

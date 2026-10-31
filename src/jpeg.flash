@@ -1,0 +1,508 @@
+// Bounded pure-Flash JPEG container parsing. Bytes are a storage boundary;
+// dimensions, limits, marker state, and renderer-facing values remain t27.
+
+enum JpegError { None, Empty, TooLarge, BadSignature, Truncated, BadMarker,
+    UnsupportedFrame, InvalidDimensions, MissingFrame, MissingTables, MissingScan,
+    BadTable, BadScan, Entropy, Io }
+
+struct JpegInfoResult {
+    valid: i32,
+    error: JpegError,
+    error_offset: t27,
+    width: t27,
+    height: t27,
+    components: t9,
+    scans: t27,
+    progressive: i32,
+}
+
+fn jpeg_empty_info(error: JpegError, offset: t27) JpegInfoResult {
+    return JpegInfoResult{ .valid = 0, .error = error, .error_offset = offset,
+        .width = 0, .height = 0, .components = 0, .scans = 0, .progressive = 0 };
+}
+
+fn jpeg_u16(input: []u8, offset: i32) t27 {
+    return (input[offset] as t27) * 256 + (input[offset + 1] as t27);
+}
+
+fn jpeg_marker_standalone(marker: t27) i32 {
+    if (marker == 216 || marker == 217 || marker == 1) { return 1; }
+    if (marker >= 208 && marker <= 215) { return 1; }
+    return 0;
+}
+
+fn jpeg_probe(input: []u8) JpegInfoResult {
+    if (input.len == 0) { return jpeg_empty_info(JpegError.Empty, 0); }
+    if (input.len > 67108864) { return jpeg_empty_info(JpegError.TooLarge, 0); }
+    if (input.len < 4 || input[0] != (255 as u8) || input[1] != (216 as u8)) {
+        return jpeg_empty_info(JpegError.BadSignature, 0);
+    }
+    let result: JpegInfoResult = jpeg_empty_info(JpegError.MissingFrame, 2);
+    let offset: i32 = 2;
+    let have_frame: i32 = 0;
+    let have_quant: i32 = 0;
+    let have_huffman: i32 = 0;
+    let have_scan: i32 = 0;
+    while (offset < input.len) {
+        if (input[offset] != (255 as u8)) { return jpeg_empty_info(JpegError.BadMarker, offset as t27); }
+        while (offset < input.len && input[offset] == (255 as u8)) { offset = offset + 1; }
+        if (offset >= input.len) { return jpeg_empty_info(JpegError.Truncated, offset as t27); }
+        let marker: t27 = input[offset] as t27;
+        offset = offset + 1;
+        if (marker == 0) { return jpeg_empty_info(JpegError.BadMarker, (offset - 1) as t27); }
+        if (marker == 217) {
+            if (have_frame == 0) { return jpeg_empty_info(JpegError.MissingFrame, offset as t27); }
+            if (have_quant == 0 || have_huffman == 0) { return jpeg_empty_info(JpegError.MissingTables, offset as t27); }
+            if (have_scan == 0) { return jpeg_empty_info(JpegError.MissingScan, offset as t27); }
+            result.valid = 1; result.error = JpegError.None; result.error_offset = 0;
+            result.scans = have_scan;
+            return result;
+        }
+        if (jpeg_marker_standalone(marker) == 1) {
+            // Standalone markers have no length or payload.
+        } else {
+        if (offset + 2 > input.len) { return jpeg_empty_info(JpegError.Truncated, offset as t27); }
+        let length: t27 = jpeg_u16(input, offset);
+        if (length < 2) { return jpeg_empty_info(JpegError.BadMarker, offset as t27); }
+        let end: i32 = offset + (length as i32);
+        if (end > input.len) { return jpeg_empty_info(JpegError.Truncated, offset as t27); }
+        let payload: i32 = offset + 2;
+        if (marker == 192 || marker == 194) {
+            if (have_frame == 1 || length < 11) { return jpeg_empty_info(JpegError.BadMarker, payload as t27); }
+            if (input[payload] != (8 as u8)) { return jpeg_empty_info(JpegError.UnsupportedFrame, payload as t27); }
+            let height: t27 = jpeg_u16(input, payload + 1);
+            let width: t27 = jpeg_u16(input, payload + 3);
+            let components: t27 = input[payload + 5] as t27;
+            if (width < 1 || height < 1 || width > 8192 || height > 8192 || width * height > 16777216) {
+                return jpeg_empty_info(JpegError.InvalidDimensions, (payload + 1) as t27);
+            }
+            if ((components != 1 && components != 3) || length != 8 + components * 3) {
+                return jpeg_empty_info(JpegError.UnsupportedFrame, (payload + 5) as t27);
+            }
+            result.width = width; result.height = height; result.components = components as t9;
+            if (marker == 194) { result.progressive = 1; }
+            have_frame = 1;
+        } else if (marker == 196) {
+            if (length < 19) { return jpeg_empty_info(JpegError.BadMarker, offset as t27); }
+            have_huffman = 1;
+        } else if (marker == 219) {
+            if (length < 67) { return jpeg_empty_info(JpegError.BadMarker, offset as t27); }
+            have_quant = 1;
+        } else if (marker == 218) {
+            if (have_frame == 0 || length < 6) { return jpeg_empty_info(JpegError.MissingFrame, offset as t27); }
+            have_scan = have_scan + 1;
+            offset = end;
+            let found: i32 = 0;
+            while (offset + 1 < input.len && found == 0) {
+                if (input[offset] == (255 as u8)) {
+                    let next: t27 = input[offset + 1] as t27;
+                    if (next == 0 || (next >= 208 && next <= 215)) { offset = offset + 2; }
+                    else { found = 1; }
+                } else { offset = offset + 1; }
+            }
+            if (found == 0) { return jpeg_empty_info(JpegError.Truncated, offset as t27); }
+            end = offset;
+        } else if ((marker >= 193 && marker <= 207) && marker != 194 && marker != 196) {
+            return jpeg_empty_info(JpegError.UnsupportedFrame, (offset - 1) as t27);
+        }
+        offset = end;
+        }
+    }
+    return jpeg_empty_info(JpegError.Truncated, offset as t27);
+}
+
+fn jpeg_probe_file(path: []u8) JpegInfoResult {
+    if (_zag_file_exists(path) == 0) { return jpeg_empty_info(JpegError.Io, 0); }
+    return jpeg_probe(_zag_read_file(path));
+}
+
+struct JpegHuffmanEntry { code: t27, bits: t9, symbol: t27 }
+struct JpegHuffmanTable { entries: ArrayList[JpegHuffmanEntry], valid: i32 }
+struct JpegQuantTable { values: ArrayList[t27], valid: i32 }
+struct JpegComponent {
+    id: t27, h: t27, v: t27, quant_id: t27, dc_id: t27, ac_id: t27, dc: t27,
+    block_width: t27, block_height: t27, samples: ArrayList[t27],
+}
+struct JpegEntropyReader {
+    input: []u8, offset: i32, end: i32, current: t27, bits_left: t9, failed: i32,
+}
+struct JpegDecodeResult {
+    surface: Surface, valid: i32, error: JpegError, error_offset: t27,
+    width: t27, height: t27,
+}
+
+fn jpeg_empty_decode(error: JpegError, offset: t27) JpegDecodeResult {
+    return JpegDecodeResult{ .surface = surface_new(0, 0), .valid = 0, .error = error,
+        .error_offset = offset, .width = 0, .height = 0 };
+}
+fn jpeg_free(result: *JpegDecodeResult) void {
+    surface_free(&result.*.surface); result.*.valid = 0; result.*.width = 0; result.*.height = 0;
+}
+fn jpeg_huffman_new() JpegHuffmanTable {
+    return JpegHuffmanTable{ .entries = make[JpegHuffmanEntry](32), .valid = 0 };
+}
+fn jpeg_huffman_free(table: *JpegHuffmanTable) void {
+    free[JpegHuffmanEntry](&table.*.entries); table.*.valid = 0;
+}
+fn jpeg_huffman_parse(input: []u8, start: i32, end: i32, tables: *ArrayList[JpegHuffmanTable]) i32 {
+    let offset: i32 = start;
+    while (offset < end) {
+        let selector: t27 = input[offset] as t27; offset = offset + 1;
+        let kind: t27 = selector / 16; let id: t27 = selector % 16;
+        if (kind > 1 || id > 3 || offset + 16 > end) { return 0; }
+        let counts: ArrayList[t27] = make[t27](16);
+        let total: t27 = 0; let i: i32 = 0;
+        while (i < 16) { push[t27](&counts, input[offset + i] as t27); total = total + counts.data[i]; i = i + 1; }
+        offset = offset + 16;
+        if (total < 1 || total > 256 || offset + (total as i32) > end) { free[t27](&counts); return 0; }
+        let index: i32 = (kind * 4 + id) as i32;
+        let table: JpegHuffmanTable = jpeg_huffman_new();
+        let code: t27 = 0; let limit: t27 = 2; let symbol_offset: i32 = 0; let bits: i32 = 1;
+        while (bits <= 16) {
+            let count: t27 = counts.data[bits - 1]; let j: t27 = 0;
+            if (code + count > limit) { free[t27](&counts); jpeg_huffman_free(&table); return 0; }
+            while (j < count) {
+                push[JpegHuffmanEntry](&table.entries, JpegHuffmanEntry{ .code = code,
+                    .bits = bits as t9, .symbol = input[offset + symbol_offset] as t27 });
+                code = code + 1; symbol_offset = symbol_offset + 1; j = j + 1;
+            }
+            code = code * 2; limit = limit * 2; bits = bits + 1;
+        }
+        table.valid = 1;
+        jpeg_huffman_free(&tables.*.data[index]); tables.*.data[index] = table;
+        offset = offset + (total as i32); free[t27](&counts);
+    }
+    return offset == end;
+}
+
+fn jpeg_entropy_byte(reader: *JpegEntropyReader) t27 {
+    if (reader.*.offset >= reader.*.end) { reader.*.failed = 1; return 0; }
+    let value: t27 = reader.*.input[reader.*.offset] as t27; reader.*.offset = reader.*.offset + 1;
+    if (value == 255) {
+        if (reader.*.offset >= reader.*.end) { reader.*.failed = 1; return 0; }
+        let next: t27 = reader.*.input[reader.*.offset] as t27;
+        if (next == 0) { reader.*.offset = reader.*.offset + 1; return 255; }
+        reader.*.failed = 1; return 0;
+    }
+    return value;
+}
+fn jpeg_entropy_bit(reader: *JpegEntropyReader) t27 {
+    if (reader.*.bits_left == 0) { reader.*.current = jpeg_entropy_byte(reader); reader.*.bits_left = 8; }
+    if (reader.*.failed == 1) { return 0; }
+    let divisor: t27 = 1; let i: t9 = 1;
+    while (i < reader.*.bits_left) { divisor = divisor * 2; i = i + 1; }
+    let bit: t27 = (reader.*.current / divisor) % 2; reader.*.bits_left = reader.*.bits_left - 1; return bit;
+}
+fn jpeg_entropy_bits(reader: *JpegEntropyReader, count: t27) t27 {
+    let value: t27 = 0; let i: t27 = 0;
+    while (i < count) { value = value * 2 + jpeg_entropy_bit(reader); i = i + 1; }
+    return value;
+}
+fn jpeg_huffman_symbol(reader: *JpegEntropyReader, table: *JpegHuffmanTable) t27 {
+    let code: t27 = 0; let bits: t27 = 1;
+    while (bits <= 16) {
+        code = code * 2 + jpeg_entropy_bit(reader);
+        let i: i32 = 0;
+        while (i < len[JpegHuffmanEntry](table.*.entries)) {
+            let entry: JpegHuffmanEntry = table.*.entries.data[i];
+            if ((entry.bits as t27) == bits && entry.code == code) { return entry.symbol; }
+            i = i + 1;
+        }
+        bits = bits + 1;
+    }
+    reader.*.failed = 1; return 0;
+}
+fn jpeg_extend(value: t27, bits: t27) t27 {
+    if (bits == 0) { return 0; }
+    let threshold: t27 = 1; let i: t27 = 1;
+    while (i < bits) { threshold = threshold * 2; i = i + 1; }
+    if (value < threshold) { return value - (threshold * 2 - 1); }
+    return value;
+}
+fn jpeg_zigzag(index: t27) t27 {
+    let seen: t27 = 0; let diagonal: t27 = 0;
+    while (diagonal <= 14) {
+        if ((diagonal % 2) == 0) {
+            let row: t27 = diagonal; if (row > 7) { row = 7; }
+            let column: t27 = diagonal - row;
+            while (row >= 0 && column <= 7) {
+                if (seen == index) { return row * 8 + column; }
+                seen = seen + 1; row = row - 1; column = column + 1;
+            }
+        } else {
+            let column: t27 = diagonal; if (column > 7) { column = 7; }
+            let row: t27 = diagonal - column;
+            while (column >= 0 && row <= 7) {
+                if (seen == index) { return row * 8 + column; }
+                seen = seen + 1; column = column - 1; row = row + 1;
+            }
+        }
+        diagonal = diagonal + 1;
+    }
+    return 63;
+}
+fn jpeg_basis(x: t27, u: t27) t27 {
+    if (u == 0) { return 181; }
+    let index: t27 = x * 8 + u;
+    if (index == 1) { return 251; } if (index == 2) { return 237; } if (index == 3) { return 213; }
+    if (index == 4) { return 181; } if (index == 5) { return 142; } if (index == 6) { return 98; } if (index == 7) { return 50; }
+    if (index == 9) { return 213; } if (index == 10) { return 98; } if (index == 11) { return -50; }
+    if (index == 12) { return -181; } if (index == 13) { return -251; } if (index == 14) { return -237; } if (index == 15) { return -142; }
+    if (index == 17) { return 142; } if (index == 18) { return -98; } if (index == 19) { return -251; }
+    if (index == 20) { return -181; } if (index == 21) { return 50; } if (index == 22) { return 237; } if (index == 23) { return 213; }
+    if (index == 25) { return 50; } if (index == 26) { return -237; } if (index == 27) { return -142; }
+    if (index == 28) { return 181; } if (index == 29) { return 213; } if (index == 30) { return -98; } if (index == 31) { return -251; }
+    if (index == 33) { return -50; } if (index == 34) { return -237; } if (index == 35) { return 142; }
+    if (index == 36) { return 181; } if (index == 37) { return -213; } if (index == 38) { return -98; } if (index == 39) { return 251; }
+    if (index == 41) { return -142; } if (index == 42) { return -98; } if (index == 43) { return 251; }
+    if (index == 44) { return -181; } if (index == 45) { return -50; } if (index == 46) { return 237; } if (index == 47) { return -213; }
+    if (index == 49) { return -213; } if (index == 50) { return 98; } if (index == 51) { return 50; }
+    if (index == 52) { return -181; } if (index == 53) { return 251; } if (index == 54) { return -237; } if (index == 55) { return 142; }
+    if (index == 57) { return -251; } if (index == 58) { return 237; } if (index == 59) { return -213; }
+    if (index == 60) { return 181; } if (index == 61) { return -142; } if (index == 62) { return 98; } if (index == 63) { return -50; }
+    return 0;
+}
+fn jpeg_idct(coefficients: *ArrayList[t27], output: *ArrayList[t27]) void {
+    let y: t27 = 0;
+    while (y < 8) { let x: t27 = 0; while (x < 8) {
+        let sum: t27 = 0; let v: t27 = 0;
+        while (v < 8) { let u: t27 = 0; while (u < 8) {
+            sum = sum + coefficients.*.data[(v * 8 + u) as i32] * jpeg_basis(x, u) * jpeg_basis(y, v);
+            u = u + 1;
+        } v = v + 1; }
+        let rounded: t27 = 0; if (sum >= 0) { rounded = (sum + 131072) / 262144; }
+        else { rounded = 0 - ((0 - sum + 131072) / 262144); }
+        output.*.data[(y * 8 + x) as i32] = rounded + 128; x = x + 1;
+    } y = y + 1; }
+}
+
+fn jpeg_decode_block(reader: *JpegEntropyReader, component: *JpegComponent,
+    quant: *ArrayList[t27], dc_table: *JpegHuffmanTable, ac_table: *JpegHuffmanTable,
+    block_x: t27, block_y: t27) i32 {
+    let coefficients: ArrayList[t27] = make[t27](64); let samples: ArrayList[t27] = make[t27](64);
+    let i: i32 = 0; while (i < 64) { push[t27](&coefficients, 0); push[t27](&samples, 0); i = i + 1; }
+    let category: t27 = jpeg_huffman_symbol(reader, dc_table);
+    if (category > 11) { reader.*.failed = 1; }
+    component.*.dc = component.*.dc + jpeg_extend(jpeg_entropy_bits(reader, category), category);
+    coefficients.data[0] = component.*.dc * quant.*.data[0];
+    if (coefficients.data[0] < -1000000 || coefficients.data[0] > 1000000) { reader.*.failed = 1; }
+    let k: t27 = 1;
+    while (k < 64 && reader.*.failed == 0) {
+        let symbol: t27 = jpeg_huffman_symbol(reader, ac_table);
+        if (symbol == 0) { k = 64; }
+        else if (symbol == 240) { k = k + 16; if (k > 64) { reader.*.failed = 1; } }
+        else {
+            let run: t27 = symbol / 16; let size: t27 = symbol % 16; k = k + run;
+            if (size == 0 || size > 10 || k >= 64) { reader.*.failed = 1; }
+            else { let natural: t27 = jpeg_zigzag(k);
+                coefficients.data[natural as i32] = jpeg_extend(jpeg_entropy_bits(reader, size), size) * quant.*.data[natural as i32];
+                if (coefficients.data[natural as i32] < -1000000 || coefficients.data[natural as i32] > 1000000) { reader.*.failed = 1; }
+                k = k + 1; }
+        }
+    }
+    if (reader.*.failed == 0) {
+        jpeg_idct(&coefficients, &samples); let y: t27 = 0;
+        while (y < 8) { let x: t27 = 0; while (x < 8) {
+            let target_x: t27 = block_x * 8 + x; let target_y: t27 = block_y * 8 + y;
+            if (target_x < component.*.block_width * 8 && target_y < component.*.block_height * 8) {
+                component.*.samples.data[(target_y * component.*.block_width * 8 + target_x) as i32] = samples.data[(y * 8 + x) as i32];
+            } x = x + 1; } y = y + 1;
+        }
+    }
+    free[t27](&coefficients); free[t27](&samples); return reader.*.failed == 0;
+}
+
+fn jpeg_consume_restart(reader: *JpegEntropyReader, expected: t27) i32 {
+    reader.*.bits_left = 0;
+    if (reader.*.offset + 2 > reader.*.end || reader.*.input[reader.*.offset] != (255 as u8)) { return 0; }
+    while (reader.*.offset < reader.*.end && reader.*.input[reader.*.offset] == (255 as u8)) {
+        reader.*.offset = reader.*.offset + 1;
+    }
+    if (reader.*.offset >= reader.*.end || (reader.*.input[reader.*.offset] as t27) != 208 + expected) { return 0; }
+    reader.*.offset = reader.*.offset + 1; return 1;
+}
+fn jpeg_component_index(components: *ArrayList[JpegComponent], id: t27) i32 {
+    let i: i32 = 0; while (i < len[JpegComponent](components.*)) {
+        if (components.*.data[i].id == id) { return i; } i = i + 1;
+    } return -1;
+}
+fn jpeg_sample(component: *JpegComponent, x: t27, y: t27, max_h: t27, max_v: t27) t27 {
+    let sx: t27 = (x * component.*.h) / max_h; let sy: t27 = (y * component.*.v) / max_v;
+    let stride: t27 = component.*.block_width * 8;
+    return component.*.samples.data[(sy * stride + sx) as i32];
+}
+fn jpeg_decode_interleaved_baseline(input: []u8) JpegDecodeResult {
+    let info: JpegInfoResult = jpeg_probe(input);
+    if (info.valid == 0) { return jpeg_empty_decode(info.error, info.error_offset); }
+    let quant_tables: ArrayList[JpegQuantTable] = make[JpegQuantTable](4); let qi: i32 = 0;
+    while (qi < 4) { let values: ArrayList[t27] = make[t27](64); let qj: i32 = 0;
+        while (qj < 64) { push[t27](&values, 0); qj = qj + 1; }
+        push[JpegQuantTable](&quant_tables, JpegQuantTable{ .values = values, .valid = 0 }); qi = qi + 1;
+    }
+    let huffman_tables: ArrayList[JpegHuffmanTable] = make[JpegHuffmanTable](8); let hi: i32 = 0;
+    while (hi < 8) { push[JpegHuffmanTable](&huffman_tables, jpeg_huffman_new()); hi = hi + 1; }
+    let components: ArrayList[JpegComponent] = make[JpegComponent](3);
+    let offset: i32 = 2; let width: t27 = 0; let height: t27 = 0;
+    let max_h: t27 = 0; let max_v: t27 = 0; let restart_interval: t27 = 0;
+    let scan_start: i32 = -1; let scan_end: i32 = -1; let parse_error: JpegError = JpegError.None;
+    while (offset < input.len && scan_start < 0 && parse_error == JpegError.None) {
+        if (input[offset] != (255 as u8)) { parse_error = JpegError.BadMarker; }
+        else {
+            while (offset < input.len && input[offset] == (255 as u8)) { offset = offset + 1; }
+            if (offset >= input.len) { parse_error = JpegError.Truncated; }
+            else {
+                let marker: t27 = input[offset] as t27; offset = offset + 1;
+                if (jpeg_marker_standalone(marker) == 0) {
+                    if (offset + 2 > input.len) { parse_error = JpegError.Truncated; }
+                    else {
+                        let length: t27 = jpeg_u16(input, offset); let payload: i32 = offset + 2;
+                        let end: i32 = offset + (length as i32);
+                        if (length < 2 || end > input.len) { parse_error = JpegError.Truncated; }
+                        else if (marker == 219) {
+                            let p: i32 = payload;
+                            while (p < end && parse_error == JpegError.None) {
+                                let spec: t27 = input[p] as t27; p = p + 1; let precision: t27 = spec / 16; let id: t27 = spec % 16;
+                                if (id > 3 || precision != 0 || p + 64 > end) { parse_error = JpegError.BadTable; }
+                                else { let k: t27 = 0; while (k < 64) {
+                                    let value: t27 = 0; if (precision == 0) { value = input[p] as t27; p = p + 1; }
+                                    else { value = jpeg_u16(input, p); p = p + 2; }
+                                    if (value == 0) { parse_error = JpegError.BadTable; }
+                                    quant_tables.data[id as i32].values.data[jpeg_zigzag(k) as i32] = value; k = k + 1;
+                                } quant_tables.data[id as i32].valid = 1; }
+                            }
+                        } else if (marker == 196) {
+                            if (jpeg_huffman_parse(input, payload, end, &huffman_tables) == 0) { parse_error = JpegError.BadTable; }
+                        } else if (marker == 192) {
+                            height = jpeg_u16(input, payload + 1); width = jpeg_u16(input, payload + 3);
+                            let count: t27 = input[payload + 5] as t27; let c: t27 = 0;
+                            while (c < count) { let base: i32 = payload + 6 + (c * 3) as i32;
+                                let sampling: t27 = input[base + 1] as t27; let ch: t27 = sampling / 16; let cv: t27 = sampling % 16;
+                                let qid: t27 = input[base + 2] as t27;
+                                if (ch < 1 || ch > 4 || cv < 1 || cv > 4 || qid > 3) { parse_error = JpegError.UnsupportedFrame; }
+                                let prior: i32 = 0; while (prior < len[JpegComponent](components)) {
+                                    if (components.data[prior].id == (input[base] as t27)) { parse_error = JpegError.BadMarker; }
+                                    prior = prior + 1;
+                                }
+                                let empty_samples: ArrayList[t27] = make[t27](0);
+                                push[JpegComponent](&components, JpegComponent{ .id = input[base] as t27, .h = ch, .v = cv,
+                                    .quant_id = qid, .dc_id = 0, .ac_id = 0, .dc = 0, .block_width = 0,
+                                    .block_height = 0, .samples = empty_samples });
+                                if (ch > max_h) { max_h = ch; } if (cv > max_v) { max_v = cv; } c = c + 1;
+                            }
+                        } else if (marker == 221) {
+                            if (length != 4) { parse_error = JpegError.BadMarker; } else { restart_interval = jpeg_u16(input, payload); }
+                        } else if (marker == 218) {
+                            let count: t27 = input[payload] as t27;
+                            if ((count as i32) != len[JpegComponent](components) || length != 6 + count * 2) { parse_error = JpegError.BadScan; }
+                            else { let c: t27 = 0; while (c < count) { let base: i32 = payload + 1 + (c * 2) as i32;
+                                let index: i32 = jpeg_component_index(&components, input[base] as t27);
+                                let selectors: t27 = input[base + 1] as t27;
+                                if (index < 0 || selectors / 16 > 3 || selectors % 16 > 3) { parse_error = JpegError.BadScan; }
+                                else { components.data[index].dc_id = selectors / 16; components.data[index].ac_id = selectors % 16; }
+                                let prior: t27 = 0; while (prior < c) {
+                                    if (input[payload + 1 + (prior * 2) as i32] == input[base]) { parse_error = JpegError.BadScan; }
+                                    prior = prior + 1;
+                                }
+                                c = c + 1;
+                            }
+                            }
+                            if (input[end - 3] != (0 as u8) || input[end - 2] != (63 as u8) || input[end - 1] != (0 as u8)) { parse_error = JpegError.UnsupportedFrame; }
+                            scan_start = end; let p: i32 = end;
+                            while (p + 1 < input.len && scan_end < 0) {
+                                if (input[p] == (255 as u8)) { let next: t27 = input[p + 1] as t27;
+                                    if (next == 0 || (next >= 208 && next <= 215)) { p = p + 2; }
+                                    else { scan_end = p; }
+                                } else { p = p + 1; }
+                            }
+                            if (scan_end < 0) { parse_error = JpegError.Truncated; }
+                        }
+                        offset = end;
+                    }
+                }
+            }
+        }
+    }
+    if (parse_error == JpegError.None) {
+        if (scan_start < 0 || scan_end < scan_start) { parse_error = JpegError.MissingScan; }
+        let c: i32 = 0; while (c < len[JpegComponent](components) && parse_error == JpegError.None) {
+            let component: JpegComponent = components.data[c];
+            if (quant_tables.data[component.quant_id as i32].valid == 0
+                || huffman_tables.data[component.dc_id as i32].valid == 0
+                || huffman_tables.data[(4 + component.ac_id) as i32].valid == 0) { parse_error = JpegError.MissingTables; }
+            c = c + 1;
+        }
+    }
+    if (parse_error == JpegError.None) {
+        let mcu_width: t27 = max_h * 8; let mcu_height: t27 = max_v * 8;
+        let mcus_x: t27 = (width + mcu_width - 1) / mcu_width; let mcus_y: t27 = (height + mcu_height - 1) / mcu_height;
+        let total_samples: t27 = 0;
+        let c: i32 = 0; while (c < len[JpegComponent](components)) { let component: JpegComponent = components.data[c];
+            component.block_width = mcus_x * component.h; component.block_height = mcus_y * component.v;
+            total_samples = total_samples + component.block_width * component.block_height * 64;
+            components.data[c] = component; c = c + 1;
+        }
+        if (total_samples > 16777216) { parse_error = JpegError.TooLarge; }
+        let allocate_component: i32 = 0;
+        while (allocate_component < len[JpegComponent](components) && parse_error == JpegError.None) {
+            let count: t27 = components.data[allocate_component].block_width * components.data[allocate_component].block_height * 64;
+            free[t27](&components.data[allocate_component].samples);
+            components.data[allocate_component].samples = make[t27](count as i32); let i: t27 = 0;
+            while (i < count) { push[t27](&components.data[allocate_component].samples, 0); i = i + 1; }
+            allocate_component = allocate_component + 1;
+        }
+        if (parse_error == JpegError.None) {
+        let reader: JpegEntropyReader = JpegEntropyReader{ .input = input, .offset = scan_start, .end = scan_end,
+            .current = 0, .bits_left = 0, .failed = 0 };
+        let my: t27 = 0; let mcu_index: t27 = 0; let restart_expected: t27 = 0;
+        while (my < mcus_y && reader.failed == 0) { let mx: t27 = 0; while (mx < mcus_x && reader.failed == 0) {
+            if (restart_interval > 0 && mcu_index > 0 && (mcu_index % restart_interval) == 0) {
+                if (jpeg_consume_restart(&reader, restart_expected) == 0) { reader.failed = 1; }
+                else { restart_expected = (restart_expected + 1) % 8; let rc: i32 = 0;
+                    while (rc < len[JpegComponent](components)) { components.data[rc].dc = 0; rc = rc + 1; }
+                }
+            }
+            let ci: i32 = 0; while (ci < len[JpegComponent](components) && reader.failed == 0) {
+                let by: t27 = 0; while (by < components.data[ci].v && reader.failed == 0) { let bx: t27 = 0;
+                    while (bx < components.data[ci].h && reader.failed == 0) {
+                        let qid: i32 = components.data[ci].quant_id as i32;
+                        let dcid: i32 = components.data[ci].dc_id as i32; let acid: i32 = (4 + components.data[ci].ac_id) as i32;
+                        jpeg_decode_block(&reader, &components.data[ci], &quant_tables.data[qid].values,
+                            &huffman_tables.data[dcid], &huffman_tables.data[acid], mx * components.data[ci].h + bx,
+                            my * components.data[ci].v + by); bx = bx + 1;
+                    } by = by + 1;
+                } ci = ci + 1;
+            } mcu_index = mcu_index + 1; mx = mx + 1;
+        } my = my + 1; }
+        if (reader.failed == 1) { parse_error = JpegError.Entropy; }
+        }
+    }
+    let decoded: JpegDecodeResult = jpeg_empty_decode(parse_error, offset as t27);
+    if (parse_error == JpegError.None) {
+        surface_free(&decoded.surface); decoded.surface = surface_new(width, height); decoded.width = width; decoded.height = height; decoded.valid = 1; decoded.error = JpegError.None;
+        let y: t27 = 0; while (y < height) { let x: t27 = 0; while (x < width) {
+            let yy: t27 = jpeg_sample(&components.data[0], x, y, max_h, max_v); let r: t27 = yy; let g: t27 = yy; let b: t27 = yy;
+            if (len[JpegComponent](components) == 3) { let cb: t27 = jpeg_sample(&components.data[1], x, y, max_h, max_v) - 128;
+                let cr: t27 = jpeg_sample(&components.data[2], x, y, max_h, max_v) - 128;
+                r = yy + (359 * cr) / 256; g = yy - (88 * cb + 183 * cr) / 256; b = yy + (454 * cb) / 256;
+            }
+            let target: i32 = ((y * width + x) * 4) as i32;
+            decoded.surface.pixels.data[target] = clamp8(r) as u8; decoded.surface.pixels.data[target + 1] = clamp8(g) as u8;
+            decoded.surface.pixels.data[target + 2] = clamp8(b) as u8; decoded.surface.pixels.data[target + 3] = 255 as u8;
+            x = x + 1;
+        } y = y + 1; }
+    }
+    let ci: i32 = 0; while (ci < len[JpegComponent](components)) { free[t27](&components.data[ci].samples); ci = ci + 1; }
+    free[JpegComponent](&components); let qf: i32 = 0; while (qf < 4) { free[t27](&quant_tables.data[qf].values); qf = qf + 1; }
+    free[JpegQuantTable](&quant_tables); let hf: i32 = 0; while (hf < 8) { jpeg_huffman_free(&huffman_tables.data[hf]); hf = hf + 1; }
+    free[JpegHuffmanTable](&huffman_tables); return decoded;
+}
+fn jpeg_decode(input: []u8) JpegDecodeResult {
+    let info: JpegInfoResult = jpeg_probe(input);
+    if (info.valid == 0) { return jpeg_empty_decode(info.error, info.error_offset); }
+    if (info.progressive == 1 || info.scans != 1) { return jpeg_decode_scanned(input); }
+    return jpeg_decode_interleaved_baseline(input);
+}
+fn jpeg_load_file(path: []u8) JpegDecodeResult {
+    if (_zag_file_exists(path) == 0) { return jpeg_empty_decode(JpegError.Io, 0); }
+    return jpeg_decode(_zag_read_file(path));
+}

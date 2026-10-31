@@ -1,0 +1,485 @@
+// Deterministic row/column layout and structural validation.
+
+struct CheckReport {
+    errors: i32,
+    warnings: i32,
+    overlaps: i32,
+    clipped: i32,
+    undersized: i32,
+    unlabeled: i32,
+    off_grid: i32,
+    low_contrast: i32,
+    invalid_geometry: i32,
+}
+
+fn layout_t27_min() t27 { return (0 as t27) - flashy_t27_max(); }
+
+fn layout_add_checked(a: t27, b: t27, out: *t27) i32 {
+    if (b > 0 && a > flashy_t27_max() - b) { return 0; }
+    if (b < 0 && a < layout_t27_min() - b) { return 0; }
+    out.* = a + b;
+    return 1;
+}
+
+fn layout_sub_checked(a: t27, b: t27, out: *t27) i32 {
+    // Balanced t27 has a symmetric minimum/maximum, so negating t27_min is
+    // representable and can be delegated to the checked addition boundary.
+    return layout_add_checked(a, (0 as t27) - b, out);
+}
+
+fn layout_mul_checked(a: t27, b: t27, out: *t27) i32 {
+    if (a == 0 || b == 0) { out.* = 0; return 1; }
+    // Symmetric magnitudes avoid max/negative truncation making the two
+    // operand orders disagree at t27_min * -1.
+    let magnitude_a: t27 = a; if (magnitude_a < 0) { magnitude_a = (0 as t27) - magnitude_a; }
+    let magnitude_b: t27 = b; if (magnitude_b < 0) { magnitude_b = (0 as t27) - magnitude_b; }
+    if (magnitude_a > flashy_t27_max() / magnitude_b) { return 0; }
+    out.* = a * b;
+    return 1;
+}
+
+fn layout_nonnegative_difference(a: t27, b: t27, out: *t27) i32 {
+    if (a < 0 || b < 0 || b > a) { return 0; }
+    return layout_sub_checked(a, b, out);
+}
+
+// Half-open interval comparison without forming an endpoint outside t27.
+fn layout_interval_before(start: t27, extent: t27, other_start: t27) i32 {
+    let finish: t27 = 0;
+    if (layout_add_checked(start, extent, &finish) == 0) {
+        // Extents accepted by rect_intersects are positive, so the only
+        // possible failure is an upper-bound overflow beyond every t27 origin.
+        return 0;
+    }
+    return finish <= other_start;
+}
+
+fn rect_intersects(a: Rect, b: Rect) i32 {
+    if (a.w <= 0 || a.h <= 0 || b.w <= 0 || b.h <= 0) { return 0; }
+    if (layout_interval_before(a.x, a.w, b.x) == 1 || layout_interval_before(b.x, b.w, a.x) == 1) { return 0; }
+    if (layout_interval_before(a.y, a.h, b.y) == 1 || layout_interval_before(b.y, b.h, a.y) == 1) { return 0; }
+    return 1;
+}
+
+fn layout_resolve_length(length: Length, available: t27, intrinsic: t27, out: *t27) i32 {
+    if (available < 0) { return 0; }
+    if (length.kind == LengthKind.Pixels) {
+        if (length.value < 0) { return 0; }
+        out.* = length.value;
+        return 1;
+    }
+    if (length.kind == LengthKind.Percent) {
+        if (length.value < 0 || length.value > 100) { return 0; }
+        out.* = length_resolve(length, available, intrinsic);
+        return 1;
+    }
+    if (intrinsic < 0) { return 0; }
+    out.* = intrinsic;
+    return 1;
+}
+
+fn layout_resolve_size_checked(child: *Node, available_w: t27, available_h: t27) i32 {
+    if (child.*.style.min_w < 0 || child.*.style.min_h < 0
+        || child.*.style.max_w < 0 || child.*.style.max_h < 0
+        || (child.*.style.max_w > 0 && child.*.style.max_w < child.*.style.min_w)
+        || (child.*.style.max_h > 0 && child.*.style.max_h < child.*.style.min_h)) { return 0; }
+    let width: t27 = 0;
+    let height: t27 = 0;
+    if (layout_resolve_length(child.*.style.width, available_w, child.*.bounds.w, &width) == 0
+        || layout_resolve_length(child.*.style.height, available_h, child.*.bounds.h, &height) == 0) { return 0; }
+    child.*.bounds.w = width;
+    child.*.bounds.h = height;
+    if (child.*.bounds.w < child.*.style.min_w) { child.*.bounds.w = child.*.style.min_w; }
+    if (child.*.bounds.h < child.*.style.min_h) { child.*.bounds.h = child.*.style.min_h; }
+    if (child.*.style.max_w > 0 && child.*.bounds.w > child.*.style.max_w) { child.*.bounds.w = child.*.style.max_w; }
+    if (child.*.style.max_h > 0 && child.*.bounds.h > child.*.style.max_h) { child.*.bounds.h = child.*.style.max_h; }
+    return 1;
+}
+
+fn layout_resolve_size(child: *Node, available_w: t27, available_h: t27) void {
+    if (layout_resolve_size_checked(child, available_w, available_h) == 0) {
+        child.*.bounds.w = -1;
+        child.*.bounds.h = -1;
+    }
+}
+
+fn layout_cross_position_checked(origin: t27, available: t27, size: t27, margin: t27,
+    align: AlignKind, out: *t27) i32 {
+    if (available < 0 || size < 0 || margin < 0) { return 0; }
+    let offset: t27 = 0;
+    if (align == AlignKind.Center) {
+        if (layout_sub_checked(available, size, &offset) == 0) { return 0; }
+        offset = offset / 2;
+        return layout_add_checked(origin, offset, out);
+    }
+    if (align == AlignKind.End) {
+        if (layout_add_checked(origin, available, &offset) == 0
+            || layout_sub_checked(offset, size, &offset) == 0
+            || layout_sub_checked(offset, margin, out) == 0) { return 0; }
+        return 1;
+    }
+    return layout_add_checked(origin, margin, out);
+}
+
+fn layout_cross_position(origin: t27, available: t27, size: t27, margin: t27, align: AlignKind) t27 {
+    let result: t27 = 0;
+    if (layout_cross_position_checked(origin, available, size, margin, align, &result) == 0) {
+        return layout_t27_min();
+    }
+    return result;
+}
+
+fn layout_mark_invalid(child: *Node) void {
+    child.*.bounds.x = 0;
+    child.*.bounds.y = 0;
+    child.*.bounds.w = -1;
+    child.*.bounds.h = -1;
+}
+
+fn layout_inner_extent(extent: t27, padding: t27, out: *t27) i32 {
+    let doubled: t27 = 0;
+    if (extent < 0 || padding < 0 || layout_mul_checked(padding, 2, &doubled) == 0
+        || layout_sub_checked(extent, doubled, out) == 0) { return 0; }
+    if (out.* < 0) { out.* = 0; }
+    return 1;
+}
+
+fn layout_child_extent(extent: t27, margin: t27, out: *t27) i32 {
+    let doubled: t27 = 0;
+    if (extent < 0 || margin < 0 || layout_mul_checked(margin, 2, &doubled) == 0
+        || layout_nonnegative_difference(extent, doubled, out) == 0) { return 0; }
+    return 1;
+}
+
+fn layout_ceil_div(value: t27, divisor: t27, out: *t27) i32 {
+    if (value < 0 || divisor < 1) { return 0; }
+    out.* = value / divisor;
+    if ((value % divisor) != 0) { return layout_add_checked(out.*, 1, out); }
+    return 1;
+}
+
+fn ui_layout(ui: *Ui) void {
+    let p: i32 = 0;
+    while (p < len[Node](ui.*.nodes)) {
+        let parent: Node = get[Node](ui.*.nodes, p);
+        if (parent.live == 1 && parent.style.layout != LayoutKind.Absolute) {
+            let inner_w: t27 = 0;
+            let inner_h: t27 = 0;
+            let layout_valid: i32 = 1;
+            if (parent.style.gap < 0 || layout_inner_extent(parent.bounds.w, parent.style.padding, &inner_w) == 0
+                || layout_inner_extent(parent.bounds.h, parent.style.padding, &inner_h) == 0) { layout_valid = 0; }
+            let cursor_main: t27 = 0;
+            let cursor_cross: t27 = 0;
+            let line_extent: t27 = 0;
+            let child_number: t27 = 0;
+            let child_count: t27 = 0;
+            let count_i: i32 = 0;
+            while (count_i < len[Node](ui.*.nodes)) {
+                if (ui.*.nodes.data[count_i].live == 1 && ui.*.nodes.data[count_i].parent == p) {
+                    if (layout_add_checked(child_count, 1, &child_count) == 0) { layout_valid = 0; }
+                }
+                count_i = count_i + 1;
+            }
+            let grid_columns: t27 = 0;
+            let grid_rows: t27 = 0;
+            let grid_cell_w: t27 = 0;
+            let grid_cell_h: t27 = 0;
+            if (layout_valid == 1 && parent.style.layout == LayoutKind.Grid && child_count > 0) {
+                grid_columns = parent.style.columns as t27;
+                let column_gaps: t27 = 0;
+                let row_gaps: t27 = 0;
+                let grid_width: t27 = 0;
+                let grid_height: t27 = 0;
+                if (grid_columns < 1 || layout_ceil_div(child_count, grid_columns, &grid_rows) == 0
+                    || layout_mul_checked(parent.style.gap, grid_columns - 1, &column_gaps) == 0
+                    || layout_mul_checked(parent.style.gap, grid_rows - 1, &row_gaps) == 0
+                    || layout_nonnegative_difference(inner_w, column_gaps, &grid_width) == 0
+                    || layout_nonnegative_difference(inner_h, row_gaps, &grid_height) == 0) {
+                    layout_valid = 0;
+                } else {
+                    grid_cell_w = grid_width / grid_columns;
+                    grid_cell_h = grid_height / grid_rows;
+                }
+            }
+            let i: i32 = 0;
+            while (i < len[Node](ui.*.nodes)) {
+                let child: Node = get[Node](ui.*.nodes, i);
+                if (child.live == 1 && child.parent == p) {
+                    let margin: t27 = child.style.margin;
+                    let child_valid: i32 = layout_valid;
+                    if (margin < 0) { child_valid = 0; }
+                    if (child_valid == 1 && parent.style.layout == LayoutKind.Grid) {
+                        let available_w: t27 = 0;
+                        let available_h: t27 = 0;
+                        let stride_w: t27 = 0;
+                        let stride_h: t27 = 0;
+                        let column_offset: t27 = 0;
+                        let row_offset: t27 = 0;
+                        let cross_x: t27 = 0;
+                        let cross_y: t27 = 0;
+                        let base_x: t27 = 0;
+                        let base_y: t27 = 0;
+                        let position: t27 = 0;
+                        let column: t27 = child_number % grid_columns;
+                        let row: t27 = child_number / grid_columns;
+                        if (layout_child_extent(grid_cell_w, margin, &available_w) == 0
+                            || layout_child_extent(grid_cell_h, margin, &available_h) == 0
+                            || layout_resolve_size_checked(&child, available_w, available_h) == 0) { child_valid = 0; }
+                        if (child_valid == 1 && parent.style.align == AlignKind.Stretch) {
+                            child.bounds.w = available_w;
+                            child.bounds.h = available_h;
+                        }
+                        if (child_valid == 1 && (layout_add_checked(grid_cell_w, parent.style.gap, &stride_w) == 0
+                            || layout_add_checked(grid_cell_h, parent.style.gap, &stride_h) == 0
+                            || layout_mul_checked(column, stride_w, &column_offset) == 0
+                            || layout_mul_checked(row, stride_h, &row_offset) == 0
+                            || layout_cross_position_checked(0, grid_cell_w, child.bounds.w, margin, parent.style.align, &cross_x) == 0
+                            || layout_cross_position_checked(0, grid_cell_h, child.bounds.h, margin, parent.style.align, &cross_y) == 0
+                            || layout_add_checked(parent.bounds.x, parent.style.padding, &base_x) == 0
+                            || layout_add_checked(parent.bounds.y, parent.style.padding, &base_y) == 0
+                            || layout_add_checked(base_x, column_offset, &position) == 0
+                            || layout_add_checked(position, cross_x, &child.bounds.x) == 0
+                            || layout_add_checked(base_y, row_offset, &position) == 0
+                            || layout_add_checked(position, cross_y, &child.bounds.y) == 0)) { child_valid = 0; }
+                    } else {
+                        let available_w: t27 = 0;
+                        let available_h: t27 = 0;
+                        if (child_valid == 1 && (layout_child_extent(inner_w, margin, &available_w) == 0
+                            || layout_child_extent(inner_h, margin, &available_h) == 0
+                            || layout_resolve_size_checked(&child, available_w, available_h) == 0)) { child_valid = 0; }
+                        if (child_valid == 1 && parent.style.layout == LayoutKind.Stack) {
+                            if (parent.style.align == AlignKind.Stretch) {
+                                child.bounds.w = available_w;
+                                child.bounds.h = available_h;
+                            }
+                            let cross_x: t27 = 0;
+                            let cross_y: t27 = 0;
+                            let base: t27 = 0;
+                            if (layout_cross_position_checked(0, inner_w, child.bounds.w, margin, parent.style.align, &cross_x) == 0
+                                || layout_cross_position_checked(0, inner_h, child.bounds.h, margin, parent.style.align, &cross_y) == 0
+                                || layout_add_checked(parent.bounds.x, parent.style.padding, &base) == 0
+                                || layout_add_checked(base, cross_x, &child.bounds.x) == 0
+                                || layout_add_checked(parent.bounds.y, parent.style.padding, &base) == 0
+                                || layout_add_checked(base, cross_y, &child.bounds.y) == 0) { child_valid = 0; }
+                        } else if (child_valid == 1 && parent.style.layout == LayoutKind.Row) {
+                            let doubled_margin: t27 = 0;
+                            let needed: t27 = 0;
+                            if (layout_mul_checked(margin, 2, &doubled_margin) == 0
+                                || layout_add_checked(child.bounds.w, doubled_margin, &needed) == 0) { child_valid = 0; }
+                            let projected: t27 = 0;
+                            let should_wrap: i32 = 0;
+                            if (child_valid == 1 && parent.style.wrap == 1 && cursor_main > 0) {
+                                if (layout_add_checked(cursor_main, needed, &projected) == 0 || projected > inner_w) { should_wrap = 1; }
+                            }
+                            if (child_valid == 1 && should_wrap == 1) {
+                                if (layout_add_checked(cursor_cross, line_extent, &cursor_cross) == 0
+                                    || layout_add_checked(cursor_cross, parent.style.gap, &cursor_cross) == 0) { child_valid = 0; }
+                                cursor_main = 0;
+                                line_extent = 0;
+                            }
+                            if (child_valid == 1 && parent.style.align == AlignKind.Stretch) { child.bounds.h = available_h; }
+                            let cross_available: t27 = 0;
+                            let cross: t27 = 0;
+                            let base: t27 = 0;
+                            if (child_valid == 1 && (layout_sub_checked(inner_h, cursor_cross, &cross_available) == 0
+                                || layout_cross_position_checked(0, cross_available, child.bounds.h, margin, parent.style.align, &cross) == 0
+                                || layout_add_checked(parent.bounds.x, parent.style.padding, &base) == 0
+                                || layout_add_checked(base, cursor_main, &base) == 0
+                                || layout_add_checked(base, margin, &child.bounds.x) == 0
+                                || layout_add_checked(parent.bounds.y, parent.style.padding, &base) == 0
+                                || layout_add_checked(base, cursor_cross, &base) == 0
+                                || layout_add_checked(base, cross, &child.bounds.y) == 0
+                                || layout_add_checked(cursor_main, needed, &cursor_main) == 0
+                                || layout_add_checked(cursor_main, parent.style.gap, &cursor_main) == 0)) { child_valid = 0; }
+                            let extent: t27 = 0;
+                            if (child_valid == 1 && (layout_add_checked(child.bounds.h, doubled_margin, &extent) == 0)) { child_valid = 0; }
+                            if (child_valid == 1 && extent > line_extent) { line_extent = extent; }
+                        } else if (child_valid == 1) {
+                            let doubled_margin: t27 = 0;
+                            let needed: t27 = 0;
+                            if (layout_mul_checked(margin, 2, &doubled_margin) == 0
+                                || layout_add_checked(child.bounds.h, doubled_margin, &needed) == 0) { child_valid = 0; }
+                            let projected: t27 = 0;
+                            let should_wrap: i32 = 0;
+                            if (child_valid == 1 && parent.style.wrap == 1 && cursor_main > 0) {
+                                if (layout_add_checked(cursor_main, needed, &projected) == 0 || projected > inner_h) { should_wrap = 1; }
+                            }
+                            if (child_valid == 1 && should_wrap == 1) {
+                                if (layout_add_checked(cursor_cross, line_extent, &cursor_cross) == 0
+                                    || layout_add_checked(cursor_cross, parent.style.gap, &cursor_cross) == 0) { child_valid = 0; }
+                                cursor_main = 0;
+                                line_extent = 0;
+                            }
+                            if (child_valid == 1 && parent.style.align == AlignKind.Stretch) { child.bounds.w = available_w; }
+                            let cross_available: t27 = 0;
+                            let cross: t27 = 0;
+                            let base: t27 = 0;
+                            if (child_valid == 1 && (layout_sub_checked(inner_w, cursor_cross, &cross_available) == 0
+                                || layout_cross_position_checked(0, cross_available, child.bounds.w, margin, parent.style.align, &cross) == 0
+                                || layout_add_checked(parent.bounds.x, parent.style.padding, &base) == 0
+                                || layout_add_checked(base, cursor_cross, &base) == 0
+                                || layout_add_checked(base, cross, &child.bounds.x) == 0
+                                || layout_add_checked(parent.bounds.y, parent.style.padding, &base) == 0
+                                || layout_add_checked(base, cursor_main, &base) == 0
+                                || layout_add_checked(base, margin, &child.bounds.y) == 0
+                                || layout_add_checked(cursor_main, needed, &cursor_main) == 0
+                                || layout_add_checked(cursor_main, parent.style.gap, &cursor_main) == 0)) { child_valid = 0; }
+                            let extent: t27 = 0;
+                            if (child_valid == 1 && (layout_add_checked(child.bounds.w, doubled_margin, &extent) == 0)) { child_valid = 0; }
+                            if (child_valid == 1 && extent > line_extent) { line_extent = extent; }
+                        }
+                    }
+                    if (child_valid == 0) { layout_mark_invalid(&child); }
+                    child.dirty_layout = 0; set[Node](&ui.*.nodes, i, child); child_number = child_number + 1;
+                }
+                i = i + 1;
+            }
+        }
+        p = p + 1;
+    }
+}
+
+fn role_needs_label(role: Role) i32 {
+    if (role == Role.Button || role == Role.Checkbox || role == Role.Radio || role == Role.Slider
+        || role == Role.ProgressBar || role == Role.TextField || role == Role.Image || role == Role.Tab
+        || role == Role.MenuItem || role == Role.Dialog || role == Role.Navigation) { return 1; }
+    return 0;
+}
+
+fn color_luma(c: Color) t27 {
+    // Integer Rec.709 approximation in native balanced-ternary arithmetic.
+    return ((c.r as t27) * 2126 + (c.g as t27) * 7152 + (c.b as t27) * 722) / 10000;
+}
+
+fn color_contrast_ok(fg: Color, bg: Color) i32 {
+    if (bg.a < 255) { return 1; }
+    let a: t27 = color_luma(fg);
+    let b: t27 = color_luma(bg);
+    let hi: t27 = a;
+    let lo: t27 = b;
+    if (b > a) { hi = b; lo = a; }
+    // Conservative 3:1 integer gate for controls and large/default text.
+    if ((hi + 18) * 100 >= (lo + 18) * 300) { return 1; }
+    return 0;
+}
+
+fn layout_check_axis(origin: t27, extent: t27, limit: t27, clipped: *i32, invalid: *i32) void {
+    if (limit < 0) { clipped.* = 1; invalid.* = 1; }
+    if (extent < 0) { clipped.* = 1; invalid.* = 1; return; }
+    if (origin < 0) { clipped.* = 1; }
+    let finish: t27 = 0;
+    if (layout_add_checked(origin, extent, &finish) == 0) {
+        clipped.* = 1;
+        invalid.* = 1;
+    } else if (finish > limit) {
+        clipped.* = 1;
+    }
+}
+
+fn layout_length_valid(length: Length) i32 {
+    if (length.kind == LengthKind.Auto) { return 1; }
+    if (length.kind == LengthKind.Pixels) { return length.value >= 0; }
+    if (length.kind == LengthKind.Percent) { return length.value >= 0 && length.value <= 100; }
+    return 0;
+}
+
+fn layout_child_count(ui: *Ui, parent_id: i32, out: *t27) i32 {
+    out.* = 0;
+    let i: i32 = 0;
+    while (i < len[Node](ui.*.nodes)) {
+        let child: Node = get[Node](ui.*.nodes, i);
+        if (child.live == 1 && child.parent == parent_id) {
+            if (layout_add_checked(out.*, 1, out) == 0) { return 0; }
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn layout_style_geometry_valid(ui: *Ui, node_id: i32, node: Node) i32 {
+    if (node.style.padding < 0 || node.style.gap < 0 || node.style.margin < 0
+        || node.style.min_w < 0 || node.style.min_h < 0
+        || node.style.max_w < 0 || node.style.max_h < 0
+        || (node.style.max_w > 0 && node.style.max_w < node.style.min_w)
+        || (node.style.max_h > 0 && node.style.max_h < node.style.min_h)
+        || layout_length_valid(node.style.width) == 0
+        || layout_length_valid(node.style.height) == 0
+        || (node.style.layout == LayoutKind.Grid && node.style.columns < 1)
+        || (node.style.wrap != 0 && node.style.wrap != 1)) { return 0; }
+
+    let doubled: t27 = 0;
+    if (layout_mul_checked(node.style.margin, 2, &doubled) == 0
+        || layout_mul_checked(node.style.padding, 2, &doubled) == 0) { return 0; }
+    if (node.style.layout == LayoutKind.Absolute || node.bounds.w < 0 || node.bounds.h < 0) { return 1; }
+
+    let child_count: t27 = 0;
+    let inner_w: t27 = 0;
+    let inner_h: t27 = 0;
+    if (layout_child_count(ui, node_id, &child_count) == 0
+        || layout_inner_extent(node.bounds.w, node.style.padding, &inner_w) == 0
+        || layout_inner_extent(node.bounds.h, node.style.padding, &inner_h) == 0) { return 0; }
+
+    if (node.style.layout == LayoutKind.Grid && child_count > 0) {
+        let columns: t27 = node.style.columns as t27;
+        let rows: t27 = 0;
+        let column_gaps: t27 = 0;
+        let row_gaps: t27 = 0;
+        if (layout_ceil_div(child_count, columns, &rows) == 0
+            || layout_mul_checked(node.style.gap, columns - 1, &column_gaps) == 0
+            || layout_mul_checked(node.style.gap, rows - 1, &row_gaps) == 0
+            || column_gaps > inner_w || row_gaps > inner_h) { return 0; }
+    } else if ((node.style.layout == LayoutKind.Row || node.style.layout == LayoutKind.Column)
+        && child_count > 1) {
+        let total_gaps: t27 = 0;
+        if (layout_mul_checked(node.style.gap, child_count - 1, &total_gaps) == 0) { return 0; }
+    }
+    return 1;
+}
+
+fn ui_check(ui: *Ui, strict_layout: i32) CheckReport {
+    let r: CheckReport = CheckReport{ .errors = 0, .warnings = 0, .overlaps = 0, .clipped = 0,
+        .undersized = 0, .unlabeled = 0, .off_grid = 0, .low_contrast = 0, .invalid_geometry = 0 };
+    let i: i32 = 0;
+    while (i < len[Node](ui.*.nodes)) {
+        let a: Node = get[Node](ui.*.nodes, i);
+        if (a.live == 1) {
+            let clipped: i32 = 0;
+            let invalid: i32 = 0;
+            layout_check_axis(a.bounds.x, a.bounds.w, ui.*.width, &clipped, &invalid);
+            layout_check_axis(a.bounds.y, a.bounds.h, ui.*.height, &clipped, &invalid);
+            if (layout_style_geometry_valid(ui, i, a) == 0) { invalid = 1; }
+            if (clipped == 1) { r.clipped = r.clipped + 1; }
+            if (invalid == 1) { r.invalid_geometry = r.invalid_geometry + 1; }
+            if ((a.semantics.role == Role.Button || a.semantics.role == Role.Checkbox || a.semantics.role == Role.Radio
+                || a.semantics.role == Role.Tab || a.semantics.role == Role.MenuItem)
+                && (a.bounds.w < 44 || a.bounds.h < 44)) {
+                r.undersized = r.undersized + 1;
+            }
+            if (a.semantics.has_range == 1 && (a.semantics.range_max < a.semantics.range_min
+                || a.semantics.range_current < a.semantics.range_min
+                || a.semantics.range_current > a.semantics.range_max)) { r.clipped = r.clipped + 1; }
+            if (role_needs_label(a.semantics.role) == 1 && a.semantics.label.len == 0) {
+                r.unlabeled = r.unlabeled + 1;
+            }
+            if ((a.style.padding % 4) != 0 || (a.style.gap % 4) != 0 || (a.style.margin % 4) != 0) {
+                r.off_grid = r.off_grid + 1;
+            }
+            if (a.text.len > 0 && color_contrast_ok(a.style.fg, a.style.bg) == 0) {
+                r.low_contrast = r.low_contrast + 1;
+            }
+            let j: i32 = i + 1;
+            while (j < len[Node](ui.*.nodes)) {
+                let b: Node = get[Node](ui.*.nodes, j);
+                if (b.live == 1 && a.parent == b.parent && a.parent >= 0 && rect_intersects(a.bounds, b.bounds) == 1) {
+                    r.overlaps = r.overlaps + 1;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    r.errors = r.clipped + r.undersized + r.unlabeled + r.overlaps + r.low_contrast + r.invalid_geometry;
+    if (strict_layout == 1) { r.errors = r.errors + r.off_grid; }
+    else { r.warnings = r.off_grid; }
+    return r;
+}

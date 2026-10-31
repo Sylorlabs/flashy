@@ -1,0 +1,9 @@
+.build/
+.flashy/
+.zag-cache/
+.zagd.lock
+.zagd.status
+.zagd.semantic-ready
+*_shim.zag
+*.ppm
+*.rgba

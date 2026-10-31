@@ -1,0 +1,198 @@
+@import("../src/flashy.flash")
+
+fn automation_endpoint_expect(ok: i32, message: []u8) i32 {
+    if (ok == 0) { _zag_print("FAIL "); _zag_println(message); return 1; }
+    return 0;
+}
+
+fn automation_endpoint_set_test_id(ui: *Ui, node_id: i32, value: []u8) void {
+    let node: Node = get[Node](ui.*.nodes, node_id);
+    node.semantics.test_id = value;
+    set[Node](&ui.*.nodes, node_id, node);
+}
+
+fn main() i32 {
+    let failures: i32 = 0;
+    let pid_text: []u8 = _zag_i64_to_str(linux_getpid() as i64);
+    let path_prefix: []u8 = _zag_str_concat("/tmp/flashy-automation-", pid_text);
+    _zag_str_free(pid_text);
+    let path: []u8 = _zag_str_concat(path_prefix, ".sock");
+    _zag_str_free(path_prefix);
+    let stale_cleanup: LinuxUnixUnlinkResult = linux_unix_unlink_exact(path);
+    failures = failures + automation_endpoint_expect(stale_cleanup.path_valid == 1
+        && ((stale_cleanup.missing == 1 && stale_cleanup.error_code == (0 - 2))
+            || (stale_cleanup.removed == 1 && stale_cleanup.error_code == 0)),
+        "endpoint fixture begins from an exact absent path");
+
+    let invalid: AutomationListener = automation_listener_open("", 1);
+    failures = failures + automation_endpoint_expect(invalid.active == 0
+        && invalid.fd < 0 && invalid.path_bound == 0
+        && invalid.status == AutomationEndpointStatus.ListenFailed,
+        "invalid listener paths fail without descriptor or cleanup authority");
+    let _invalid_closed: i32 = automation_listener_close(&invalid);
+
+    let listener: AutomationListener = automation_listener_open(path, 4);
+    let path_status: LinuxFileStatus = linux_unix_path_status_exact(path);
+    failures = failures + automation_endpoint_expect(listener.active == 1
+        && listener.fd >= 0 && listener.path_bound == 1
+        && listener.status == AutomationEndpointStatus.Ready
+        && listener.path.len == path.len && path_status.valid == 1
+        && (path_status.mode % 512) == 384,
+        "public listener owns one exact owner-only pathname and descriptor");
+
+    if (listener.active == 1) {
+        let empty_accept: AutomationListenerAccept = automation_listener_accept(
+            &listener, 0);
+        failures = failures + automation_endpoint_expect(empty_accept.accepted == 0
+            && empty_accept.status == AutomationEndpointStatus.AcceptTimeout
+            && listener.active == 1 && listener.accepted_connections == 0,
+            "accept timeout consumes no listener authority");
+
+        let duplicate: AutomationListener = automation_listener_open(path, 1);
+        failures = failures + automation_endpoint_expect(duplicate.active == 0
+            && duplicate.path_bound == 0 && duplicate.fd < 0
+            && duplicate.status == AutomationEndpointStatus.ListenFailed,
+            "duplicate bind cannot claim or unlink an existing endpoint");
+        let _duplicate_closed: i32 = automation_listener_close(&duplicate);
+
+        let runner: AutomationRunner = automation_runner_connect(path);
+        let accepted: AutomationListenerAccept = automation_listener_accept(
+            &listener, 1000);
+        let runner_fd: i64 = runner.connection.fd;
+        let accepted_fd: i64 = accepted.connection.fd;
+        failures = failures + automation_endpoint_expect(runner.active == 1
+            && runner.connection.active == 1 && accepted.accepted == 1
+            && accepted.connection.active == 1
+            && listener.accepted_connections == 1,
+            "external runner and listener transfer one accepted connection");
+
+        if (runner.active == 1 && accepted.accepted == 1) {
+            let ui: Ui = ui_new(243, 81);
+            ui_begin(&ui);
+            let button: i32 = ui_button_control(&ui, 729, -1,
+                rect(3, 3, 81, 27), "Light", 91);
+            automation_endpoint_set_test_id(&ui, button, "light-button");
+            ui_end(&ui);
+
+            let request: AutomationRequest = automation_request(27,
+                AutomationCommand.Click, automation_locator_test_id("light-button"),
+                "", Key.Unknown);
+            let sent: i32 = automation_runner_send(&runner, request);
+            let duplicate_send: i32 = automation_runner_send(&runner, request);
+            let handled: AutomationResponse = automation_server_step(
+                &accepted.connection, &ui, 1000);
+            let received: AutomationResponse = automation_runner_receive(&runner, 1000);
+            failures = failures + automation_endpoint_expect(sent == 1
+                && duplicate_send == 0 && handled.valid == 1
+                && handled.request_id == 27 && handled.status == AutomationResponseStatus.Ok
+                && received.valid == 1 && received.request_id == 27
+                && received.status == AutomationResponseStatus.Ok
+                && runner.awaiting_response == 0 && runner.completed_requests == 1
+                && action_emission_count(&ui, 91) == 1,
+                "runner enforces one outstanding request and executes real UI behavior");
+
+            let assertion: AutomationRequest = automation_request(28,
+                AutomationCommand.AssertVisible, automation_locator_key(729),
+                "", Key.Unknown);
+            let assertion_sent: i32 = automation_runner_send(&runner, assertion);
+            let timed: AutomationResponse = automation_runner_receive(&runner, 0);
+            let timed_status: AutomationEndpointStatus = runner.status;
+            let asserted: AutomationResponse = automation_server_step(
+                &accepted.connection, &ui, 1000);
+            let retried: AutomationResponse = automation_runner_receive(&runner, 1000);
+            failures = failures + automation_endpoint_expect(assertion_sent == 1
+                && timed.valid == 0
+                && timed_status == AutomationEndpointStatus.ResponseTimeout
+                && runner.status == AutomationEndpointStatus.Ready
+                && asserted.status == AutomationResponseStatus.Ok
+                && retried.valid == 1 && retried.request_id == 28
+                && runner.completed_requests == 2,
+                "zero-progress response timeout preserves one pending identity for an exact retry");
+
+            let mismatch_request: AutomationRequest = automation_request(29,
+                AutomationCommand.AssertVisible, automation_locator_key(729),
+                "", Key.Unknown);
+            let mismatch_sent: i32 = automation_runner_send(&runner, mismatch_request);
+            let wrong: AutomationResponse = AutomationResponse{ .request_id = 30,
+                .status = AutomationResponseStatus.Ok, .matches = 1, .valid = 1 };
+            let wrong_sent: i32 = automation_send_response(&accepted.connection, wrong);
+            let mismatch: AutomationResponse = automation_runner_receive(&runner, 1000);
+            failures = failures + automation_endpoint_expect(mismatch_sent == 1
+                && wrong_sent == 1 && mismatch.valid == 0
+                && runner.active == 0 && runner.connection.active == 0
+                && runner.status == AutomationEndpointStatus.ResponseMismatch,
+                "wrong response identity terminally retires runner authority");
+
+            automation_runner_close(&runner);
+            automation_protocol_close(&accepted.connection);
+            ui_free(&ui);
+        } else {
+            automation_runner_close(&runner);
+            automation_protocol_close(&accepted.connection);
+        }
+        failures = failures + automation_endpoint_expect(
+            (runner_fd < 0 || linux_fd_flags(runner_fd) == (0 - 9))
+            && (accepted_fd < 0 || linux_fd_flags(accepted_fd) == (0 - 9)),
+            "runner and transferred connection descriptors close exactly once");
+
+        let listener_fd: i64 = listener.fd;
+        let first_close: i32 = automation_listener_close(&listener);
+        let second_close: i32 = automation_listener_close(&listener);
+        let after_close: LinuxConnectResult = linux_unix_connect(path);
+        failures = failures + automation_endpoint_expect(first_close == 1
+            && second_close == 1 && listener.active == 0 && listener.fd < 0
+            && listener.path_bound == 0 && listener.path.cap == 0
+            && listener.status == AutomationEndpointStatus.Closed
+            && linux_fd_flags(listener_fd) == (0 - 9)
+            && after_close.connected == 0,
+            "listener cleanup is exact, complete, and idempotent");
+
+        let reopened: AutomationListener = automation_listener_open(path, 1);
+        let reopened_fd: i64 = reopened.fd;
+        failures = failures + automation_endpoint_expect(reopened.active == 1
+            && reopened.path_bound == 1,
+            "closed listener pathname can be rebound without stale state");
+        let reopened_closed: i32 = automation_listener_close(&reopened);
+        failures = failures + automation_endpoint_expect(reopened_closed == 1
+            && (reopened_fd < 0 || linux_fd_flags(reopened_fd) == (0 - 9)),
+            "reopened listener descriptor is not leaked");
+    } else {
+        let _inactive_listener_closed: i32 = automation_listener_close(&listener);
+    }
+
+    // Deterministically exercise cleanup failure without changing filesystem
+    // permissions: an embedded NUL is rejected before unlink. The listener must
+    // retain its exact bytes/authority so a corrected retry can finish safely.
+    let retry_cleanup: AutomationListener = automation_listener_empty();
+    retry_cleanup.path = automation_endpoint_copy_bytes(path);
+    push[u8](&retry_cleanup.path, 0 as u8);
+    push[u8](&retry_cleanup.path, 'b');
+    push[u8](&retry_cleanup.path, 'a');
+    push[u8](&retry_cleanup.path, 'd');
+    retry_cleanup.path_bound = 1;
+    retry_cleanup.status = AutomationEndpointStatus.Ready;
+    let retained_close: i32 = automation_listener_close(&retry_cleanup);
+    let retained_capacity: i32 = retry_cleanup.path.cap;
+    let retained_bound: i32 = retry_cleanup.path_bound;
+    let retained_status: AutomationEndpointStatus = retry_cleanup.status;
+    let retained_error: i64 = retry_cleanup.error_code;
+    retry_cleanup.path.data[path.len] = '-' as u8;
+    let retry_close: i32 = automation_listener_close(&retry_cleanup);
+    failures = failures + automation_endpoint_expect(retained_close == 0
+        && retained_capacity > 0 && retained_bound == 1
+        && retained_status == AutomationEndpointStatus.CleanupFailed
+        && retained_error == (0 - 22) && retry_close == 1
+        && retry_cleanup.path_bound == 0 && retry_cleanup.path.cap == 0
+        && retry_cleanup.status == AutomationEndpointStatus.Closed,
+        "failed exact cleanup retains path authority until a successful retry");
+
+    let final_status: LinuxFileStatus = linux_unix_path_status_exact(path);
+    failures = failures + automation_endpoint_expect(final_status.valid == 0
+        && final_status.error_code == (0 - 2),
+        "endpoint leaves no filesystem node after final cleanup");
+
+    _zag_str_free(path);
+
+    if (failures == 0) { _zag_println("automation_endpoint_test: ok"); }
+    return failures;
+}

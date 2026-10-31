@@ -1,0 +1,345 @@
+@import("../src/flashy.flash")
+
+fn expect(ok: i32, message: []u8) i32 {
+    if (ok == 0) { _zag_print("FAIL "); _zag_println(message); return 1; }
+    return 0;
+}
+
+fn counter_text(value: t27) []u8 {
+    if (value == 0) { return "0"; }
+    if (value == 1) { return "1"; }
+    return "many";
+}
+
+fn increment_handler(context: *EventContext, event: Event) void {
+    if (event.kind != EventKind.Click) { return; }
+    let state: StateHandle = ui_state(context.*.ui, context.*.user_data, 0, 1);
+    let _updated: i32 = state_set(context.*.ui, state, state_get(context.*.ui, state) + 1);
+}
+
+fn input_handler(context: *EventContext, event: Event) void {
+    if (event.kind != EventKind.Input) { return; }
+    let state: StateHandle = ui_state(context.*.ui, context.*.user_data, 0, 1);
+    let _updated: i32 = state_set(context.*.ui, state, event.text.len as t27);
+}
+
+fn double_atomic_handler(context: *EventContext, event: Event) void {
+    let state: StateHandle = ui_state(context.*.ui, context.*.user_data, 0, 1);
+    if (event.kind == EventKind.Click) {
+        let next: t27 = state_get(context.*.ui, state) + 1;
+        let _counted: i32 = state_set(context.*.ui, state, next);
+        if (next == 1) {
+            let node_id: i32 = ui_find_key(context.*.ui, context.*.node_key);
+            if (node_id >= 0) {
+                let node: Node = get[Node](context.*.ui.*.nodes, node_id);
+                node.style.enabled = 0;
+                set[Node](&context.*.ui.*.nodes, node_id, node);
+            }
+        }
+    } else if (event.kind == EventKind.DoubleClick) {
+        let _double_seen: i32 = state_set(context.*.ui, state,
+            state_get(context.*.ui, state) + 100);
+    }
+}
+
+fn build_counter(ui: *Ui, value: t27) void {
+    ui_begin(ui);
+    let root_style: Style = theme_surface();
+    root_style.layout = LayoutKind.Column;
+    let root: i32 = ui_node(ui, 1, NodeKind.Root, -1, rect(0, 0, 240, 160), root_style,
+        semantics(Role.Window, "Counter", "", "window"), "", Action{ .id = 0 });
+    let text_style: Style = style_default();
+    text_style.bg = color_rgba(34, 38, 50, 255);
+    let label: i32 = ui_node(ui, 2, NodeKind.Text, root, rect(0, 0, 180, 44), text_style,
+        semantics(Role.Text, "Count", counter_text(value), "count"), counter_text(value), Action{ .id = 0 });
+    let button: i32 = ui_node(ui, 3, NodeKind.Button, root, rect(0, 0, 180, 44), theme_button(),
+        semantics(Role.Button, "Increment", "", "increment"), "Increment", Action{ .id = 7 });
+    let toggle: i32 = ui_toggle_control(ui, 4, root, rect(0, 0, 180, 44), "Enable light", 0, 8);
+    let toggle_node: Node = get[Node](ui.*.nodes, toggle);
+    toggle_node.semantics.test_id = "light-toggle";
+    set[Node](&ui.*.nodes, toggle, toggle_node);
+    ui_end(ui);
+    ui_layout(ui);
+}
+
+fn main() i32 {
+    let failures: i32 = 0;
+
+    failures = failures + expect(length_resolve(length_percent(100),
+        flashy_t27_max(), 0) == flashy_t27_max()
+        && length_resolve(length_percent(99), flashy_t27_max(), 0)
+            == (flashy_t27_max() / 100) * 99
+                + ((flashy_t27_max() % 100) * 99) / 100,
+        "percent lengths preserve full-range balanced-t27 arithmetic");
+
+    failures = failures + expect(rect_contains(
+            rect(flashy_t27_max() - 1, 0, 1, 1), flashy_t27_max() - 1, 0) == 1
+        && rect_contains(rect(flashy_t27_max() - 1, 0, 3, 1),
+            flashy_t27_max(), 0) == 0
+        && rect_contains(rect((0 as t27) - flashy_t27_max(), 0,
+            flashy_t27_max(), 1), -1, 0) == 1
+        && rect_contains(rect((0 as t27) - flashy_t27_max(), 0,
+            flashy_t27_max(), 1), 0, 0) == 0,
+        "hit testing compares full-range half-open rectangles without endpoint overflow");
+    let invalid_center_x: t27 = 0;
+    let invalid_center_y: t27 = 0;
+    failures = failures + expect(rect_center_checked(
+        rect(flashy_t27_max() - 1, 0, 6, 2),
+        &invalid_center_x, &invalid_center_y) == 0,
+        "unrepresentable locator centers fail before input dispatch");
+
+    let overflow_input: Ui = ui_new(flashy_t27_max(), 10);
+    ui_begin(&overflow_input);
+    let overflow_button_style: Style = style_default();
+    let _overflow_button: i32 = ui_node(&overflow_input, 9001,
+        NodeKind.Button, -1, rect(flashy_t27_max() - 1, 0, 6, 2),
+        overflow_button_style, semantics(Role.Button, "Overflow", "", "overflow"),
+        "Overflow", Action{ .id = 9 });
+    ui_end(&overflow_input);
+    let overflow_locator: Locator = locate_key(&overflow_input, 9001);
+    failures = failures + expect(locator_click(&overflow_input, overflow_locator) == 0
+        && locator_hover(&overflow_input, overflow_locator) == 0
+        && locator_double_click(&overflow_input, overflow_locator) == 0
+        && len[t9](overflow_input.emitted_actions) == 0
+        && overflow_input.focused_node == -1 && overflow_input.hovered_node == -1,
+        "strict locators reject overflowed geometry without input or focus mutation");
+    ui_free(&overflow_input);
+
+    let invalid_surface: Surface = surface_new(surface_max_dimension() + 1, 1);
+    failures = failures + expect(invalid_surface.width == 0
+        && invalid_surface.height == 0 && len[u8](invalid_surface.pixels) == 0,
+        "surface allocation rejects dimensions beyond the bounded axis limit");
+    let resize_guard: Surface = surface_new(2, 2);
+    surface_fill(&resize_guard, rect(0, 0, 2, 2), color_rgba(9, 8, 7, 255));
+    let resize_guard_checksum: t27 = surface_checksum(&resize_guard);
+    surface_resize(&resize_guard, surface_max_dimension(), surface_max_dimension());
+    failures = failures + expect(resize_guard.width == 2 && resize_guard.height == 2
+        && surface_checksum(&resize_guard) == resize_guard_checksum,
+        "invalid surface resize preserves the existing allocation and pixels");
+    surface_free(&resize_guard); surface_free(&invalid_surface);
+
+    let clipped_surface: Surface = surface_new(2, 2);
+    surface_fill(&clipped_surface,
+        rect(flashy_t27_max() - 1, 0, 3, 1), color_rgba(255, 0, 0, 255));
+    failures = failures + expect(clipped_surface.painted_pixels == 0,
+        "surface fill rejects positive-edge overflow without wraparound");
+    surface_fill(&clipped_surface,
+        rect(1, 0, flashy_t27_max(), 1), color_rgba(255, 0, 0, 255));
+    failures = failures + expect(clipped_surface.painted_pixels == 0,
+        "surface fill rejects an unrepresentable endpoint even when its origin is visible");
+    surface_fill(&clipped_surface,
+        rect(0 - flashy_t27_max(), 0, flashy_t27_max(), 1),
+        color_rgba(255, 0, 0, 255));
+    failures = failures + expect(clipped_surface.painted_pixels == 0,
+        "surface fill clips full-range negative geometry without overflow");
+    surface_fill(&clipped_surface, rect(-1, 0, 2, 1),
+        color_rgba(255, 0, 0, 255));
+    failures = failures + expect(clipped_surface.painted_pixels == 1
+        && clipped_surface.pixels.data[0] == 255 as u8,
+        "surface fill preserves the visible intersection after safe clipping");
+    surface_free(&clipped_surface);
+    let ui: Ui = ui_new(240, 220);
+    let count: StateHandle = ui_state(&ui, 99, 0, 1);
+    build_counter(&ui, state_get(&ui, count));
+    failures = failures + expect(ui_live_count(&ui) == 4, "four retained nodes");
+    let button_before: i32 = ui_find_key(&ui, 3);
+    let handler_state: StateHandle = ui_state(&ui, 500, 0, 1);
+    failures = failures + expect(ui_bind_handler(&ui, 3, 500, increment_handler) == 1,
+        "function-value handler binds by stable node and state keys");
+    failures = failures + expect(locator_click(&ui, locate_role(&ui, Role.Button, "Increment")) == 1, "strict role click");
+    failures = failures + expect(action_emitted(&ui, 7) == 1, "action emitted");
+    failures = failures + expect(state_get(&ui, handler_state) == 1, "event callback mutates stable state without pointer capture");
+    let toggle_loc: Locator = locate_test_id(&ui, "light-toggle");
+    let toggle_bounds: Rect = get[Node](ui.nodes, toggle_loc.node).bounds;
+    failures = failures + expect(ui_dispatch(&ui, Event{ .kind = EventKind.PointerDown,
+        .x = toggle_bounds.x + 2, .y = toggle_bounds.y + 2, .key = Key.Unknown,
+        .modifiers = KeyModifiers{ .shift = 0, .control = 0, .alt = 0, .meta = 0 }, .detail = 0, .text = "" }) == 1,
+        "pointer capture starts");
+    failures = failures + expect(ui_dispatch(&ui, Event{ .kind = EventKind.PointerUp,
+        .x = toggle_bounds.x + 2, .y = toggle_bounds.y + 2, .key = Key.Unknown,
+        .modifiers = KeyModifiers{ .shift = 0, .control = 0, .alt = 0, .meta = 0 }, .detail = 0, .text = "" }) == 1,
+        "pointer click completes");
+    failures = failures + expect(get[Node](ui.nodes, toggle_loc.node).value == 1, "toggle changes state");
+    failures = failures + expect(action_emitted(&ui, 8) == 1, "toggle action emitted");
+    failures = failures + expect(ui_dispatch(&ui, Event{ .kind = EventKind.Press, .x = 0, .y = 0,
+        .key = Key.Tab, .modifiers = KeyModifiers{ .shift = 0, .control = 0, .alt = 0, .meta = 0 },
+        .detail = 0, .text = "" }) == 1, "tab focus traversal");
+    failures = failures + expect(ui.focused_node == button_before, "tab wraps to next interactive control");
+    failures = failures + expect(ui_dispatch(&ui, Event{ .kind = EventKind.Press, .x = 0, .y = 0,
+        .key = Key.Enter, .modifiers = KeyModifiers{ .shift = 0, .control = 0, .alt = 0, .meta = 0 },
+        .detail = 0, .text = "" }) == 1, "keyboard activates focused control");
+    failures = failures + expect(state_set(&ui, count, 1) == 1, "state write");
+    build_counter(&ui, state_get(&ui, count));
+    failures = failures + expect(ui_find_key(&ui, 3) == button_before, "key preserves node identity");
+    failures = failures + expect(state_get(&ui, count) == 1, "state survives reconciliation");
+    failures = failures + expect(ui.focused_node == button_before, "focus survives keyed reconciliation");
+    let migrated: StateHandle = ui_state(&ui, 99, 42, 2);
+    failures = failures + expect(state_valid(&ui, count) == 0, "old state handle rejected after schema migration");
+    failures = failures + expect(state_get(&ui, migrated) == 42, "state schema migration initializes value");
+    let report: CheckReport = ui_check(&ui, 0);
+    failures = failures + expect(report.errors == 0, "layout and semantics valid");
+    let surface: Surface = surface_new(240, 220);
+    let painted: t27 = ui_render(&ui, &surface, 1);
+    failures = failures + expect(painted > 0, "headless frame painted");
+    let idle: t27 = ui_render(&ui, &surface, 0);
+    failures = failures + expect(idle == 0, "idle frame paints nothing");
+    failures = failures + expect(locate_test_id(&ui, "increment").matches == 1, "test id locator");
+    failures = failures + expect(locator_focus(&ui, locate_test_id(&ui, "increment")) == 1, "focus operation");
+    let before_cancel: t27 = get[Node](ui.nodes, locate_test_id(&ui, "light-toggle").node).value;
+    failures = failures + expect(ui_dispatch(&ui, Event{ .kind = EventKind.PointerDown,
+        .x = toggle_bounds.x + 2, .y = toggle_bounds.y + 2, .key = Key.Unknown,
+        .modifiers = KeyModifiers{ .shift = 0, .control = 0, .alt = 0, .meta = 0 }, .detail = 0, .text = "" }) == 1,
+        "cancel gesture captures pointer");
+    failures = failures + expect(ui_dispatch(&ui, Event{ .kind = EventKind.PointerUp, .x = 239, .y = 219,
+        .key = Key.Unknown, .modifiers = KeyModifiers{ .shift = 0, .control = 0, .alt = 0, .meta = 0 },
+        .detail = 0, .text = "" }) == 0, "release outside cancels click");
+    failures = failures + expect(get[Node](ui.nodes, locate_test_id(&ui, "light-toggle").node).value == before_cancel, "cancelled click does not mutate toggle");
+
+    let catalog: Ui = ui_new(300, 400);
+    let custom_theme: Theme = theme_default();
+    custom_theme.primary = color_rgba(120, 40, 90, 255); custom_theme.minimum_target = 48;
+    let custom_button: Style = theme_button_for(custom_theme);
+    failures = failures + expect(custom_button.bg.r == 120 && custom_button.bg.g == 40
+        && custom_button.min_w == 48 && custom_button.min_h == 48, "theme tokens replace control recipes without forking widgets");
+    ui_begin(&catalog);
+    let dialog: i32 = ui_dialog_primitive(&catalog, 300, -1, rect(0, 0, 280, 392), "Settings");
+    let field: i32 = ui_text_field_control(&catalog, 301, dialog, rect(16, 16, 220, 44), "Name", "Flashy", 20);
+    let radio: i32 = ui_radio_control(&catalog, 302, dialog, rect(16, 68, 220, 44), "Optical", 0, 21);
+    let progress: i32 = ui_progress_control(&catalog, 303, dialog, rect(16, 120, 220, 44), "Build", 0, 100, 75);
+    let tab: i32 = ui_tab_control(&catalog, 304, dialog, rect(16, 172, 220, 44), "General", 1, 22);
+    let menu_item: i32 = ui_menu_item_control(&catalog, 305, dialog, rect(16, 224, 220, 44), "Save", 23);
+    let slider: i32 = ui_slider_control(&catalog, 306, dialog, rect(16, 276, 220, 44), "Level", 0, 24);
+    let scroll: i32 = ui_scroll_primitive(&catalog, 307, dialog, rect(16, 328, 220, 44), "Options");
+    ui_end(&catalog);
+    let input_state: StateHandle = ui_state(&catalog, 700, 0, 1);
+    failures = failures + expect(ui_bind_handler(&catalog, 301, 700, input_handler) == 1,
+        "text field binds normalized input handler");
+    failures = failures + expect(locate_role(&catalog, Role.TextField, "Name").matches == 1
+        && locator_has_text(&catalog, locate_key(&catalog, 301), "Flashy"), "text field exposes strict role, key, and text locators");
+    failures = failures + expect(locate_text(&catalog, "General").matches == 1
+        && locator_is_visible(&catalog, locate_key(&catalog, 304))
+        && locator_is_enabled(&catalog, locate_key(&catalog, 304)), "tab exposes visibility and enabled assertions");
+    failures = failures + expect(locator_click(&catalog, locate_role(&catalog, Role.Radio, "Optical")) == 1
+        && locator_has_value(&catalog, locate_key(&catalog, 302), 1), "radio activation selects retained state");
+    failures = failures + expect(locate_state(&catalog, 75).matches == 1
+        && get[Node](catalog.nodes, progress).semantics.has_range == 1
+        && get[Node](catalog.nodes, progress).semantics.range_current == 75, "range semantics and state locator are available");
+    failures = failures + expect(locator_focus(&catalog, locate_role(&catalog, Role.Tab, "General")) == 1
+        && locator_is_focused(&catalog, locate_key(&catalog, 304)), "tab participates in semantic focus traversal");
+    failures = failures + expect(locator_fill(&catalog, locate_key(&catalog, 301), "Light") == 1
+        && locator_type(&catalog, locate_key(&catalog, 301), " UI") == 1
+        && locator_has_text(&catalog, locate_key(&catalog, 301), "Light UI")
+        && state_get(&catalog, input_state) == 8, "fill and type update accessible value and deliver Input events");
+    failures = failures + expect(locator_blur(&catalog, locate_key(&catalog, 301)) == 1
+        && locator_is_focused(&catalog, locate_key(&catalog, 301)) == 0, "automation blur clears focus");
+    failures = failures + expect(locator_hover(&catalog, locate_key(&catalog, 304)) == 1
+        && catalog.hovered_node == tab, "automation hover uses retained geometry");
+    let hover_order: Ui = ui_new(81, 81);
+    ui_begin(&hover_order);
+    let covered_button: i32 = ui_button_control(&hover_order, 910, -1,
+        rect(3, 3, 54, 54), "Covered", 31);
+    let top_button: i32 = ui_button_control(&hover_order, 911, -1,
+        rect(3, 3, 54, 54), "Top", 32);
+    ui_end(&hover_order);
+    failures = failures + expect(locator_hover(&hover_order,
+            locate_key(&hover_order, 910)) == 0
+        && hover_order.hovered_node == -1
+        && locator_hover(&hover_order, locate_key(&hover_order, 911)) == 1
+        && hover_order.hovered_node == top_button && covered_button >= 0,
+        "strict hover fails on an occluded locator instead of hovering a different node");
+    let double_state: StateHandle = ui_state(&hover_order, 912, 0, 1);
+    let _double_bound: i32 = ui_bind_handler(&hover_order, 911, 912,
+        double_atomic_handler);
+    failures = failures + expect(locator_click(&hover_order,
+            locate_key(&hover_order, 910)) == 0
+        && action_emission_count(&hover_order, 31) == 0
+        && locator_double_click(&hover_order, locate_key(&hover_order, 911)) == 1
+        && action_emission_count(&hover_order, 32) == 2
+        && state_get(&hover_order, double_state) == 102
+        && get[Node](hover_order.nodes, top_button).style.enabled == 0,
+        "double click commits two actions and emits DoubleClick before reentrant disable can half-fail");
+    ui_free(&hover_order);
+    let _press_focus: i32 = locator_focus(&catalog, locate_key(&catalog, 304));
+    let focus_before_unsupported_press: i32 = catalog.focused_node;
+    failures = failures + expect(locator_press(&catalog,
+            locate_key(&catalog, 305), Key.A) == 0
+        && catalog.focused_node == focus_before_unsupported_press
+        && catalog.focused_node == tab,
+        "unsupported locator press fails before changing focus");
+    let slider_bounds: Rect = catalog.nodes.data[slider].bounds;
+    failures = failures + expect(ui_dispatch(&catalog, Event{ .kind = EventKind.PointerDown,
+        .x = slider_bounds.x + 165, .y = slider_bounds.y + 8, .key = Key.Unknown,
+        .modifiers = KeyModifiers{ .shift = 0, .control = 0, .alt = 0, .meta = 0 }, .detail = 0, .text = "" }) == 1
+        && ui_dispatch(&catalog, Event{ .kind = EventKind.PointerUp,
+        .x = slider_bounds.x + 165, .y = slider_bounds.y + 8, .key = Key.Unknown,
+        .modifiers = KeyModifiers{ .shift = 0, .control = 0, .alt = 0, .meta = 0 }, .detail = 0, .text = "" }) == 1
+        && locator_has_value(&catalog, locate_key(&catalog, 306), 75)
+        && catalog.nodes.data[slider].semantics.range_current == 75, "slider pointer interaction updates semantic range value");
+    failures = failures + expect(locator_scroll(&catalog, locate_key(&catalog, 307), 27) == 1
+        && locator_scroll(&catalog, locate_key(&catalog, 307), -9) == 1
+        && catalog.nodes.data[scroll].scroll_y == 18, "automation scroll updates bounded retained scroll state");
+    failures = failures + expect(locator_scroll(&catalog, locate_key(&catalog, 307),
+            flashy_t27_max()) == 1
+        && catalog.nodes.data[scroll].scroll_y == flashy_t27_max()
+        && locator_scroll(&catalog, locate_key(&catalog, 307), 1) == 1
+        && catalog.nodes.data[scroll].scroll_y == flashy_t27_max()
+        && locator_scroll(&catalog, locate_key(&catalog, 307),
+            0 - flashy_t27_max()) == 1
+        && catalog.nodes.data[scroll].scroll_y == 0,
+        "scroll state remains balanced-t27 and saturates without binary narrowing or overflow");
+    failures = failures + expect(locator_double_click(&catalog, locate_key(&catalog, 305)) == 1
+        && action_emission_count(&catalog, 23) == 2, "double click emits two deterministic activations");
+    failures = failures + expect(locator_has_geometry(&catalog, locate_key(&catalog, 305), rect(16, 224, 220, 44)),
+        "automation asserts exact balanced-ternary geometry");
+    failures = failures + expect(ui_has_no_layout_violations(&catalog, 1) == 1, "control catalog passes strict layout checks");
+    let _restore_tab_focus: i32 = locator_focus(&catalog, locate_key(&catalog, 304));
+    let snapshot: InspectorSnapshot = ui_inspect(&catalog);
+    let inspected_tab: i32 = inspector_find_key(&snapshot, 304);
+    failures = failures + expect(len[InspectorNode](snapshot.nodes) == 8 && snapshot.focusable == 5
+        && snapshot.violations == 0, "inspector captures live component, focus, and validation state");
+    failures = failures + expect(inspected_tab >= 0 && snapshot.nodes.data[inspected_tab].parent_key == 300
+        && snapshot.nodes.data[inspected_tab].depth == 1 && snapshot.nodes.data[inspected_tab].focus_order == 2
+        && snapshot.nodes.data[inspected_tab].focused == 1, "inspector exposes hierarchy and exact focus order");
+    inspector_free(&snapshot);
+    ui_free(&catalog);
+
+    let lifecycle: Ui = ui_new(160, 100);
+    ui_begin(&lifecycle);
+    let lifecycle_root: i32 = ui_node(&lifecycle, 600, NodeKind.Root, -1, rect(0, 0, 160, 100), theme_surface(),
+        semantics(Role.Window, "Lifecycle", "", "lifecycle"), "", Action{ .id = 0 });
+    let lifecycle_button: i32 = ui_button_control(&lifecycle, 601, lifecycle_root, rect(8, 8, 80, 44), "Keep", 30);
+    ui_end(&lifecycle);
+    failures = failures + expect(lifecycle.reconcile.mounted == 2 && lifecycle.reconcile.updated == 0,
+        "reconciliation reports initial mounts");
+    let _lifecycle_focus: i32 = ui_set_focus(&lifecycle, lifecycle_button);
+    ui_begin(&lifecycle);
+    let lifecycle_root_again: i32 = ui_node(&lifecycle, 600, NodeKind.Root, -1, rect(0, 0, 160, 100), theme_surface(),
+        semantics(Role.Window, "Lifecycle", "", "lifecycle"), "", Action{ .id = 0 });
+    let _lifecycle_button_again: i32 = ui_button_control(&lifecycle, 601, lifecycle_root_again, rect(8, 8, 80, 44), "Keep", 30);
+    ui_end(&lifecycle);
+    failures = failures + expect(lifecycle.reconcile.updated == 2 && lifecycle.reconcile.mounted == 0
+        && lifecycle.reconcile.focus_preserved == 1, "reconciliation reports keyed updates and focus preservation");
+    ui_begin(&lifecycle);
+    let _lifecycle_root_last: i32 = ui_node(&lifecycle, 600, NodeKind.Root, -1, rect(0, 0, 160, 100), theme_surface(),
+        semantics(Role.Window, "Lifecycle", "", "lifecycle"), "", Action{ .id = 0 });
+    ui_end(&lifecycle);
+    failures = failures + expect(lifecycle.reconcile.updated == 1 && lifecycle.reconcile.unmounted == 1
+        && ui_find_key(&lifecycle, 601) < 0, "reconciliation reports removed keyed subtrees");
+    ui_free(&lifecycle);
+
+    let bad: Ui = ui_new(80, 80);
+    ui_begin(&bad);
+    let _bad_a: i32 = ui_node(&bad, 200, NodeKind.Button, -1, rect(0, 0, 20, 20), theme_button(), semantics(Role.Button, "", "", "dup"), "bad", Action{ .id = 1 });
+    let _bad_b: i32 = ui_node(&bad, 201, NodeKind.Button, -1, rect(0, 0, 20, 20), theme_button(), semantics(Role.Button, "", "", "dup"), "bad", Action{ .id = 2 });
+    ui_end(&bad);
+    let bad_report: CheckReport = ui_check(&bad, 0);
+    failures = failures + expect(bad_report.undersized == 2, "checker finds undersized targets");
+    failures = failures + expect(bad_report.unlabeled == 2, "checker finds semantic labels");
+    failures = failures + expect(locate_test_id(&bad, "dup").matches == 2, "ambiguous locator remains ambiguous");
+    failures = failures + expect(locator_click(&bad, locate_test_id(&bad, "dup")) == 0, "ambiguous locator fails closed");
+    failures = failures + expect(surface_checksum(&surface) == 453823277, "deterministic golden checksum");
+    _zag_println("checksum=453823277");
+    if (failures != 0) { return 1; }
+    _zag_println("foundation_test: ok");
+    return 0;
+}

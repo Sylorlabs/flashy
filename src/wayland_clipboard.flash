@@ -1,0 +1,1603 @@
+// Wayland core clipboard protocol foundation.
+//
+// Clipboard identities, generations, bounds, and state transitions stay in
+// Flash native balanced-ternary values. u8 buffers and binary descriptors exist
+// only at the Wayland/Linux wire boundary. This slice binds version 1 and
+// intentionally implements selection semantics, not drag-and-drop semantics.
+
+enum WaylandClipboardError {
+    None,
+    InvalidArgument,
+    InvalidState,
+    InvalidIdentity,
+    StaleIdentity,
+    MalformedFrame,
+    InvalidOpcode,
+    InvalidMime,
+    MimeLimit,
+    InvalidSelection,
+    UnexpectedFd,
+    MissingFd,
+    InvalidFd,
+    TransferFailed,
+    Timeout,
+    TooLarge,
+    InvalidUtf8,
+}
+
+enum WaylandClipboardEventKind {
+    None,
+    OfferIntroduced,
+    MimeOffered,
+    SelectionSet,
+    SelectionCleared,
+    SourceSend,
+    SourceCancelled,
+    SourceTargetIgnored,
+    DragEnterIgnored,
+    DragLeaveIgnored,
+    DragMotionIgnored,
+    DragDropIgnored,
+}
+
+struct WaylandClipboardIdentity {
+    object_id: t27,
+    generation: t27,
+    valid: i32,
+}
+
+struct WaylandClipboardMime {
+    storage: ArrayList[u8],
+    value: []u8,
+    authoritative: i32,
+}
+
+struct WaylandClipboardSource {
+    identity: WaylandClipboardIdentity,
+    committed: i32,
+    authoritative_offered: i32,
+    selected: i32,
+    used: i32,
+    cancelled: i32,
+    live: i32,
+}
+
+struct WaylandClipboardOffer {
+    identity: WaylandClipboardIdentity,
+    mimes: ArrayList[WaylandClipboardMime],
+    total_mime_bytes: t27,
+    authoritative: i32,
+    mime_rejected: i32,
+    selected: i32,
+    retired: i32,
+    live: i32,
+}
+
+struct WaylandClipboardState {
+    manager_id: t27,
+    device_id: t27,
+    seat_id: t27,
+    sources: ArrayList[WaylandClipboardSource],
+    offers: ArrayList[WaylandClipboardOffer],
+    retired_offers: ArrayList[WaylandClipboardIdentity],
+    prepared_source: WaylandClipboardIdentity,
+    current_source: WaylandClipboardIdentity,
+    current_offer: WaylandClipboardIdentity,
+    pending_offer: WaylandClipboardIdentity,
+    drag_offer: WaylandClipboardIdentity,
+    drag_active: i32,
+    next_generation: t27,
+    error: WaylandClipboardError,
+    terminal: i32,
+    valid: i32,
+}
+
+// A valid SourceSend dispatch transfers transfer_fd ownership to the caller.
+// All other dispatches have transfer_fd=-1. Invalid paths close any received
+// descriptor before returning.
+struct WaylandClipboardDispatch {
+    kind: WaylandClipboardEventKind,
+    identity: WaylandClipboardIdentity,
+    replaced: WaylandClipboardIdentity,
+    transfer_fd: i64,
+    authoritative: i32,
+    error: WaylandClipboardError,
+    valid: i32,
+}
+
+// The receive request owns request, read_fd, and write_fd. The write endpoint
+// is passed through SCM_RIGHTS but remains locally owned until mark_sent closes
+// it. On success, take_read_fd transfers the exact read-only endpoint. error is
+// the immutable construction result; later take/mark/abort operations preserve
+// it while changing only ownership state.
+struct WaylandClipboardReceiveRequest {
+    request: WireBuffer,
+    identity: WaylandClipboardIdentity,
+    read_fd: i64,
+    write_fd: i64,
+    error: WaylandClipboardError,
+    valid: i32,
+}
+
+struct WaylandClipboardTextResult {
+    bytes: ArrayList[u8],
+    error: WaylandClipboardError,
+    valid: i32,
+}
+
+fn wayland_clipboard_version() t27 { return 1; }
+fn wayland_clipboard_max_sources() t27 { return 27; }
+fn wayland_clipboard_max_offers() t27 { return 27; }
+fn wayland_clipboard_max_retired_offers() t27 { return 81; }
+fn wayland_clipboard_max_mimes() t27 { return 27; }
+fn wayland_clipboard_max_mime_bytes() t27 { return 243; }
+fn wayland_clipboard_max_total_mime_bytes() t27 { return 2187; }
+fn wayland_clipboard_max_transfer_bytes() t27 { return 260100; }
+fn wayland_clipboard_text_mime() []u8 { return "text/plain;charset=utf-8"; }
+
+fn wayland_clipboard_bad_identity() WaylandClipboardIdentity {
+    return WaylandClipboardIdentity{ .object_id = 0, .generation = 0, .valid = 0 };
+}
+
+fn wayland_clipboard_identity_equal(a: WaylandClipboardIdentity,
+    b: WaylandClipboardIdentity) i32 {
+    if (a.valid != 0 && b.valid != 0 && a.object_id == b.object_id
+        && a.generation == b.generation) { return 1; }
+    return 0;
+}
+
+fn wayland_clipboard_u32_valid(value: t27) i32 {
+    if (value >= 0 && value <= 4294967295) { return 1; }
+    return 0;
+}
+
+fn wayland_clipboard_object_id_valid(value: t27) i32 {
+    if (value >= 1 && wayland_clipboard_u32_valid(value) != 0) { return 1; }
+    return 0;
+}
+
+fn wayland_clipboard_mime_authoritative(value: []u8) i32 {
+    return @strEq(value, wayland_clipboard_text_mime());
+}
+
+// Core MIME values are strings but their grammar is an ASCII media type. This
+// foundation retains bounded visible ASCII values, while only the exact UTF-8
+// text spelling above grants clipboard-text authority.
+fn wayland_clipboard_mime_valid(value: []u8) i32 {
+    if (value.len < 1 || value.len as t27 > wayland_clipboard_max_mime_bytes()
+        || utf8_validate(value).valid == 0) { return 0; }
+    let slash_count: t27 = 0;
+    let separator: i32 = -1;
+    let i: i32 = 0;
+    while (i < value.len) {
+        let byte: t27 = value[i] as t27;
+        if (byte < 33 || byte > 126) { return 0; }
+        if (byte == '/') { slash_count = slash_count + 1; }
+        if (byte == ';' && separator < 0) { separator = i; }
+        i = i + 1;
+    }
+    let media_end: i32 = value.len;
+    if (separator >= 0) { media_end = separator; }
+    if (slash_count != 1 || media_end < 3 || value[0] == '/'
+        || value[media_end - 1] == '/') { return 0; }
+    return 1;
+}
+
+// Incoming MIME strings are opaque protocol strings. Quoted parameters,
+// spaces, and additional slashes are legal to advertise even when Flashy does
+// not understand them. Structural UTF-8/NUL validity is distinct from whether
+// the value fits Flashy's retained negotiation bound.
+fn wayland_clipboard_remote_mime_structural(value: []u8) i32 {
+    if (value.len < 1 || utf8_validate(value).valid == 0) { return 0; }
+    let i: i32 = 0;
+    while (i < value.len) {
+        if (value[i] == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn wayland_clipboard_empty_mime() WaylandClipboardMime {
+    return WaylandClipboardMime{
+        .storage = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 },
+        .value = "", .authoritative = 0 };
+}
+
+fn wayland_clipboard_mime_copy(value: []u8) WaylandClipboardMime {
+    let mime: WaylandClipboardMime = wayland_clipboard_empty_mime();
+    if (wayland_clipboard_remote_mime_structural(value) == 0
+        || value.len as t27 > wayland_clipboard_max_mime_bytes()) { return mime; }
+    mime.storage = make[u8](value.len);
+    let i: i32 = 0;
+    while (i < value.len) { push[u8](&mime.storage, value[i]); i = i + 1; }
+    mime.value = mime.storage.data[0..len[u8](mime.storage)];
+    mime.authoritative = wayland_clipboard_mime_authoritative(mime.value);
+    return mime;
+}
+
+fn wayland_clipboard_mime_free(mime: *WaylandClipboardMime) void {
+    if (mime.*.storage.cap > 0) { free[u8](&mime.*.storage); }
+    mime.*.storage = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 };
+    mime.*.value = ""; mime.*.authoritative = 0;
+}
+
+fn wayland_clipboard_empty_dispatch(error: WaylandClipboardError)
+    WaylandClipboardDispatch {
+    return WaylandClipboardDispatch{ .kind = WaylandClipboardEventKind.None,
+        .identity = wayland_clipboard_bad_identity(),
+        .replaced = wayland_clipboard_bad_identity(), .transfer_fd = 0 - 1,
+        .authoritative = 0, .error = error, .valid = 0 };
+}
+
+fn wayland_clipboard_dispatch_close(dispatch: *WaylandClipboardDispatch) i32 {
+    let ok: i32 = 1;
+    if (dispatch.*.transfer_fd >= 0) {
+        if (linux_close(dispatch.*.transfer_fd) != 0) { ok = 0; }
+        dispatch.*.transfer_fd = 0 - 1;
+    }
+    dispatch.*.valid = 0;
+    return ok;
+}
+
+fn wayland_clipboard_offer_free(offer: *WaylandClipboardOffer) void {
+    let i: i32 = 0;
+    while (i < len[WaylandClipboardMime](offer.*.mimes)) {
+        wayland_clipboard_mime_free(&offer.*.mimes.data[i]); i = i + 1;
+    }
+    if (offer.*.mimes.cap > 0) { free[WaylandClipboardMime](&offer.*.mimes); }
+    offer.*.mimes = ArrayList[WaylandClipboardMime]{
+        .data = null as *WaylandClipboardMime, .len = 0, .cap = 0 };
+    offer.*.identity = wayland_clipboard_bad_identity();
+    offer.*.total_mime_bytes = 0; offer.*.authoritative = 0;
+    offer.*.mime_rejected = 0; offer.*.selected = 0;
+    offer.*.retired = 1; offer.*.live = 0;
+}
+
+fn wayland_clipboard_state_clear_records(state: *WaylandClipboardState) void {
+    let i: i32 = 0;
+    while (i < len[WaylandClipboardOffer](state.*.offers)) {
+        wayland_clipboard_offer_free(&state.*.offers.data[i]); i = i + 1;
+    }
+    state.*.offers.len = 0; state.*.sources.len = 0;
+    state.*.retired_offers.len = 0;
+    state.*.prepared_source = wayland_clipboard_bad_identity();
+    state.*.current_source = wayland_clipboard_bad_identity();
+    state.*.current_offer = wayland_clipboard_bad_identity();
+    state.*.pending_offer = wayland_clipboard_bad_identity();
+    state.*.drag_offer = wayland_clipboard_bad_identity();
+    state.*.drag_active = 0;
+}
+
+fn wayland_clipboard_state_fail(state: *WaylandClipboardState,
+    error: WaylandClipboardError) void {
+    wayland_clipboard_state_clear_records(state);
+    state.*.error = error; state.*.terminal = 1;
+}
+
+fn wayland_clipboard_state_new(manager_id: t27, device_id: t27,
+    seat_id: t27) WaylandClipboardState {
+    let state: WaylandClipboardState = WaylandClipboardState{
+        .manager_id = manager_id, .device_id = device_id, .seat_id = seat_id,
+        .sources = make[WaylandClipboardSource](4),
+        .offers = make[WaylandClipboardOffer](4),
+        .retired_offers = make[WaylandClipboardIdentity](4),
+        .prepared_source = wayland_clipboard_bad_identity(),
+        .current_source = wayland_clipboard_bad_identity(),
+        .current_offer = wayland_clipboard_bad_identity(),
+        .pending_offer = wayland_clipboard_bad_identity(),
+        .drag_offer = wayland_clipboard_bad_identity(), .drag_active = 0,
+        .next_generation = 0,
+        .error = WaylandClipboardError.None, .terminal = 0, .valid = 1 };
+    if (wayland_client_new_id_valid(manager_id) == 0
+        || wayland_client_new_id_valid(device_id) == 0
+        || wayland_client_new_id_valid(seat_id) == 0
+        || manager_id == device_id || manager_id == seat_id || device_id == seat_id) {
+        wayland_clipboard_state_fail(&state, WaylandClipboardError.InvalidIdentity);
+        state.valid = 0;
+    }
+    return state;
+}
+
+fn wayland_clipboard_empty_state() WaylandClipboardState {
+    return WaylandClipboardState{ .manager_id = 0, .device_id = 0, .seat_id = 0,
+        .sources = ArrayList[WaylandClipboardSource]{
+            .data = null as *WaylandClipboardSource, .len = 0, .cap = 0 },
+        .offers = ArrayList[WaylandClipboardOffer]{
+            .data = null as *WaylandClipboardOffer, .len = 0, .cap = 0 },
+        .retired_offers = ArrayList[WaylandClipboardIdentity]{
+            .data = null as *WaylandClipboardIdentity, .len = 0, .cap = 0 },
+        .prepared_source = wayland_clipboard_bad_identity(),
+        .current_source = wayland_clipboard_bad_identity(),
+        .current_offer = wayland_clipboard_bad_identity(),
+        .pending_offer = wayland_clipboard_bad_identity(),
+        .drag_offer = wayland_clipboard_bad_identity(), .drag_active = 0,
+        .next_generation = 0, .error = WaylandClipboardError.None,
+        .terminal = 0, .valid = 0 };
+}
+
+fn wayland_clipboard_state_free(state: *WaylandClipboardState) void {
+    wayland_clipboard_state_clear_records(state);
+    if (state.*.offers.cap > 0) { free[WaylandClipboardOffer](&state.*.offers); }
+    if (state.*.sources.cap > 0) { free[WaylandClipboardSource](&state.*.sources); }
+    if (state.*.retired_offers.cap > 0) {
+        free[WaylandClipboardIdentity](&state.*.retired_offers);
+    }
+    state.*.offers = ArrayList[WaylandClipboardOffer]{
+        .data = null as *WaylandClipboardOffer, .len = 0, .cap = 0 };
+    state.*.sources = ArrayList[WaylandClipboardSource]{
+        .data = null as *WaylandClipboardSource, .len = 0, .cap = 0 };
+    state.*.retired_offers = ArrayList[WaylandClipboardIdentity]{
+        .data = null as *WaylandClipboardIdentity, .len = 0, .cap = 0 };
+    state.*.valid = 0;
+}
+
+fn wayland_clipboard_source_index(state: *WaylandClipboardState,
+    object_id: t27) i32 {
+    let i: i32 = 0;
+    while (i < len[WaylandClipboardSource](state.*.sources)) {
+        if (state.*.sources.data[i].live != 0
+            && state.*.sources.data[i].committed != 0
+            && state.*.sources.data[i].identity.object_id == object_id) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn wayland_clipboard_source_slot_index(state: *WaylandClipboardState,
+    object_id: t27) i32 {
+    let i: i32 = 0;
+    while (i < len[WaylandClipboardSource](state.*.sources)) {
+        if (state.*.sources.data[i].live != 0
+            && state.*.sources.data[i].identity.object_id == object_id) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn wayland_clipboard_offer_index(state: *WaylandClipboardState,
+    object_id: t27) i32 {
+    let i: i32 = 0;
+    while (i < len[WaylandClipboardOffer](state.*.offers)) {
+        if (state.*.offers.data[i].live != 0
+            && state.*.offers.data[i].identity.object_id == object_id) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn wayland_clipboard_generation_in_use(state: *WaylandClipboardState,
+    generation: t27) i32 {
+    let source_i: i32 = 0;
+    while (source_i < len[WaylandClipboardSource](state.*.sources)) {
+        if (state.*.sources.data[source_i].live != 0
+            && state.*.sources.data[source_i].identity.generation == generation) { return 1; }
+        source_i = source_i + 1;
+    }
+    let offer_i: i32 = 0;
+    while (offer_i < len[WaylandClipboardOffer](state.*.offers)) {
+        if (state.*.offers.data[offer_i].live != 0
+            && state.*.offers.data[offer_i].identity.generation == generation) { return 1; }
+        offer_i = offer_i + 1;
+    }
+    return 0;
+}
+
+fn wayland_clipboard_next_generation(state: *WaylandClipboardState) t27 {
+    let candidate: t27 = 1;
+    if (state.*.next_generation > 0
+        && state.*.next_generation < flashy_t27_max()) {
+        candidate = state.*.next_generation + 1;
+    }
+    let attempt: t27 = 0;
+    let bound: t27 = wayland_clipboard_max_sources()
+        + wayland_clipboard_max_offers() + 1;
+    while (attempt < bound && wayland_clipboard_generation_in_use(state, candidate) != 0) {
+        if (candidate >= flashy_t27_max()) { candidate = 1; }
+        else { candidate = candidate + 1; }
+        attempt = attempt + 1;
+    }
+    if (wayland_clipboard_generation_in_use(state, candidate) != 0) { return 0; }
+    state.*.next_generation = candidate;
+    return candidate;
+}
+
+fn wayland_clipboard_object_id_in_use(state: *WaylandClipboardState,
+    object_id: t27) i32 {
+    if (object_id == state.*.manager_id || object_id == state.*.device_id
+        || object_id == state.*.seat_id
+        || wayland_clipboard_source_slot_index(state, object_id) >= 0
+        || wayland_clipboard_offer_index(state, object_id) >= 0) { return 1; }
+    return 0;
+}
+
+// Reserve the complete source slot and generation before any bytes are sent.
+// The provisional record consumes the 27-source bound and object ID but is not
+// visible to source/event lookup and cannot hold MIME or selection authority.
+// Exactly one create transaction may be outstanding on the serialized UI
+// thread; sent=0 commit aborts and removes the reservation.
+fn wayland_clipboard_prepare_source(state: *WaylandClipboardState,
+    object_id: t27) WireBuffer {
+    if (state.*.valid == 0 || state.*.terminal != 0
+        || state.*.prepared_source.valid != 0
+        || wayland_client_new_id_valid(object_id) == 0
+        || wayland_clipboard_object_id_in_use(state, object_id) != 0
+        || len[WaylandClipboardSource](state.*.sources) as t27
+            >= wayland_clipboard_max_sources()) {
+        return wayland_clipboard_bad_wire();
+    }
+    let request: WireBuffer = wayland_clipboard_manager_create_source_request(
+        state.*.manager_id, object_id);
+    if (request.error != 0) { return request; }
+    let generation: t27 = wayland_clipboard_next_generation(state);
+    if (generation == 0) {
+        wire_free(&request); return wayland_clipboard_bad_wire();
+    }
+    let identity: WaylandClipboardIdentity = WaylandClipboardIdentity{
+        .object_id = object_id, .generation = generation, .valid = 1 };
+    push[WaylandClipboardSource](&state.*.sources, WaylandClipboardSource{
+        .identity = identity, .committed = 0, .authoritative_offered = 0,
+        .selected = 0, .used = 0, .cancelled = 0, .live = 1 });
+    state.*.prepared_source = identity;
+    return request;
+}
+
+// Commit performs no allocation and chooses no identity: sent=1 only flips the
+// exact pre-send provisional record. An impossible missing/mismatched slot
+// terminals the state so a compositor-visible source is never left untracked.
+fn wayland_clipboard_register_source_commit(state: *WaylandClipboardState,
+    object_id: t27, sent: i32) WaylandClipboardIdentity {
+    let bad: WaylandClipboardIdentity = wayland_clipboard_bad_identity();
+    if (state.*.valid == 0 || state.*.terminal != 0
+        || (sent != 0 && sent != 1)) { return bad; }
+    if (state.*.prepared_source.valid == 0
+        || state.*.prepared_source.object_id != object_id) {
+        if (sent == 1) {
+            wayland_clipboard_state_fail(state, WaylandClipboardError.InvalidState);
+        }
+        return bad;
+    }
+    let index: i32 = wayland_clipboard_source_slot_index(state, object_id);
+    if (index < 0 || state.*.sources.data[index].committed != 0
+        || wayland_clipboard_identity_equal(state.*.prepared_source,
+            state.*.sources.data[index].identity) == 0) {
+        wayland_clipboard_state_fail(state, WaylandClipboardError.InvalidState);
+        return bad;
+    }
+    let identity: WaylandClipboardIdentity = state.*.prepared_source;
+    state.*.prepared_source = wayland_clipboard_bad_identity();
+    if (sent == 0) {
+        wayland_clipboard_remove_source(state, index); return bad;
+    }
+    state.*.sources.data[index].committed = 1;
+    return identity;
+}
+
+fn wayland_clipboard_identity_source_index(state: *WaylandClipboardState,
+    identity: WaylandClipboardIdentity) i32 {
+    let index: i32 = wayland_clipboard_source_index(state, identity.object_id);
+    if (index >= 0 && wayland_clipboard_identity_equal(
+        state.*.sources.data[index].identity, identity) != 0) { return index; }
+    return -1;
+}
+
+fn wayland_clipboard_identity_offer_index(state: *WaylandClipboardState,
+    identity: WaylandClipboardIdentity) i32 {
+    let index: i32 = wayland_clipboard_offer_index(state, identity.object_id);
+    if (index >= 0 && wayland_clipboard_identity_equal(
+        state.*.offers.data[index].identity, identity) != 0) { return index; }
+    return -1;
+}
+
+fn wayland_clipboard_remove_source(state: *WaylandClipboardState,
+    index: i32) void {
+    if (index < 0 || index >= len[WaylandClipboardSource](state.*.sources)) { return; }
+    let i: i32 = index;
+    while (i + 1 < len[WaylandClipboardSource](state.*.sources)) {
+        state.*.sources.data[i] = state.*.sources.data[i + 1]; i = i + 1;
+    }
+    state.*.sources.len = state.*.sources.len - 1;
+}
+
+fn wayland_clipboard_remove_offer(state: *WaylandClipboardState,
+    index: i32) void {
+    if (index < 0 || index >= len[WaylandClipboardOffer](state.*.offers)) { return; }
+    wayland_clipboard_offer_free(&state.*.offers.data[index]);
+    let i: i32 = index;
+    while (i + 1 < len[WaylandClipboardOffer](state.*.offers)) {
+        state.*.offers.data[i] = state.*.offers.data[i + 1]; i = i + 1;
+    }
+    state.*.offers.len = state.*.offers.len - 1;
+}
+
+fn wayland_clipboard_bad_wire() WireBuffer {
+    let out: WireBuffer = wire_new(1); out.error = 1; return out;
+}
+
+fn wayland_clipboard_manager_create_source_request(manager_id: t27,
+    source_id: t27) WireBuffer {
+    // Stateless codec primitive only. Stateful clients must use
+    // wayland_clipboard_prepare_source so cap/ID/generation reservation occurs
+    // before this frame reaches a transport.
+    if (wayland_client_new_id_valid(manager_id) == 0
+        || wayland_client_new_id_valid(source_id) == 0
+        || manager_id == source_id) { return wayland_clipboard_bad_wire(); }
+    return wayland_new_id_request(manager_id, 0, source_id);
+}
+
+fn wayland_clipboard_manager_get_device_request(manager_id: t27,
+    device_id: t27, seat_id: t27) WireBuffer {
+    if (wayland_client_new_id_valid(manager_id) == 0
+        || wayland_client_new_id_valid(device_id) == 0
+        || wayland_client_new_id_valid(seat_id) == 0
+        || manager_id == device_id || manager_id == seat_id || device_id == seat_id) {
+        return wayland_clipboard_bad_wire();
+    }
+    let payload: WireBuffer = wire_new(8);
+    wire_push_u32_le(&payload, device_id); wire_push_u32_le(&payload, seat_id);
+    let out: WireBuffer = wayland_encode(manager_id, 1, &payload);
+    wire_free(&payload); return out;
+}
+
+fn wayland_clipboard_source_offer_request(source_id: t27,
+    mime: []u8) WireBuffer {
+    if (wayland_client_new_id_valid(source_id) == 0
+        || wayland_clipboard_mime_valid(mime) == 0) {
+        return wayland_clipboard_bad_wire();
+    }
+    return wayland_string_request(source_id, 0, mime);
+}
+
+fn wayland_clipboard_source_destroy_request(source_id: t27) WireBuffer {
+    if (wayland_client_new_id_valid(source_id) == 0) {
+        return wayland_clipboard_bad_wire();
+    }
+    return wayland_empty_request(source_id, 1);
+}
+
+fn wayland_clipboard_device_set_selection_request(device_id: t27,
+    source_id: t27, serial: t27) WireBuffer {
+    if (wayland_client_new_id_valid(device_id) == 0
+        || (source_id != 0 && wayland_client_new_id_valid(source_id) == 0)
+        || wayland_clipboard_u32_valid(serial) == 0) {
+        return wayland_clipboard_bad_wire();
+    }
+    let payload: WireBuffer = wire_new(8);
+    wire_push_u32_le(&payload, source_id); wire_push_u32_le(&payload, serial);
+    let out: WireBuffer = wayland_encode(device_id, 1, &payload);
+    wire_free(&payload); return out;
+}
+
+fn wayland_clipboard_offer_receive_request(offer_id: t27,
+    mime: []u8) WireBuffer {
+    if (wayland_server_new_id_valid(offer_id) == 0
+        || wayland_clipboard_mime_valid(mime) == 0) {
+        return wayland_clipboard_bad_wire();
+    }
+    // The fd argument is ancillary; only the string occupies frame bytes.
+    return wayland_string_request(offer_id, 1, mime);
+}
+
+fn wayland_clipboard_offer_destroy_request(offer_id: t27) WireBuffer {
+    if (wayland_server_new_id_valid(offer_id) == 0) {
+        return wayland_clipboard_bad_wire();
+    }
+    return wayland_empty_request(offer_id, 2);
+}
+
+fn wayland_clipboard_source_offer(state: *WaylandClipboardState,
+    identity: WaylandClipboardIdentity, mime: []u8) WireBuffer {
+    let index: i32 = wayland_clipboard_identity_source_index(state, identity);
+    if (state.*.terminal != 0 || index < 0
+        || state.*.sources.data[index].cancelled != 0
+        || state.*.sources.data[index].authoritative_offered != 0
+        || wayland_clipboard_mime_authoritative(mime) == 0) {
+        return wayland_clipboard_bad_wire();
+    }
+    let request: WireBuffer = wayland_clipboard_source_offer_request(
+        identity.object_id, mime);
+    return request;
+}
+
+fn wayland_clipboard_source_offer_commit(state: *WaylandClipboardState,
+    identity: WaylandClipboardIdentity, sent: i32) i32 {
+    if (sent == 0) { return 0; }
+    let index: i32 = wayland_clipboard_identity_source_index(state, identity);
+    if (state.*.terminal != 0 || index < 0
+        || state.*.sources.data[index].cancelled != 0
+        || state.*.sources.data[index].authoritative_offered != 0) { return 0; }
+    state.*.sources.data[index].authoritative_offered = 1; return 1;
+}
+
+fn wayland_clipboard_set_source_selection(state: *WaylandClipboardState,
+    identity: WaylandClipboardIdentity, serial: t27) WireBuffer {
+    let index: i32 = wayland_clipboard_identity_source_index(state, identity);
+    if (state.*.terminal != 0 || index < 0
+        || state.*.sources.data[index].cancelled != 0
+        || state.*.sources.data[index].authoritative_offered == 0
+        || state.*.sources.data[index].used != 0) {
+        return wayland_clipboard_bad_wire();
+    }
+    let request: WireBuffer = wayland_clipboard_device_set_selection_request(
+        state.*.device_id, identity.object_id, serial);
+    return request;
+}
+
+fn wayland_clipboard_set_source_selection_commit(
+    state: *WaylandClipboardState, identity: WaylandClipboardIdentity,
+    sent: i32) i32 {
+    if (sent == 0) { return 0; }
+    let index: i32 = wayland_clipboard_identity_source_index(state, identity);
+    if (state.*.terminal != 0 || index < 0
+        || state.*.sources.data[index].cancelled != 0
+        || state.*.sources.data[index].authoritative_offered == 0
+        || state.*.sources.data[index].used != 0) { return 0; }
+    if (state.*.current_source.valid != 0) {
+        let prior: i32 = wayland_clipboard_identity_source_index(
+            state, state.*.current_source);
+        if (prior >= 0) { state.*.sources.data[prior].selected = 0; }
+    }
+    state.*.sources.data[index].selected = 1;
+    state.*.sources.data[index].used = 1;
+    state.*.current_source = identity;
+    return 1;
+}
+
+fn wayland_clipboard_clear_source_selection(state: *WaylandClipboardState,
+    serial: t27) WireBuffer {
+    if (state.*.terminal != 0) { return wayland_clipboard_bad_wire(); }
+    return wayland_clipboard_device_set_selection_request(
+        state.*.device_id, 0, serial);
+}
+
+fn wayland_clipboard_clear_source_selection_commit(
+    state: *WaylandClipboardState, sent: i32) i32 {
+    if (sent == 0 || state.*.terminal != 0) { return 0; }
+    if (state.*.current_source.valid != 0) {
+        let prior: i32 = wayland_clipboard_identity_source_index(
+            state, state.*.current_source);
+        if (prior >= 0) { state.*.sources.data[prior].selected = 0; }
+    }
+    state.*.current_source = wayland_clipboard_bad_identity(); return 1;
+}
+
+fn wayland_clipboard_destroy_source(state: *WaylandClipboardState,
+    identity: WaylandClipboardIdentity) WireBuffer {
+    let index: i32 = wayland_clipboard_identity_source_index(state, identity);
+    if (state.*.terminal != 0 || index < 0) {
+        return wayland_clipboard_bad_wire();
+    }
+    return wayland_clipboard_source_destroy_request(identity.object_id);
+}
+
+fn wayland_clipboard_destroy_source_commit(state: *WaylandClipboardState,
+    identity: WaylandClipboardIdentity, sent: i32) i32 {
+    if (sent == 0) { return 0; }
+    let index: i32 = wayland_clipboard_identity_source_index(state, identity);
+    if (state.*.terminal != 0 || index < 0) { return 0; }
+    if (wayland_clipboard_identity_equal(state.*.current_source, identity) != 0) {
+        state.*.current_source = wayland_clipboard_bad_identity();
+    }
+    wayland_clipboard_remove_source(state, index); return 1;
+}
+
+fn wayland_clipboard_destroy_offer(state: *WaylandClipboardState,
+    identity: WaylandClipboardIdentity) WireBuffer {
+    let index: i32 = wayland_clipboard_identity_offer_index(state, identity);
+    if (state.*.terminal != 0 || index < 0) { return wayland_clipboard_bad_wire(); }
+    return wayland_clipboard_offer_destroy_request(identity.object_id);
+}
+
+fn wayland_clipboard_destroy_offer_commit(state: *WaylandClipboardState,
+    identity: WaylandClipboardIdentity, sent: i32) i32 {
+    if (sent == 0) { return 0; }
+    let index: i32 = wayland_clipboard_identity_offer_index(state, identity);
+    if (state.*.terminal != 0 || index < 0) { return 0; }
+    if (wayland_clipboard_identity_equal(state.*.current_offer, identity) != 0) {
+        state.*.current_offer = wayland_clipboard_bad_identity();
+    }
+    if (wayland_clipboard_identity_equal(state.*.pending_offer, identity) != 0) {
+        state.*.pending_offer = wayland_clipboard_bad_identity();
+    }
+    if (wayland_clipboard_identity_equal(state.*.drag_offer, identity) != 0) {
+        state.*.drag_offer = wayland_clipboard_bad_identity();
+    }
+    let retired_i: i32 = 0;
+    while (retired_i < len[WaylandClipboardIdentity](state.*.retired_offers)) {
+        if (wayland_clipboard_identity_equal(
+            state.*.retired_offers.data[retired_i], identity) != 0) {
+            let move_i: i32 = retired_i;
+            while (move_i + 1
+                < len[WaylandClipboardIdentity](state.*.retired_offers)) {
+                state.*.retired_offers.data[move_i] =
+                    state.*.retired_offers.data[move_i + 1];
+                move_i = move_i + 1;
+            }
+            state.*.retired_offers.len = state.*.retired_offers.len - 1;
+        } else { retired_i = retired_i + 1; }
+    }
+    wayland_clipboard_remove_offer(state, index); return 1;
+}
+
+fn wayland_clipboard_frame_exact(input: *WireBuffer, frame: WaylandFrame,
+    object_id: t27, opcode: t27) i32 {
+    if (input.*.error == 0 && frame.valid != 0 && frame.payload_offset == 8
+        && frame.object_id == object_id && frame.opcode == opcode
+        && frame.size == len[u8](input.*.bytes) as t27) { return 1; }
+    return 0;
+}
+
+fn wayland_clipboard_string_payload(input: *WireBuffer, frame: WaylandFrame)
+    WireString {
+    let bad: WireString = WireString{
+        .value = "", .next_offset = frame.payload_offset, .valid = 0 };
+    if (frame.size < 12 || frame.payload_offset < 0) { return bad; }
+    let end: i32 = frame.size as i32;
+    let value: WireString = wire_read_string(input, frame.payload_offset, end);
+    if (input.*.error != 0 || value.valid == 0 || value.next_offset != end
+        || wayland_clipboard_remote_mime_structural(value.value) == 0) { return bad; }
+    return value;
+}
+
+fn wayland_clipboard_nullable_string_payload(input: *WireBuffer,
+    frame: WaylandFrame) WireString {
+    let bad: WireString = WireString{
+        .value = "", .next_offset = frame.payload_offset, .valid = 0 };
+    if (frame.size < 12 || frame.payload_offset < 0) { return bad; }
+    let end: i32 = frame.size as i32;
+    let encoded_size: t27 = wire_read_u32_le(input, frame.payload_offset);
+    if (input.*.error != 0) { return bad; }
+    if (encoded_size == 0) {
+        if (frame.payload_offset + 4 != end) { return bad; }
+        return WireString{ .value = "", .next_offset = end, .valid = 1 };
+    }
+    return wayland_clipboard_string_payload(input, frame);
+}
+
+fn wayland_clipboard_add_offer(state: *WaylandClipboardState,
+    object_id: t27) WaylandClipboardIdentity {
+    let bad: WaylandClipboardIdentity = wayland_clipboard_bad_identity();
+    if (wayland_server_new_id_valid(object_id) == 0
+        || wayland_clipboard_object_id_in_use(state, object_id) != 0
+        || len[WaylandClipboardOffer](state.*.offers) as t27
+            >= wayland_clipboard_max_offers()) { return bad; }
+    let generation: t27 = wayland_clipboard_next_generation(state);
+    if (generation == 0) { return bad; }
+    let identity: WaylandClipboardIdentity = WaylandClipboardIdentity{
+        .object_id = object_id, .generation = generation, .valid = 1 };
+    push[WaylandClipboardOffer](&state.*.offers, WaylandClipboardOffer{
+        .identity = identity, .mimes = make[WaylandClipboardMime](4),
+        .total_mime_bytes = 0, .authoritative = 0, .mime_rejected = 0,
+        .selected = 0, .retired = 0, .live = 1 });
+    return identity;
+}
+
+fn wayland_clipboard_add_offer_mime(offer: *WaylandClipboardOffer,
+    value: []u8) WaylandClipboardError {
+    if (wayland_clipboard_remote_mime_structural(value) == 0) {
+        return WaylandClipboardError.InvalidMime;
+    }
+    // Authority depends only on the exact bounded spelling, not its position
+    // in an otherwise opaque remote preference list. A source cannot suppress
+    // text merely by advertising the exact type after our retention cap.
+    if (wayland_clipboard_mime_authoritative(value) != 0) {
+        offer.*.authoritative = 1;
+    }
+    if (value.len as t27 > wayland_clipboard_max_mime_bytes()
+        || len[WaylandClipboardMime](offer.*.mimes) as t27
+        >= wayland_clipboard_max_mimes()
+        || value.len as t27 > wayland_clipboard_max_total_mime_bytes()
+            - offer.*.total_mime_bytes) {
+        // Unknown remote types are not connection errors and cannot revoke a
+        // previously proven exact UTF-8 text offer. They simply receive no
+        // local authority or retained storage once the negotiation cap is hit.
+        offer.*.mime_rejected = 1;
+        return WaylandClipboardError.None;
+    }
+    let i: i32 = 0;
+    while (i < len[WaylandClipboardMime](offer.*.mimes)) {
+        if (@strEq(offer.*.mimes.data[i].value, value) != 0) {
+            return WaylandClipboardError.None;
+        }
+        i = i + 1;
+    }
+    let mime: WaylandClipboardMime = wayland_clipboard_mime_copy(value);
+    if (mime.storage.cap == 0) { return WaylandClipboardError.InvalidMime; }
+    offer.*.total_mime_bytes = offer.*.total_mime_bytes + value.len as t27;
+    if (mime.authoritative != 0) { offer.*.authoritative = 1; }
+    push[WaylandClipboardMime](&offer.*.mimes, mime);
+    return WaylandClipboardError.None;
+}
+
+fn wayland_clipboard_fd_access_mode(fd: i64) i64 {
+    let flags: i64 = linux_fd_status_flags(fd);
+    if (flags < 0) { return 0 - 1; }
+    return flags - (flags / 4) * 4;
+}
+
+fn wayland_clipboard_fd_cloexec(fd: i64) i32 {
+    let flags: i64 = linux_fd_flags(fd);
+    if (flags >= 0 && (flags % 2) == linux_fd_cloexec()) { return 1; }
+    return 0;
+}
+
+fn wayland_clipboard_close_received(fd: i64) void {
+    if (fd >= 0) { let _closed_received: i64 = linux_close(fd); }
+}
+
+fn wayland_clipboard_retire_offer(state: *WaylandClipboardState,
+    identity: WaylandClipboardIdentity) WaylandClipboardIdentity {
+    let index: i32 = wayland_clipboard_identity_offer_index(state, identity);
+    if (index < 0) { return wayland_clipboard_bad_identity(); }
+    if (state.*.offers.data[index].retired == 0) {
+        if (len[WaylandClipboardIdentity](state.*.retired_offers) as t27
+            >= wayland_clipboard_max_retired_offers()) {
+            wayland_clipboard_state_fail(state, WaylandClipboardError.MimeLimit);
+            return wayland_clipboard_bad_identity();
+        }
+        push[WaylandClipboardIdentity](&state.*.retired_offers,
+            state.*.offers.data[index].identity);
+    }
+    state.*.offers.data[index].selected = 0;
+    state.*.offers.data[index].retired = 1;
+    return state.*.offers.data[index].identity;
+}
+
+fn wayland_clipboard_take_retired_offer(
+    state: *WaylandClipboardState) WaylandClipboardIdentity {
+    if (len[WaylandClipboardIdentity](state.*.retired_offers) == 0) {
+        return wayland_clipboard_bad_identity();
+    }
+    let identity: WaylandClipboardIdentity = state.*.retired_offers.data[0];
+    let i: i32 = 0;
+    while (i + 1 < len[WaylandClipboardIdentity](state.*.retired_offers)) {
+        state.*.retired_offers.data[i] = state.*.retired_offers.data[i + 1];
+        i = i + 1;
+    }
+    state.*.retired_offers.len = state.*.retired_offers.len - 1;
+    return identity;
+}
+
+// wl_data_device.selection authority ends when keyboard focus leaves this
+// client, even if no replacement selection event follows. Queued identities
+// remain generation-tagged and drainable for exact destroy requests.
+fn wayland_clipboard_selection_focus_lost(
+    state: *WaylandClipboardState) i32 {
+    if (state.*.valid == 0 || state.*.terminal != 0) { return 0; }
+    let retired_count: i32 = 0;
+    if (state.*.pending_offer.valid != 0) {
+        if (wayland_clipboard_retire_offer(
+            state, state.*.pending_offer).valid != 0) {
+            retired_count = retired_count + 1;
+        }
+        state.*.pending_offer = wayland_clipboard_bad_identity();
+    }
+    if (state.*.current_offer.valid != 0) {
+        if (wayland_clipboard_retire_current_offer(state).valid != 0) {
+            retired_count = retired_count + 1;
+        }
+    }
+    return retired_count;
+}
+
+// Retire only incoming selection authority. Local source supersession and
+// self-mirror filtering must not pretend keyboard focus changed, nor disturb a
+// separately pending selection or ignored DnD offer.
+fn wayland_clipboard_retire_current_offer(
+    state: *WaylandClipboardState) WaylandClipboardIdentity {
+    if (state.*.valid == 0 || state.*.terminal != 0
+        || state.*.current_offer.valid == 0) {
+        return wayland_clipboard_bad_identity();
+    }
+    let retired: WaylandClipboardIdentity = wayland_clipboard_retire_offer(
+        state, state.*.current_offer);
+    state.*.current_offer = wayland_clipboard_bad_identity();
+    return retired;
+}
+
+fn wayland_clipboard_process_frame(state: *WaylandClipboardState,
+    input: *WireBuffer, received_fd: i64, fd_count: t27,
+    ancillary_valid: i32) WaylandClipboardDispatch {
+    if (state.*.valid == 0 || state.*.terminal != 0) {
+        wayland_clipboard_close_received(received_fd);
+        return wayland_clipboard_empty_dispatch(WaylandClipboardError.InvalidState);
+    }
+    let frame: WaylandFrame = wayland_decode(input, 0);
+    if (input.*.error != 0 || frame.valid == 0 || frame.payload_offset != 8
+        || frame.size != len[u8](input.*.bytes) as t27) {
+        wayland_clipboard_close_received(received_fd);
+        wayland_clipboard_state_fail(state, WaylandClipboardError.MalformedFrame);
+        return wayland_clipboard_empty_dispatch(WaylandClipboardError.MalformedFrame);
+    }
+    if (frame.object_id == state.*.device_id) {
+        if (received_fd >= 0 || fd_count != 0 || ancillary_valid == 0) {
+            wayland_clipboard_close_received(received_fd);
+            wayland_clipboard_state_fail(state, WaylandClipboardError.UnexpectedFd);
+            return wayland_clipboard_empty_dispatch(WaylandClipboardError.UnexpectedFd);
+        }
+        if (frame.opcode == 0) {
+            if (wayland_clipboard_frame_exact(input, frame, state.*.device_id, 0) == 0
+                || frame.size != 12) {
+                wayland_clipboard_state_fail(state, WaylandClipboardError.MalformedFrame);
+                return wayland_clipboard_empty_dispatch(WaylandClipboardError.MalformedFrame);
+            }
+            let object_id: t27 = wire_read_u32_le(input, frame.payload_offset);
+            let identity: WaylandClipboardIdentity = wayland_clipboard_add_offer(
+                state, object_id);
+            if (input.*.error != 0 || identity.valid == 0) {
+                wayland_clipboard_state_fail(state, WaylandClipboardError.InvalidIdentity);
+                return wayland_clipboard_empty_dispatch(WaylandClipboardError.InvalidIdentity);
+            }
+            let out: WaylandClipboardDispatch = wayland_clipboard_empty_dispatch(
+                WaylandClipboardError.None);
+            if (state.*.pending_offer.valid != 0) {
+                out.replaced = wayland_clipboard_retire_offer(
+                    state, state.*.pending_offer);
+            }
+            state.*.pending_offer = identity;
+            out.kind = WaylandClipboardEventKind.OfferIntroduced;
+            out.identity = identity; out.valid = 1; return out;
+        }
+        if (frame.opcode == 1) {
+            if (wayland_clipboard_frame_exact(input, frame,
+                state.*.device_id, 1) == 0 || frame.size != 28
+                || state.*.drag_active != 0) {
+                wayland_clipboard_state_fail(state, WaylandClipboardError.MalformedFrame);
+                return wayland_clipboard_empty_dispatch(WaylandClipboardError.MalformedFrame);
+            }
+            let _serial: t27 = wire_read_u32_le(input, frame.payload_offset);
+            let surface_id: t27 = wire_read_u32_le(input, frame.payload_offset + 4);
+            let _x: t27 = wire_read_i32_le(input, frame.payload_offset + 8);
+            let _y: t27 = wire_read_i32_le(input, frame.payload_offset + 12);
+            let offer_id: t27 = wire_read_u32_le(input, frame.payload_offset + 16);
+            if (input.*.error != 0
+                || wayland_client_new_id_valid(surface_id) == 0
+                || (offer_id != 0 && wayland_server_new_id_valid(offer_id) == 0)) {
+                wayland_clipboard_state_fail(state, WaylandClipboardError.MalformedFrame);
+                return wayland_clipboard_empty_dispatch(WaylandClipboardError.MalformedFrame);
+            }
+            let out: WaylandClipboardDispatch = wayland_clipboard_empty_dispatch(
+                WaylandClipboardError.None);
+            if (offer_id != 0) {
+                let offer_index: i32 = wayland_clipboard_offer_index(state, offer_id);
+                if (offer_index < 0 || state.*.pending_offer.valid == 0
+                    || wayland_clipboard_identity_equal(state.*.pending_offer,
+                        state.*.offers.data[offer_index].identity) == 0) {
+                    wayland_clipboard_state_fail(state,
+                        WaylandClipboardError.InvalidSelection);
+                    return wayland_clipboard_empty_dispatch(
+                        WaylandClipboardError.InvalidSelection);
+                }
+                state.*.drag_offer = state.*.offers.data[offer_index].identity;
+                out.identity = state.*.drag_offer;
+            } else if (state.*.pending_offer.valid != 0) {
+                let retired_pending: WaylandClipboardIdentity =
+                    wayland_clipboard_retire_offer(state, state.*.pending_offer);
+                if (out.replaced.valid == 0) { out.replaced = retired_pending; }
+            }
+            state.*.pending_offer = wayland_clipboard_bad_identity();
+            state.*.drag_active = 1;
+            out.kind = WaylandClipboardEventKind.DragEnterIgnored;
+            out.valid = 1; return out;
+        }
+        if (frame.opcode == 2) {
+            if (wayland_clipboard_frame_exact(input, frame,
+                state.*.device_id, 2) == 0 || frame.size != 8
+                || (state.*.drag_active != 1
+                    && state.*.drag_active != 2)) {
+                wayland_clipboard_state_fail(state, WaylandClipboardError.MalformedFrame);
+                return wayland_clipboard_empty_dispatch(WaylandClipboardError.MalformedFrame);
+            }
+            let out: WaylandClipboardDispatch = wayland_clipboard_empty_dispatch(
+                WaylandClipboardError.None);
+            if (state.*.drag_offer.valid != 0) {
+                out.replaced = wayland_clipboard_retire_offer(
+                    state, state.*.drag_offer);
+            }
+            state.*.drag_offer = wayland_clipboard_bad_identity();
+            state.*.drag_active = 0;
+            out.kind = WaylandClipboardEventKind.DragLeaveIgnored;
+            out.valid = 1; return out;
+        }
+        if (frame.opcode == 3) {
+            if (wayland_clipboard_frame_exact(input, frame,
+                state.*.device_id, 3) == 0 || frame.size != 20
+                || state.*.drag_active != 1) {
+                wayland_clipboard_state_fail(state, WaylandClipboardError.MalformedFrame);
+                return wayland_clipboard_empty_dispatch(WaylandClipboardError.MalformedFrame);
+            }
+            let _time: t27 = wire_read_u32_le(input, frame.payload_offset);
+            let _x: t27 = wire_read_i32_le(input, frame.payload_offset + 4);
+            let _y: t27 = wire_read_i32_le(input, frame.payload_offset + 8);
+            if (input.*.error != 0) {
+                wayland_clipboard_state_fail(state, WaylandClipboardError.MalformedFrame);
+                return wayland_clipboard_empty_dispatch(WaylandClipboardError.MalformedFrame);
+            }
+            let out: WaylandClipboardDispatch = wayland_clipboard_empty_dispatch(
+                WaylandClipboardError.None);
+            out.kind = WaylandClipboardEventKind.DragMotionIgnored;
+            out.identity = state.*.drag_offer; out.valid = 1; return out;
+        }
+        if (frame.opcode == 4) {
+            if (wayland_clipboard_frame_exact(input, frame,
+                state.*.device_id, 4) == 0 || frame.size != 8
+                || state.*.drag_active != 1) {
+                wayland_clipboard_state_fail(state, WaylandClipboardError.MalformedFrame);
+                return wayland_clipboard_empty_dispatch(WaylandClipboardError.MalformedFrame);
+            }
+            let out: WaylandClipboardDispatch = wayland_clipboard_empty_dispatch(
+                WaylandClipboardError.None);
+            if (state.*.drag_offer.valid != 0) {
+                out.replaced = wayland_clipboard_retire_offer(
+                    state, state.*.drag_offer);
+            }
+            state.*.drag_offer = wayland_clipboard_bad_identity();
+            // Weston and other compositors normally follow drop with leave.
+            // Phase two accepts that exact teardown once without retiring the
+            // offer twice; unsolicited motion/drop remain protocol errors.
+            state.*.drag_active = 2;
+            out.kind = WaylandClipboardEventKind.DragDropIgnored;
+            out.valid = 1; return out;
+        }
+        if (frame.opcode == 5) {
+            if (wayland_clipboard_frame_exact(input, frame, state.*.device_id, 5) == 0
+                || frame.size != 12) {
+                wayland_clipboard_state_fail(state, WaylandClipboardError.MalformedFrame);
+                return wayland_clipboard_empty_dispatch(WaylandClipboardError.MalformedFrame);
+            }
+            let object_id: t27 = wire_read_u32_le(input, frame.payload_offset);
+            let out: WaylandClipboardDispatch = wayland_clipboard_empty_dispatch(
+                WaylandClipboardError.None);
+            if (object_id == 0) {
+                if (state.*.pending_offer.valid != 0) {
+                    let _retired_unselected: WaylandClipboardIdentity =
+                        wayland_clipboard_retire_offer(state,
+                            state.*.pending_offer);
+                    state.*.pending_offer = wayland_clipboard_bad_identity();
+                }
+                if (state.*.current_offer.valid != 0) {
+                    out.replaced = wayland_clipboard_retire_offer(
+                        state, state.*.current_offer);
+                }
+                state.*.current_offer = wayland_clipboard_bad_identity();
+                out.kind = WaylandClipboardEventKind.SelectionCleared;
+                out.valid = 1; return out;
+            }
+            let index: i32 = wayland_clipboard_offer_index(state, object_id);
+            if (index < 0 || state.*.pending_offer.valid == 0
+                || wayland_clipboard_identity_equal(state.*.pending_offer,
+                    state.*.offers.data[index].identity) == 0
+                || state.*.offers.data[index].retired != 0
+                || state.*.offers.data[index].selected != 0) {
+                wayland_clipboard_state_fail(state, WaylandClipboardError.InvalidSelection);
+                return wayland_clipboard_empty_dispatch(WaylandClipboardError.InvalidSelection);
+            }
+            if (state.*.current_offer.valid != 0) {
+                out.replaced = wayland_clipboard_retire_offer(
+                    state, state.*.current_offer);
+            }
+            state.*.offers.data[index].selected = 1;
+            state.*.current_offer = state.*.offers.data[index].identity;
+            state.*.pending_offer = wayland_clipboard_bad_identity();
+            out.kind = WaylandClipboardEventKind.SelectionSet;
+            out.identity = state.*.current_offer;
+            out.authoritative = state.*.offers.data[index].authoritative;
+            out.valid = 1; return out;
+        }
+        wayland_clipboard_state_fail(state, WaylandClipboardError.InvalidOpcode);
+        return wayland_clipboard_empty_dispatch(WaylandClipboardError.InvalidOpcode);
+    }
+
+    let offer_index: i32 = wayland_clipboard_offer_index(state, frame.object_id);
+    if (offer_index >= 0) {
+        if (received_fd >= 0 || fd_count != 0 || ancillary_valid == 0) {
+            wayland_clipboard_close_received(received_fd);
+            wayland_clipboard_state_fail(state, WaylandClipboardError.UnexpectedFd);
+            return wayland_clipboard_empty_dispatch(WaylandClipboardError.UnexpectedFd);
+        }
+        if (frame.opcode != 0) {
+            wayland_clipboard_state_fail(state, WaylandClipboardError.InvalidOpcode);
+            return wayland_clipboard_empty_dispatch(WaylandClipboardError.InvalidOpcode);
+        }
+        if (state.*.pending_offer.valid == 0
+            || wayland_clipboard_identity_equal(state.*.pending_offer,
+                state.*.offers.data[offer_index].identity) == 0) {
+            wayland_clipboard_state_fail(state, WaylandClipboardError.MalformedFrame);
+            return wayland_clipboard_empty_dispatch(WaylandClipboardError.MalformedFrame);
+        }
+        let mime: WireString = wayland_clipboard_string_payload(input, frame);
+        if (mime.valid == 0) {
+            wayland_clipboard_state_fail(state, WaylandClipboardError.InvalidMime);
+            return wayland_clipboard_empty_dispatch(WaylandClipboardError.InvalidMime);
+        }
+        let mime_error: WaylandClipboardError = wayland_clipboard_add_offer_mime(
+            &state.*.offers.data[offer_index], mime.value);
+        if (mime_error != WaylandClipboardError.None) {
+            wayland_clipboard_state_fail(state, mime_error);
+            return wayland_clipboard_empty_dispatch(mime_error);
+        }
+        let out: WaylandClipboardDispatch = wayland_clipboard_empty_dispatch(
+            WaylandClipboardError.None);
+        out.kind = WaylandClipboardEventKind.MimeOffered;
+        out.identity = state.*.offers.data[offer_index].identity;
+        out.valid = 1; return out;
+    }
+
+    let source_index: i32 = wayland_clipboard_source_index(state, frame.object_id);
+    if (source_index >= 0) {
+        if (frame.opcode == 0) {
+            if (received_fd >= 0 || fd_count != 0 || ancillary_valid == 0) {
+                wayland_clipboard_close_received(received_fd);
+                wayland_clipboard_state_fail(state, WaylandClipboardError.UnexpectedFd);
+                return wayland_clipboard_empty_dispatch(WaylandClipboardError.UnexpectedFd);
+            }
+            let target: WireString = wayland_clipboard_nullable_string_payload(
+                input, frame);
+            if (target.valid == 0
+                || state.*.sources.data[source_index].cancelled != 0) {
+                wayland_clipboard_state_fail(state, WaylandClipboardError.MalformedFrame);
+                return wayland_clipboard_empty_dispatch(WaylandClipboardError.MalformedFrame);
+            }
+            let out: WaylandClipboardDispatch = wayland_clipboard_empty_dispatch(
+                WaylandClipboardError.None);
+            out.kind = WaylandClipboardEventKind.SourceTargetIgnored;
+            out.identity = state.*.sources.data[source_index].identity;
+            out.valid = 1; return out;
+        }
+        if (frame.opcode == 1) {
+            if (fd_count != 1 || received_fd < 0 || ancillary_valid == 0) {
+                wayland_clipboard_close_received(received_fd);
+                let error: WaylandClipboardError = WaylandClipboardError.MissingFd;
+                if (fd_count > 1 || ancillary_valid == 0) {
+                    error = WaylandClipboardError.UnexpectedFd;
+                }
+                wayland_clipboard_state_fail(state, error);
+                return wayland_clipboard_empty_dispatch(error);
+            }
+            let mime: WireString = wayland_clipboard_string_payload(input, frame);
+            if (mime.valid == 0
+                || wayland_clipboard_mime_authoritative(mime.value) == 0) {
+                wayland_clipboard_close_received(received_fd);
+                wayland_clipboard_state_fail(state, WaylandClipboardError.InvalidMime);
+                return wayland_clipboard_empty_dispatch(WaylandClipboardError.InvalidMime);
+            }
+            if (state.*.sources.data[source_index].authoritative_offered == 0
+                || state.*.sources.data[source_index].used == 0
+                || state.*.sources.data[source_index].cancelled != 0) {
+                wayland_clipboard_close_received(received_fd);
+                wayland_clipboard_state_fail(state, WaylandClipboardError.InvalidState);
+                return wayland_clipboard_empty_dispatch(WaylandClipboardError.InvalidState);
+            }
+            let access_mode: i64 = wayland_clipboard_fd_access_mode(received_fd);
+            if (wayland_clipboard_fd_cloexec(received_fd) == 0
+                || (access_mode != linux_o_write_only()
+                    && access_mode != linux_o_read_write())) {
+                wayland_clipboard_close_received(received_fd);
+                wayland_clipboard_state_fail(state, WaylandClipboardError.InvalidFd);
+                return wayland_clipboard_empty_dispatch(WaylandClipboardError.InvalidFd);
+            }
+            let out: WaylandClipboardDispatch = wayland_clipboard_empty_dispatch(
+                WaylandClipboardError.None);
+            out.kind = WaylandClipboardEventKind.SourceSend;
+            out.identity = state.*.sources.data[source_index].identity;
+            out.transfer_fd = received_fd; out.authoritative = 1;
+            out.valid = 1; return out;
+        }
+        if (frame.opcode == 2) {
+            if (received_fd >= 0 || fd_count != 0 || ancillary_valid == 0) {
+                wayland_clipboard_close_received(received_fd);
+                wayland_clipboard_state_fail(state, WaylandClipboardError.UnexpectedFd);
+                return wayland_clipboard_empty_dispatch(WaylandClipboardError.UnexpectedFd);
+            }
+            if (wayland_clipboard_frame_exact(input, frame, frame.object_id, 2) == 0
+                || frame.size != 8 || state.*.sources.data[source_index].used == 0
+                || state.*.sources.data[source_index].cancelled != 0) {
+                wayland_clipboard_state_fail(state, WaylandClipboardError.MalformedFrame);
+                return wayland_clipboard_empty_dispatch(WaylandClipboardError.MalformedFrame);
+            }
+            state.*.sources.data[source_index].cancelled = 1;
+            state.*.sources.data[source_index].selected = 0;
+            if (wayland_clipboard_identity_equal(state.*.current_source,
+                state.*.sources.data[source_index].identity) != 0) {
+                state.*.current_source = wayland_clipboard_bad_identity();
+            }
+            let out: WaylandClipboardDispatch = wayland_clipboard_empty_dispatch(
+                WaylandClipboardError.None);
+            out.kind = WaylandClipboardEventKind.SourceCancelled;
+            out.identity = state.*.sources.data[source_index].identity;
+            out.valid = 1; return out;
+        }
+        wayland_clipboard_close_received(received_fd);
+        wayland_clipboard_state_fail(state, WaylandClipboardError.InvalidOpcode);
+        return wayland_clipboard_empty_dispatch(WaylandClipboardError.InvalidOpcode);
+    }
+
+    wayland_clipboard_close_received(received_fd);
+    wayland_clipboard_state_fail(state, WaylandClipboardError.InvalidIdentity);
+    return wayland_clipboard_empty_dispatch(WaylandClipboardError.InvalidIdentity);
+}
+
+fn wayland_clipboard_failed_receive_request(error: WaylandClipboardError)
+    WaylandClipboardReceiveRequest {
+    let cause: WaylandClipboardError = error;
+    if (cause == WaylandClipboardError.None) {
+        cause = WaylandClipboardError.InvalidArgument;
+    }
+    let request: WireBuffer = wire_new(0); request.error = 1;
+    return WaylandClipboardReceiveRequest{ .request = request,
+        .identity = wayland_clipboard_bad_identity(), .read_fd = 0 - 1,
+        .write_fd = 0 - 1, .error = cause, .valid = 0 };
+}
+
+// An inert/default request has no state authority, so InvalidState is its
+// truthful construction cause rather than an ambiguous successful status.
+fn wayland_clipboard_empty_receive_request() WaylandClipboardReceiveRequest {
+    return wayland_clipboard_failed_receive_request(
+        WaylandClipboardError.InvalidState);
+}
+
+fn wayland_clipboard_receive_preflight_error(state: *WaylandClipboardState,
+    identity: WaylandClipboardIdentity) WaylandClipboardError {
+    if (state.*.valid == 0 || state.*.terminal != 0) {
+        return WaylandClipboardError.InvalidState;
+    }
+    if (identity.valid == 0
+        || wayland_clipboard_object_id_valid(identity.object_id) == 0
+        || identity.generation < 1) {
+        return WaylandClipboardError.InvalidIdentity;
+    }
+    let object_index: i32 = wayland_clipboard_offer_index(
+        state, identity.object_id);
+    if (object_index < 0) { return WaylandClipboardError.InvalidIdentity; }
+    if (state.*.offers.data[object_index].identity.generation
+        != identity.generation) {
+        return WaylandClipboardError.StaleIdentity;
+    }
+    if (wayland_clipboard_identity_equal(state.*.current_offer, identity) == 0
+        || state.*.offers.data[object_index].selected == 0
+        || state.*.offers.data[object_index].retired != 0) {
+        return WaylandClipboardError.InvalidSelection;
+    }
+    if (state.*.offers.data[object_index].authoritative == 0) {
+        return WaylandClipboardError.InvalidMime;
+    }
+    return WaylandClipboardError.None;
+}
+
+fn wayland_clipboard_close_pipe_pair(pipe: *LinuxFdPair) void {
+    if (pipe.*.first >= 0) {
+        let _close_read: i64 = linux_close(pipe.*.first);
+        pipe.*.first = 0 - 1;
+    }
+    if (pipe.*.second >= 0) {
+        let _close_write: i64 = linux_close(pipe.*.second);
+        pipe.*.second = 0 - 1;
+    }
+    pipe.*.ok = 0;
+}
+
+// Owning construction seam shared by production and deterministic failure
+// tests. It consumes request and both pipe endpoints on every return path.
+fn wayland_clipboard_finish_receive_request(identity: WaylandClipboardIdentity,
+    pipe: LinuxFdPair, request: WireBuffer) WaylandClipboardReceiveRequest {
+    if (pipe.ok == 0 || pipe.first < 0 || pipe.second < 0) {
+        wayland_clipboard_close_pipe_pair(&pipe); wire_free(&request);
+        return wayland_clipboard_failed_receive_request(
+            WaylandClipboardError.TransferFailed);
+    }
+    if (request.error != 0 || len[u8](request.bytes) == 0) {
+        wayland_clipboard_close_pipe_pair(&pipe); wire_free(&request);
+        return wayland_clipboard_failed_receive_request(
+            WaylandClipboardError.TransferFailed);
+    }
+    return WaylandClipboardReceiveRequest{ .request = request,
+        .identity = identity, .read_fd = pipe.first, .write_fd = pipe.second,
+        .error = WaylandClipboardError.None, .valid = 1 };
+}
+
+// Internal pipe factory seam. Production passes linux_pipe_cloexec(); tests may
+// pass its exact failed result to exercise TransferFailed without fabricating a
+// different status mapping.
+fn wayland_clipboard_begin_receive_with_pipe(state: *WaylandClipboardState,
+    identity: WaylandClipboardIdentity,
+    pipe: LinuxFdPair) WaylandClipboardReceiveRequest {
+    let preflight: WaylandClipboardError =
+        wayland_clipboard_receive_preflight_error(state, identity);
+    if (preflight != WaylandClipboardError.None) {
+        wayland_clipboard_close_pipe_pair(&pipe);
+        return wayland_clipboard_failed_receive_request(preflight);
+    }
+    let request: WireBuffer = wire_new(0);
+    if (pipe.ok != 0) {
+        wire_free(&request);
+        request = wayland_clipboard_offer_receive_request(
+            identity.object_id, wayland_clipboard_text_mime());
+    }
+    return wayland_clipboard_finish_receive_request(identity, pipe, request);
+}
+
+fn wayland_clipboard_begin_receive(state: *WaylandClipboardState,
+    identity: WaylandClipboardIdentity) WaylandClipboardReceiveRequest {
+    let preflight: WaylandClipboardError =
+        wayland_clipboard_receive_preflight_error(state, identity);
+    if (preflight != WaylandClipboardError.None) {
+        return wayland_clipboard_failed_receive_request(preflight);
+    }
+    let pipe: LinuxFdPair = linux_pipe_cloexec();
+    return wayland_clipboard_begin_receive_with_pipe(state, identity, pipe);
+}
+
+fn wayland_clipboard_receive_request_mark_sent(
+    transfer: *WaylandClipboardReceiveRequest, sent: i32) i32 {
+    if (transfer.*.valid == 0 || transfer.*.write_fd < 0) { return 0; }
+    let write_closed: i64 = linux_close(transfer.*.write_fd);
+    transfer.*.write_fd = 0 - 1;
+    wire_free(&transfer.*.request);
+    if (sent == 0 || write_closed != 0) {
+        if (transfer.*.read_fd >= 0) {
+            let _close_failed_read: i64 = linux_close(transfer.*.read_fd);
+            transfer.*.read_fd = 0 - 1;
+        }
+        transfer.*.valid = 0; return 0;
+    }
+    return 1;
+}
+
+// Move the request bytes to an owning transport while retaining both pipe
+// endpoints in the transfer. The transport may free the returned wire; the
+// later mark_sent call then closes the local writer and frees only this
+// allocation-free sentinel. Repeated/invalid takes return the same sentinel.
+fn wayland_clipboard_receive_request_take_wire(
+    transfer: *WaylandClipboardReceiveRequest) WireBuffer {
+    let bad: WireBuffer = wire_new(0); bad.error = 1;
+    if (transfer.*.valid == 0 || transfer.*.write_fd < 0
+        || transfer.*.request.error != 0
+        || len[u8](transfer.*.request.bytes) == 0) { return bad; }
+    let out: WireBuffer = transfer.*.request;
+    transfer.*.request = wire_new(0);
+    return out;
+}
+
+fn wayland_clipboard_receive_request_take_read_fd(
+    transfer: *WaylandClipboardReceiveRequest) i64 {
+    if (transfer.*.valid == 0 || transfer.*.write_fd >= 0
+        || transfer.*.read_fd < 0) { return 0 - 1; }
+    let fd: i64 = transfer.*.read_fd;
+    transfer.*.read_fd = 0 - 1; transfer.*.valid = 0; return fd;
+}
+
+fn wayland_clipboard_receive_request_abort(
+    transfer: *WaylandClipboardReceiveRequest) i32 {
+    let ok: i32 = 1;
+    if (transfer.*.read_fd >= 0) {
+        if (linux_close(transfer.*.read_fd) != 0) { ok = 0; }
+        transfer.*.read_fd = 0 - 1;
+    }
+    if (transfer.*.write_fd >= 0) {
+        if (linux_close(transfer.*.write_fd) != 0) { ok = 0; }
+        transfer.*.write_fd = 0 - 1;
+    }
+    wire_free(&transfer.*.request); transfer.*.valid = 0; return ok;
+}
+
+fn wayland_clipboard_bad_text(error: WaylandClipboardError)
+    WaylandClipboardTextResult {
+    return WaylandClipboardTextResult{
+        .bytes = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 },
+        .error = error, .valid = 0 };
+}
+
+fn wayland_clipboard_text_result_free(result: *WaylandClipboardTextResult) void {
+    if (result.*.bytes.cap > 0) { free[u8](&result.*.bytes); }
+    result.*.bytes = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 };
+    result.*.valid = 0;
+}
+
+// Takes read_fd on every path. The runtime performs exact-progress nonblocking
+// reads against one absolute deadline, restores status flags, and preserves a
+// bounded prefix when it proves TooLarge. Flashy returns content only after an
+// exact EOF and UTF-8 validation; the kernel descriptor never enters UI state.
+fn wayland_clipboard_read_text_fd(read_fd: i64, maximum_bytes: t27,
+    deadline: i64) WaylandClipboardTextResult {
+    let result: WaylandClipboardTextResult = wayland_clipboard_bad_text(
+        WaylandClipboardError.TransferFailed);
+    if (maximum_bytes < 0
+        || maximum_bytes > wayland_clipboard_max_transfer_bytes()) {
+        let limit_close: i64 = 0;
+        if (read_fd >= 0) { limit_close = linux_close(read_fd); }
+        if (limit_close != 0) {
+            result.error = WaylandClipboardError.TransferFailed;
+        } else if (maximum_bytes > wayland_clipboard_max_transfer_bytes()) {
+            result.error = WaylandClipboardError.TooLarge;
+        } else { result.error = WaylandClipboardError.InvalidArgument; }
+        return result;
+    }
+    if (read_fd < 0 || wayland_clipboard_fd_cloexec(read_fd) == 0
+        || wayland_clipboard_fd_access_mode(read_fd) != linux_o_read_only()) {
+        let invalid_close: i64 = 0;
+        if (read_fd >= 0) { invalid_close = linux_close(read_fd); }
+        if (invalid_close != 0) {
+            result.error = WaylandClipboardError.TransferFailed;
+        } else { result.error = WaylandClipboardError.InvalidFd; }
+        return result;
+    }
+
+    let native: LinuxReadAllResult = linux_pipe_read_all_until(
+        read_fd, maximum_bytes as i64, deadline);
+    let close_error: i64 = linux_close(read_fd);
+    if (close_error != 0) {
+        result.error = WaylandClipboardError.TransferFailed;
+    } else if (native.too_large != 0 || native.error_code == (0 - 27)) {
+        result.error = WaylandClipboardError.TooLarge;
+    } else if (native.error_code == (0 - 110)) {
+        result.error = WaylandClipboardError.Timeout;
+    } else if (native.error_code != 0 || native.cleanup_error_code != 0
+        || native.complete == 0 || native.eof == 0) {
+        result.error = WaylandClipboardError.TransferFailed;
+    } else {
+        result.bytes = make[u8](native.read as i32);
+        let i: i32 = 0;
+        while (i < native.data.len) {
+            push[u8](&result.bytes, linux_buffer_byte(&native.data, i) as u8);
+            i = i + 1;
+        }
+        if (utf8_validate(result.bytes.data[0..len[u8](result.bytes)]).valid == 0) {
+            result.error = WaylandClipboardError.InvalidUtf8;
+        } else {
+            result.error = WaylandClipboardError.None; result.valid = 1;
+        }
+    }
+    linux_read_all_result_free(&native);
+    if (result.valid == 0 && result.bytes.cap > 0) {
+        free[u8](&result.bytes);
+        result.bytes = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 };
+    }
+    return result;
+}
+
+// Takes a SourceSend dispatch and its fd on every path. The immutable
+// generation identity remains in the dispatch for trace/job correlation, but
+// text bytes and the binary descriptor cross only this Linux wire boundary.
+fn wayland_clipboard_dispatch_write_text(
+    dispatch: *WaylandClipboardDispatch, value: []u8,
+    deadline: i64) WaylandClipboardError {
+    let error: WaylandClipboardError = WaylandClipboardError.None;
+    let writable: i32 = 0;
+    if (dispatch.*.valid == 0
+        || dispatch.*.kind != WaylandClipboardEventKind.SourceSend
+        || dispatch.*.transfer_fd < 0) {
+        error = WaylandClipboardError.InvalidState;
+    } else if (value.len as t27 > wayland_clipboard_max_transfer_bytes()) {
+        error = WaylandClipboardError.TooLarge;
+    } else if (utf8_validate(value).valid == 0) {
+        error = WaylandClipboardError.InvalidUtf8;
+    } else {
+        let access_mode: i64 = wayland_clipboard_fd_access_mode(
+            dispatch.*.transfer_fd);
+        if (wayland_clipboard_fd_cloexec(dispatch.*.transfer_fd) == 0
+            || (access_mode != linux_o_write_only()
+                && access_mode != linux_o_read_write())) {
+            error = WaylandClipboardError.InvalidFd;
+        } else { writable = 1; }
+    }
+
+    if (writable != 0) {
+        let packed: LinuxByteBuffer = linux_buffer_new(value.len);
+        let i: i32 = 0;
+        while (i < value.len) {
+            linux_buffer_set_byte(&packed, i, value[i] as t9); i = i + 1;
+        }
+        let wrote: LinuxPipeWriteResult = linux_pipe_write_buffer_all_until(
+            dispatch.*.transfer_fd, &packed, deadline);
+        linux_buffer_free(&packed);
+        if (wrote.error_code == (0 - 110)) {
+            error = WaylandClipboardError.Timeout;
+        } else if (wrote.error_code != 0 || wrote.cleanup_error_code != 0
+            || wrote.complete == 0 || wrote.written != value.len as i64) {
+            error = WaylandClipboardError.TransferFailed;
+        }
+    }
+    if (wayland_clipboard_dispatch_close(dispatch) == 0) {
+        error = WaylandClipboardError.TransferFailed;
+    }
+    return error;
+}
+
+// Deterministic fake-compositor event constructors used by focused protocol
+// tests. They use the same core encoders as production requests.
+fn wayland_clipboard_data_offer_event(device_id: t27,
+    offer_id: t27) WireBuffer {
+    if (wayland_client_new_id_valid(device_id) == 0) {
+        return wayland_clipboard_bad_wire();
+    }
+    return wayland_server_new_id_event(device_id, 0, offer_id);
+}
+
+fn wayland_clipboard_offer_mime_event(offer_id: t27,
+    mime: []u8) WireBuffer {
+    if (wayland_server_new_id_valid(offer_id) == 0) {
+        return wayland_clipboard_bad_wire();
+    }
+    return wayland_string_request(offer_id, 0, mime);
+}
+
+fn wayland_clipboard_selection_event(device_id: t27,
+    offer_id: t27) WireBuffer {
+    if (wayland_client_new_id_valid(device_id) == 0
+        || (offer_id != 0 && wayland_server_new_id_valid(offer_id) == 0)) {
+        return wayland_clipboard_bad_wire();
+    }
+    return wayland_u32_request(device_id, 5, offer_id);
+}
+
+fn wayland_clipboard_drag_enter_event(device_id: t27, serial: t27,
+    surface_id: t27, x: t27, y: t27, offer_id: t27) WireBuffer {
+    if (wayland_client_new_id_valid(device_id) == 0
+        || wayland_client_new_id_valid(surface_id) == 0
+        || (offer_id != 0 && wayland_server_new_id_valid(offer_id) == 0)) {
+        return wayland_clipboard_bad_wire();
+    }
+    let payload: WireBuffer = wire_new(20);
+    wire_push_u32_le(&payload, serial); wire_push_u32_le(&payload, surface_id);
+    wire_push_i32_le(&payload, x); wire_push_i32_le(&payload, y);
+    wire_push_u32_le(&payload, offer_id);
+    let out: WireBuffer = wayland_encode(device_id, 1, &payload);
+    wire_free(&payload); return out;
+}
+
+fn wayland_clipboard_drag_leave_event(device_id: t27) WireBuffer {
+    if (wayland_client_new_id_valid(device_id) == 0) {
+        return wayland_clipboard_bad_wire();
+    }
+    return wayland_empty_request(device_id, 2);
+}
+
+fn wayland_clipboard_drag_motion_event(device_id: t27, time: t27,
+    x: t27, y: t27) WireBuffer {
+    if (wayland_client_new_id_valid(device_id) == 0) {
+        return wayland_clipboard_bad_wire();
+    }
+    let payload: WireBuffer = wire_new(12);
+    wire_push_u32_le(&payload, time); wire_push_i32_le(&payload, x);
+    wire_push_i32_le(&payload, y);
+    let out: WireBuffer = wayland_encode(device_id, 3, &payload);
+    wire_free(&payload); return out;
+}
+
+fn wayland_clipboard_drag_drop_event(device_id: t27) WireBuffer {
+    if (wayland_client_new_id_valid(device_id) == 0) {
+        return wayland_clipboard_bad_wire();
+    }
+    return wayland_empty_request(device_id, 4);
+}
+
+fn wayland_clipboard_source_target_event(source_id: t27,
+    mime: []u8) WireBuffer {
+    if (wayland_client_new_id_valid(source_id) == 0) {
+        return wayland_clipboard_bad_wire();
+    }
+    return wayland_string_request(source_id, 0, mime);
+}
+
+fn wayland_clipboard_source_target_none_event(source_id: t27) WireBuffer {
+    if (wayland_client_new_id_valid(source_id) == 0) {
+        return wayland_clipboard_bad_wire();
+    }
+    let payload: WireBuffer = wire_new(4); wire_push_u32_le(&payload, 0);
+    let out: WireBuffer = wayland_encode(source_id, 0, &payload);
+    wire_free(&payload); return out;
+}
+
+fn wayland_clipboard_source_send_event(source_id: t27,
+    mime: []u8) WireBuffer {
+    if (wayland_client_new_id_valid(source_id) == 0) {
+        return wayland_clipboard_bad_wire();
+    }
+    return wayland_string_request(source_id, 1, mime);
+}
+
+fn wayland_clipboard_source_cancelled_event(source_id: t27) WireBuffer {
+    if (wayland_client_new_id_valid(source_id) == 0) {
+        return wayland_clipboard_bad_wire();
+    }
+    return wayland_empty_request(source_id, 2);
+}

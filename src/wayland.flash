@@ -1,0 +1,612 @@
+// Wayland wire framing. Protocol object schemas are layered above this codec.
+
+struct WaylandFrame {
+    object_id: t27,
+    opcode: t27,
+    size: t27,
+    payload_offset: i32,
+    valid: i32,
+}
+
+struct WaylandGlobal {
+    name: t27,
+    interface: []u8,
+    interface_storage: ArrayList[u8],
+    version: t27,
+    valid: i32,
+}
+
+struct WaylandSeatCapabilities {
+    raw: t27,
+    pointer: i32,
+    keyboard: i32,
+    touch: i32,
+    valid: i32,
+}
+
+enum WaylandPointerEventKind { None, Enter, Leave, Motion, Button, Axis }
+
+// wl_seat is capped at version 3 so child release requests are available while
+// wl_keyboard.repeat_info (version 4) is neither advertised nor guessed here.
+enum WaylandKeyboardEventKind { None, Keymap, Enter, Leave, Key, Modifiers }
+enum WaylandKeyboardAuthorityKind { None, Map, Withdrawn, Rejected }
+
+struct WaylandKeyboardAuthorityUpdate {
+    kind: WaylandKeyboardAuthorityKind,
+    generation: t27,
+    keymap_format: t27,
+    keymap_size: t27,
+    keymap_bytes: ArrayList[u8],
+    valid: i32,
+}
+
+struct WaylandKeyboardEvent {
+    kind: WaylandKeyboardEventKind,
+    serial: t27,
+    time: t27,
+    surface_id: t27,
+    key: t27,
+    key_state: t27,
+    mods_depressed: t27,
+    mods_latched: t27,
+    mods_locked: t27,
+    group: t27,
+    keymap_format: t27,
+    keymap_size: t27,
+    pressed_keys: ArrayList[t27],
+    // Owned raw XKB bytes. Interpretation belongs to the shared keyboard
+    // parser; this protocol boundary only validates and transports them.
+    keymap_bytes: ArrayList[u8],
+    valid: i32,
+}
+
+struct WaylandPointerEvent {
+    kind: WaylandPointerEventKind,
+    serial: t27,
+    time: t27,
+    surface_id: t27,
+    x: t27,
+    y: t27,
+    button: t27,
+    button_state: t27,
+    axis: t27,
+    axis_value: t27,
+    valid: i32,
+}
+
+fn wayland_empty_pointer_event() WaylandPointerEvent {
+    return WaylandPointerEvent{ .kind = WaylandPointerEventKind.None, .serial = 0, .time = 0,
+        .surface_id = 0, .x = 0, .y = 0, .button = 0, .button_state = 0,
+        .axis = 0, .axis_value = 0, .valid = 0 };
+}
+
+fn wayland_keyboard_keymap_format_xkb_v1() t27 { return 1; }
+fn wayland_keyboard_keymap_max_size() t27 { return 1048576; }
+fn wayland_keyboard_max_pressed_keys() t27 { return 1024; }
+
+fn wayland_empty_keyboard_event() WaylandKeyboardEvent {
+    return WaylandKeyboardEvent{ .kind = WaylandKeyboardEventKind.None,
+        .serial = 0, .time = 0, .surface_id = 0, .key = 0, .key_state = 0,
+        .mods_depressed = 0, .mods_latched = 0, .mods_locked = 0, .group = 0,
+        .keymap_format = 0, .keymap_size = 0,
+        .pressed_keys = ArrayList[t27]{ .data = null as *t27, .len = 0, .cap = 0 },
+        .keymap_bytes = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 },
+        .valid = 0 };
+}
+
+fn wayland_keyboard_event_free(event: *WaylandKeyboardEvent) void {
+    if (event.*.pressed_keys.cap > 0) { free[t27](&event.*.pressed_keys); }
+    if (event.*.keymap_bytes.cap > 0) { free[u8](&event.*.keymap_bytes); }
+    event.*.pressed_keys = ArrayList[t27]{ .data = null as *t27, .len = 0, .cap = 0 };
+    event.*.keymap_bytes = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 };
+    event.*.valid = 0;
+}
+
+fn wayland_empty_keyboard_authority_update() WaylandKeyboardAuthorityUpdate {
+    return WaylandKeyboardAuthorityUpdate{ .kind = WaylandKeyboardAuthorityKind.None,
+        .generation = 0, .keymap_format = 0, .keymap_size = 0,
+        .keymap_bytes = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 },
+        .valid = 0 };
+}
+
+fn wayland_keyboard_authority_update_free(update: *WaylandKeyboardAuthorityUpdate) void {
+    if (update.*.keymap_bytes.cap > 0) { free[u8](&update.*.keymap_bytes); }
+    update.*.keymap_bytes = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 };
+    update.*.kind = WaylandKeyboardAuthorityKind.None; update.*.valid = 0;
+}
+
+fn wayland_encode(object_id: t27, opcode: t27, payload: *WireBuffer) WireBuffer {
+    let out: WireBuffer = wire_new(8 + len[u8](payload.*.bytes) + 3);
+    let payload_len: t27 = len[u8](payload.*.bytes) as t27;
+    let padded_size: t27 = 8 + ((payload_len + 3) / 4) * 4;
+    if (payload.*.error != 0 || object_id < 1 || opcode < 0 || opcode > 65535 || padded_size > 65535) {
+        out.error = 1; return out;
+    }
+    wire_push_u32_le(&out, object_id);
+    wire_push_u32_le(&out, opcode + padded_size * 65536);
+    wire_append(&out, payload);
+    wire_pad4(&out);
+    return out;
+}
+
+fn wayland_decode(input: *WireBuffer, offset: i32) WaylandFrame {
+    let bad: WaylandFrame = WaylandFrame{ .object_id = 0, .opcode = 0, .size = 0, .payload_offset = offset + 8, .valid = 0 };
+    if (offset < 0 || offset + 8 > len[u8](input.*.bytes)) { return bad; }
+    let object_id: t27 = wire_read_u32_le(input, offset);
+    let header: t27 = wire_read_u32_le(input, offset + 4);
+    let opcode: t27 = header % 65536;
+    let size: t27 = header / 65536;
+    if (object_id < 1 || size < 8 || (size % 4) != 0 || offset + (size as i32) > len[u8](input.*.bytes)) { return bad; }
+    return WaylandFrame{ .object_id = object_id, .opcode = opcode, .size = size, .payload_offset = offset + 8, .valid = 1 };
+}
+
+// Wayland splits object-ID authority by creator. Clients allocate densely in
+// the low range, excluding wl_display's reserved ID 1; server-created new_id
+// events occupy the high range. Ordinary object references are intentionally
+// validated by their owning protocol state rather than these creation helpers.
+fn wayland_client_new_id_min() t27 { return 2; }
+fn wayland_client_new_id_max() t27 { return 4278190079; } // 0xfeffffff
+fn wayland_server_new_id_min() t27 { return 4278190080; } // 0xff000000
+fn wayland_server_new_id_max() t27 { return 4294967295; }
+
+fn wayland_client_new_id_valid(value: t27) i32 {
+    if (value >= wayland_client_new_id_min()
+        && value <= wayland_client_new_id_max()) { return 1; }
+    return 0;
+}
+
+fn wayland_server_new_id_valid(value: t27) i32 {
+    if (value >= wayland_server_new_id_min()
+        && value <= wayland_server_new_id_max()) { return 1; }
+    return 0;
+}
+
+fn wayland_bad_new_id_frame() WireBuffer {
+    let out: WireBuffer = wire_new(1); out.error = 1; return out;
+}
+
+fn wayland_display_sync(callback_id: t27) WireBuffer {
+    if (wayland_client_new_id_valid(callback_id) == 0) {
+        return wayland_bad_new_id_frame();
+    }
+    let payload: WireBuffer = wire_new(4);
+    wire_push_u32_le(&payload, callback_id);
+    let out: WireBuffer = wayland_encode(1, 0, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_display_get_registry(registry_id: t27) WireBuffer {
+    if (wayland_client_new_id_valid(registry_id) == 0) {
+        return wayland_bad_new_id_frame();
+    }
+    let payload: WireBuffer = wire_new(4);
+    wire_push_u32_le(&payload, registry_id);
+    let out: WireBuffer = wayland_encode(1, 1, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_callback_done(callback_id: t27, callback_data: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(4);
+    wire_push_u32_le(&payload, callback_data);
+    let out: WireBuffer = wayland_encode(callback_id, 0, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_registry_bind(registry_id: t27, name: t27, interface: []u8, version: t27, new_id: t27) WireBuffer {
+    if (wayland_client_new_id_valid(new_id) == 0) {
+        return wayland_bad_new_id_frame();
+    }
+    let payload: WireBuffer = wire_new(20 + interface.len);
+    wire_push_u32_le(&payload, name); wire_push_string(&payload, interface);
+    wire_push_u32_le(&payload, version); wire_push_u32_le(&payload, new_id);
+    let out: WireBuffer = wayland_encode(registry_id, 0, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_new_id_request(object_id: t27, opcode: t27, new_id: t27) WireBuffer {
+    if (wayland_client_new_id_valid(new_id) == 0) {
+        return wayland_bad_new_id_frame();
+    }
+    let payload: WireBuffer = wire_new(4);
+    wire_push_u32_le(&payload, new_id);
+    let out: WireBuffer = wayland_encode(object_id, opcode, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_server_new_id_event(object_id: t27, opcode: t27,
+    new_id: t27) WireBuffer {
+    if (wayland_server_new_id_valid(new_id) == 0) {
+        return wayland_bad_new_id_frame();
+    }
+    let payload: WireBuffer = wire_new(4);
+    wire_push_u32_le(&payload, new_id);
+    let out: WireBuffer = wayland_encode(object_id, opcode, &payload);
+    wire_free(&payload); return out;
+}
+
+fn wayland_seat_get_pointer(seat_id: t27, pointer_id: t27) WireBuffer {
+    return wayland_new_id_request(seat_id, 0, pointer_id);
+}
+
+fn wayland_seat_get_keyboard(seat_id: t27, keyboard_id: t27) WireBuffer {
+    return wayland_new_id_request(seat_id, 1, keyboard_id);
+}
+
+fn wayland_xdg_get_surface(wm_base_id: t27, xdg_surface_id: t27, surface_id: t27) WireBuffer {
+    if (wayland_client_new_id_valid(xdg_surface_id) == 0) {
+        return wayland_bad_new_id_frame();
+    }
+    let payload: WireBuffer = wire_new(8);
+    wire_push_u32_le(&payload, xdg_surface_id); wire_push_u32_le(&payload, surface_id);
+    let out: WireBuffer = wayland_encode(wm_base_id, 2, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_string_request(object_id: t27, opcode: t27, value: []u8) WireBuffer {
+    let payload: WireBuffer = wire_new(8 + value.len);
+    wire_push_string(&payload, value);
+    let out: WireBuffer = wayland_encode(object_id, opcode, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_u32_request(object_id: t27, opcode: t27, value: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(4);
+    wire_push_u32_le(&payload, value);
+    let out: WireBuffer = wayland_encode(object_id, opcode, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_empty_request(object_id: t27, opcode: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(1);
+    let out: WireBuffer = wayland_encode(object_id, opcode, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_xdg_surface_configure(xdg_surface_id: t27, serial: t27) WireBuffer {
+    return wayland_u32_request(xdg_surface_id, 0, serial);
+}
+
+fn wayland_xdg_toplevel_configure(toplevel_id: t27, width: t27, height: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(12);
+    wire_push_u32_le(&payload, width); wire_push_u32_le(&payload, height); wire_push_u32_le(&payload, 0);
+    let out: WireBuffer = wayland_encode(toplevel_id, 0, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_shm_create_pool(shm_id: t27, pool_id: t27, size: t27) WireBuffer {
+    if (wayland_client_new_id_valid(pool_id) == 0) {
+        return wayland_bad_new_id_frame();
+    }
+    let payload: WireBuffer = wire_new(8);
+    wire_push_u32_le(&payload, pool_id); wire_push_u32_le(&payload, size);
+    let out: WireBuffer = wayland_encode(shm_id, 0, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_shm_pool_create_buffer(pool_id: t27, buffer_id: t27, width: t27, height: t27, stride: t27) WireBuffer {
+    if (wayland_client_new_id_valid(buffer_id) == 0) {
+        return wayland_bad_new_id_frame();
+    }
+    let payload: WireBuffer = wire_new(24);
+    wire_push_u32_le(&payload, buffer_id); wire_push_u32_le(&payload, 0);
+    wire_push_u32_le(&payload, width); wire_push_u32_le(&payload, height);
+    wire_push_u32_le(&payload, stride); wire_push_u32_le(&payload, 1); // WL_SHM_FORMAT_XRGB8888
+    let out: WireBuffer = wayland_encode(pool_id, 0, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_surface_attach(surface_id: t27, buffer_id: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(12);
+    wire_push_u32_le(&payload, buffer_id); wire_push_u32_le(&payload, 0); wire_push_u32_le(&payload, 0);
+    let out: WireBuffer = wayland_encode(surface_id, 1, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_surface_damage_buffer(surface_id: t27, width: t27, height: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(16);
+    wire_push_u32_le(&payload, 0); wire_push_u32_le(&payload, 0);
+    wire_push_u32_le(&payload, width); wire_push_u32_le(&payload, height);
+    let out: WireBuffer = wayland_encode(surface_id, 9, &payload); wire_free(&payload); return out;
+}
+
+// wl_surface.damage is available from version 1. Presentation uses this exact
+// rectangle request when wl_surface.damage_buffer (version 4, opcode 9) is not
+// available on the bound compositor version.
+fn wayland_surface_damage(surface_id: t27, width: t27, height: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(16);
+    wire_push_i32_le(&payload, 0); wire_push_i32_le(&payload, 0);
+    wire_push_i32_le(&payload, width); wire_push_i32_le(&payload, height);
+    let out: WireBuffer = wayland_encode(surface_id, 2, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_registry_global(registry_id: t27, name: t27, interface: []u8, version: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(32 + interface.len);
+    wire_push_u32_le(&payload, name);
+    wire_push_string(&payload, interface);
+    wire_push_u32_le(&payload, version);
+    let out: WireBuffer = wayland_encode(registry_id, 0, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_decode_global(input: *WireBuffer, frame: WaylandFrame, registry_id: t27) WaylandGlobal {
+    let bad: WaylandGlobal = WaylandGlobal{ .name = 0, .interface = "",
+        .interface_storage = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 },
+        .version = 0, .valid = 0 };
+    if (frame.valid == 0 || frame.object_id != registry_id || frame.opcode != 0) { return bad; }
+    let end: i32 = (frame.payload_offset as t27 + frame.size - 8) as i32;
+    if (frame.payload_offset + 8 > end) { return bad; }
+    let name: t27 = wire_read_u32_le(input, frame.payload_offset);
+    let iface: WireString = wire_read_string(input, frame.payload_offset + 4, end);
+    if (iface.valid == 0 || iface.next_offset + 4 != end) { return bad; }
+    let version: t27 = wire_read_u32_le(input, iface.next_offset);
+    return WaylandGlobal{ .name = name, .interface = iface.value,
+        .interface_storage = ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 },
+        .version = version, .valid = 1 };
+}
+
+fn wayland_decode_seat_capabilities(input: *WireBuffer, frame: WaylandFrame, seat_id: t27) WaylandSeatCapabilities {
+    let bad: WaylandSeatCapabilities = WaylandSeatCapabilities{
+        .raw = 0, .pointer = 0, .keyboard = 0, .touch = 0, .valid = 0 };
+    if (input.*.error != 0 || frame.valid == 0 || frame.object_id != seat_id
+        || frame.opcode != 0 || frame.size != 12
+        || frame.payload_offset < 0 || frame.payload_offset + 4 > len[u8](input.*.bytes)) { return bad; }
+    let raw: t27 = wire_read_u32_le(input, frame.payload_offset);
+    if (input.*.error != 0) { return bad; }
+    return WaylandSeatCapabilities{ .raw = raw, .pointer = (raw % 2) as i32,
+        .keyboard = ((raw / 2) % 2) as i32, .touch = ((raw / 4) % 2) as i32, .valid = 1 };
+}
+
+fn wayland_seat_name_max_bytes() t27 { return 256; }
+
+// wl_seat.name is emitted for bindings at version 2 and newer. The value is
+// informational in this slice, but its exact bounded string schema must still
+// be accepted so a compliant v3 compositor cannot be mistaken for a corrupt
+// peer. The returned slice never escapes the input frame.
+fn wayland_seat_name_event_valid(input: *WireBuffer, frame: WaylandFrame,
+    seat_id: t27) i32 {
+    if (input.*.error != 0 || frame.valid == 0 || frame.object_id != seat_id
+        || frame.opcode != 1 || frame.size < 12 || frame.payload_offset < 0) {
+        return 0;
+    }
+    let end: i32 = frame.payload_offset + (frame.size - 8) as i32;
+    if (end > len[u8](input.*.bytes)) { return 0; }
+    let name: WireString = wire_read_string(input, frame.payload_offset, end);
+    if (input.*.error != 0 || name.valid == 0 || name.next_offset != end
+        || name.value.len as t27 > wayland_seat_name_max_bytes()) { return 0; }
+    return 1;
+}
+
+fn wayland_seat_event_valid(input: *WireBuffer, frame: WaylandFrame,
+    seat_id: t27) i32 {
+    if (frame.opcode == 0) {
+        let capabilities: WaylandSeatCapabilities =
+            wayland_decode_seat_capabilities(input, frame, seat_id);
+        return capabilities.valid;
+    }
+    if (frame.opcode == 1) {
+        return wayland_seat_name_event_valid(input, frame, seat_id);
+    }
+    return 0;
+}
+
+fn wayland_decode_pointer_event(input: *WireBuffer, frame: WaylandFrame, pointer_id: t27) WaylandPointerEvent {
+    let event: WaylandPointerEvent = wayland_empty_pointer_event();
+    if (input.*.error != 0 || frame.valid == 0 || frame.object_id != pointer_id
+        || frame.payload_offset < 0) { return event; }
+    let offset: i32 = frame.payload_offset;
+    if (frame.opcode == 0) {
+        if (frame.size != 24 || offset + 16 > len[u8](input.*.bytes)) { return event; }
+        event.kind = WaylandPointerEventKind.Enter;
+        event.serial = wire_read_u32_le(input, offset);
+        event.surface_id = wire_read_u32_le(input, offset + 4);
+        event.x = wire_read_wayland_fixed(input, offset + 8);
+        event.y = wire_read_wayland_fixed(input, offset + 12);
+        if (event.surface_id < 1) { return wayland_empty_pointer_event(); }
+    } else if (frame.opcode == 1) {
+        if (frame.size != 16 || offset + 8 > len[u8](input.*.bytes)) { return event; }
+        event.kind = WaylandPointerEventKind.Leave;
+        event.serial = wire_read_u32_le(input, offset);
+        event.surface_id = wire_read_u32_le(input, offset + 4);
+        if (event.surface_id < 1) { return wayland_empty_pointer_event(); }
+    } else if (frame.opcode == 2) {
+        if (frame.size != 20 || offset + 12 > len[u8](input.*.bytes)) { return event; }
+        event.kind = WaylandPointerEventKind.Motion;
+        event.time = wire_read_u32_le(input, offset);
+        event.x = wire_read_wayland_fixed(input, offset + 4);
+        event.y = wire_read_wayland_fixed(input, offset + 8);
+    } else if (frame.opcode == 3) {
+        if (frame.size != 24 || offset + 16 > len[u8](input.*.bytes)) { return event; }
+        event.kind = WaylandPointerEventKind.Button;
+        event.serial = wire_read_u32_le(input, offset);
+        event.time = wire_read_u32_le(input, offset + 4);
+        event.button = wire_read_u32_le(input, offset + 8);
+        event.button_state = wire_read_u32_le(input, offset + 12);
+        if (event.button_state != 0 && event.button_state != 1) { return wayland_empty_pointer_event(); }
+    } else if (frame.opcode == 4) {
+        if (frame.size != 20 || offset + 12 > len[u8](input.*.bytes)) { return event; }
+        event.kind = WaylandPointerEventKind.Axis;
+        event.time = wire_read_u32_le(input, offset);
+        event.axis = wire_read_u32_le(input, offset + 4);
+        event.axis_value = wire_read_wayland_fixed(input, offset + 8);
+        if (event.axis != 0 && event.axis != 1) { return wayland_empty_pointer_event(); }
+    } else { return event; }
+    if (input.*.error != 0) { return wayland_empty_pointer_event(); }
+    event.valid = 1;
+    return event;
+}
+
+fn wayland_keyboard_key_present(keys: *ArrayList[t27], key: t27) i32 {
+    let i: i32 = 0;
+    while (i < len[t27](keys.*)) {
+        if (get[t27](keys.*, i) == key) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Decode the byte-bearing portion of a wl_keyboard v1 event. The keymap file
+// descriptor is ancillary Unix state, so its ownership is validated and
+// consumed by wayland_process_keyboard_frame in the native transport layer.
+fn wayland_decode_keyboard_event(input: *WireBuffer, frame: WaylandFrame,
+    keyboard_id: t27) WaylandKeyboardEvent {
+    let event: WaylandKeyboardEvent = wayland_empty_keyboard_event();
+    if (input.*.error != 0 || frame.valid == 0 || frame.object_id != keyboard_id
+        || frame.payload_offset < 0) { return event; }
+    let offset: i32 = frame.payload_offset;
+    if (frame.opcode == 0) {
+        if (frame.size != 16 || offset + 8 > len[u8](input.*.bytes)) { return event; }
+        event.kind = WaylandKeyboardEventKind.Keymap;
+        event.keymap_format = wire_read_u32_le(input, offset);
+        event.keymap_size = wire_read_u32_le(input, offset + 4);
+        if ((event.keymap_format == 0 && event.keymap_size != 0)
+            || (event.keymap_format == wayland_keyboard_keymap_format_xkb_v1()
+                && (event.keymap_size < 1
+                    || event.keymap_size > wayland_keyboard_keymap_max_size()))
+            || (event.keymap_format != 0
+                && event.keymap_format != wayland_keyboard_keymap_format_xkb_v1())) {
+            return wayland_empty_keyboard_event();
+        }
+    } else if (frame.opcode == 1) {
+        if (frame.size < 20 || offset + 12 > len[u8](input.*.bytes)) { return event; }
+        let key_bytes: t27 = wire_read_u32_le(input, offset + 8);
+        if ((key_bytes % 4) != 0 || key_bytes / 4 > wayland_keyboard_max_pressed_keys()) {
+            return event;
+        }
+        let padded_key_bytes: t27 = ((key_bytes + 3) / 4) * 4;
+        if (frame.size != 20 + padded_key_bytes
+            || offset + 12 + (padded_key_bytes as i32) > len[u8](input.*.bytes)) { return event; }
+        event.kind = WaylandKeyboardEventKind.Enter;
+        event.serial = wire_read_u32_le(input, offset);
+        event.surface_id = wire_read_u32_le(input, offset + 4);
+        if (event.surface_id < 1) { return wayland_empty_keyboard_event(); }
+        event.pressed_keys = make[t27]((key_bytes / 4) as i32);
+        let key_i: i32 = 0;
+        while (key_i < (key_bytes / 4) as i32) {
+            let key: t27 = wire_read_u32_le(input, offset + 12 + key_i * 4);
+            if (wayland_keyboard_key_present(&event.pressed_keys, key) == 1) {
+                wayland_keyboard_event_free(&event);
+                return wayland_empty_keyboard_event();
+            }
+            push[t27](&event.pressed_keys, key);
+            key_i = key_i + 1;
+        }
+    } else if (frame.opcode == 2) {
+        if (frame.size != 16 || offset + 8 > len[u8](input.*.bytes)) { return event; }
+        event.kind = WaylandKeyboardEventKind.Leave;
+        event.serial = wire_read_u32_le(input, offset);
+        event.surface_id = wire_read_u32_le(input, offset + 4);
+        if (event.surface_id < 1) { return wayland_empty_keyboard_event(); }
+    } else if (frame.opcode == 3) {
+        if (frame.size != 24 || offset + 16 > len[u8](input.*.bytes)) { return event; }
+        event.kind = WaylandKeyboardEventKind.Key;
+        event.serial = wire_read_u32_le(input, offset);
+        event.time = wire_read_u32_le(input, offset + 4);
+        event.key = wire_read_u32_le(input, offset + 8);
+        event.key_state = wire_read_u32_le(input, offset + 12);
+        if (event.key_state != 0 && event.key_state != 1) {
+            return wayland_empty_keyboard_event();
+        }
+    } else if (frame.opcode == 4) {
+        if (frame.size != 28 || offset + 20 > len[u8](input.*.bytes)) { return event; }
+        event.kind = WaylandKeyboardEventKind.Modifiers;
+        event.serial = wire_read_u32_le(input, offset);
+        event.mods_depressed = wire_read_u32_le(input, offset + 4);
+        event.mods_latched = wire_read_u32_le(input, offset + 8);
+        event.mods_locked = wire_read_u32_le(input, offset + 12);
+        event.group = wire_read_u32_le(input, offset + 16);
+    } else { return event; }
+    if (input.*.error != 0) {
+        wayland_keyboard_event_free(&event);
+        return wayland_empty_keyboard_event();
+    }
+    event.valid = 1;
+    return event;
+}
+
+fn wayland_seat_capabilities_event(seat_id: t27, capabilities: t27) WireBuffer {
+    return wayland_u32_request(seat_id, 0, capabilities);
+}
+
+fn wayland_seat_name_event(seat_id: t27, name: []u8) WireBuffer {
+    return wayland_string_request(seat_id, 1, name);
+}
+
+fn wayland_pointer_enter_event(pointer_id: t27, serial: t27, surface_id: t27, x: t27, y: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(16);
+    wire_push_u32_le(&payload, serial); wire_push_u32_le(&payload, surface_id);
+    wire_push_wayland_fixed(&payload, x); wire_push_wayland_fixed(&payload, y);
+    let out: WireBuffer = wayland_encode(pointer_id, 0, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_pointer_leave_event(pointer_id: t27, serial: t27, surface_id: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(8);
+    wire_push_u32_le(&payload, serial); wire_push_u32_le(&payload, surface_id);
+    let out: WireBuffer = wayland_encode(pointer_id, 1, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_pointer_motion_event(pointer_id: t27, time: t27, x: t27, y: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(12);
+    wire_push_u32_le(&payload, time); wire_push_wayland_fixed(&payload, x); wire_push_wayland_fixed(&payload, y);
+    let out: WireBuffer = wayland_encode(pointer_id, 2, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_pointer_button_event(pointer_id: t27, serial: t27, time: t27,
+    button: t27, button_state: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(16);
+    if (button_state != 0 && button_state != 1) { payload.error = 1; }
+    wire_push_u32_le(&payload, serial); wire_push_u32_le(&payload, time);
+    wire_push_u32_le(&payload, button); wire_push_u32_le(&payload, button_state);
+    let out: WireBuffer = wayland_encode(pointer_id, 3, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_pointer_axis_event(pointer_id: t27, time: t27, axis: t27, value: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(12);
+    if (axis != 0 && axis != 1) { payload.error = 1; }
+    wire_push_u32_le(&payload, time); wire_push_u32_le(&payload, axis); wire_push_wayland_fixed(&payload, value);
+    let out: WireBuffer = wayland_encode(pointer_id, 4, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_keyboard_keymap_event(keyboard_id: t27, format: t27, size: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(8);
+    if ((format == 0 && size != 0)
+        || (format == wayland_keyboard_keymap_format_xkb_v1()
+            && (size < 1 || size > wayland_keyboard_keymap_max_size()))
+        || (format != 0 && format != wayland_keyboard_keymap_format_xkb_v1())) {
+        payload.error = 1;
+    }
+    wire_push_u32_le(&payload, format); wire_push_u32_le(&payload, size);
+    let out: WireBuffer = wayland_encode(keyboard_id, 0, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_keyboard_enter_event(keyboard_id: t27, serial: t27, surface_id: t27,
+    pressed_keys: *ArrayList[t27]) WireBuffer {
+    let payload: WireBuffer = wire_new(12 + len[t27](pressed_keys.*) * 4);
+    if (surface_id < 1 || len[t27](pressed_keys.*) as t27 > wayland_keyboard_max_pressed_keys()) {
+        payload.error = 1;
+    }
+    wire_push_u32_le(&payload, serial); wire_push_u32_le(&payload, surface_id);
+    wire_push_u32_le(&payload, (len[t27](pressed_keys.*) * 4) as t27);
+    let i: i32 = 0;
+    while (i < len[t27](pressed_keys.*)) {
+        let key: t27 = get[t27](pressed_keys.*, i);
+        let prior_i: i32 = 0;
+        while (prior_i < i) {
+            if (get[t27](pressed_keys.*, prior_i) == key) { payload.error = 1; }
+            prior_i = prior_i + 1;
+        }
+        wire_push_u32_le(&payload, key);
+        i = i + 1;
+    }
+    let out: WireBuffer = wayland_encode(keyboard_id, 1, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_keyboard_leave_event(keyboard_id: t27, serial: t27, surface_id: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(8);
+    if (surface_id < 1) { payload.error = 1; }
+    wire_push_u32_le(&payload, serial); wire_push_u32_le(&payload, surface_id);
+    let out: WireBuffer = wayland_encode(keyboard_id, 2, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_keyboard_key_event(keyboard_id: t27, serial: t27, time: t27,
+    key: t27, state: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(16);
+    if (state != 0 && state != 1) { payload.error = 1; }
+    wire_push_u32_le(&payload, serial); wire_push_u32_le(&payload, time);
+    wire_push_u32_le(&payload, key); wire_push_u32_le(&payload, state);
+    let out: WireBuffer = wayland_encode(keyboard_id, 3, &payload); wire_free(&payload); return out;
+}
+
+fn wayland_keyboard_modifiers_event(keyboard_id: t27, serial: t27,
+    depressed: t27, latched: t27, locked: t27, group: t27) WireBuffer {
+    let payload: WireBuffer = wire_new(20);
+    wire_push_u32_le(&payload, serial); wire_push_u32_le(&payload, depressed);
+    wire_push_u32_le(&payload, latched); wire_push_u32_le(&payload, locked);
+    wire_push_u32_le(&payload, group);
+    let out: WireBuffer = wayland_encode(keyboard_id, 4, &payload); wire_free(&payload); return out;
+}

@@ -1,0 +1,133 @@
+// Grapheme navigation and Unicode tables. Core owns the shared bounded UTF-8
+// decoder/validator because editable text storage depends on that invariant.
+
+fn unicode_is_extend(codepoint: t27) i32 {
+    if ((codepoint >= 768 && codepoint <= 879) || (codepoint >= 6832 && codepoint <= 6911)
+        || (codepoint >= 7616 && codepoint <= 7679) || (codepoint >= 8400 && codepoint <= 8447)
+        || (codepoint >= 65024 && codepoint <= 65039) || (codepoint >= 65056 && codepoint <= 65071)
+        || (codepoint >= 127995 && codepoint <= 127999) || (codepoint >= 917760 && codepoint <= 917999)) { return 1; }
+    return 0;
+}
+
+fn unicode_is_regional_indicator(codepoint: t27) i32 {
+    if (codepoint >= 127462 && codepoint <= 127487) { return 1; }
+    return 0;
+}
+
+fn utf8_next_grapheme(input: []u8, offset: i32) i32 {
+    let first: Utf8Decode = utf8_decode_at(input, offset);
+    if (first.valid == 0) { return offset; }
+    let next: i32 = offset + first.width as i32;
+    let previous: t27 = first.codepoint;
+    let regional_count: t27 = 0;
+    if (unicode_is_regional_indicator(first.codepoint) == 1) { regional_count = 1; }
+    while (next < input.len) {
+        let decoded: Utf8Decode = utf8_decode_at(input, next);
+        if (decoded.valid == 0) { return next; }
+        let joins: i32 = 0;
+        if (unicode_is_extend(decoded.codepoint) == 1 || decoded.codepoint == 8205 || previous == 8205) { joins = 1; }
+        if (previous == 13 && decoded.codepoint == 10) { joins = 1; }
+        if (unicode_is_regional_indicator(decoded.codepoint) == 1 && regional_count == 1) { joins = 1; }
+        if (joins == 0) { return next; }
+        if (unicode_is_regional_indicator(decoded.codepoint) == 1) { regional_count = regional_count + 1; }
+        else if (unicode_is_extend(decoded.codepoint) == 0) { regional_count = 0; }
+        previous = decoded.codepoint; next = next + decoded.width as i32;
+    }
+    return next;
+}
+
+fn utf8_previous_grapheme(input: []u8, offset: i32) i32 {
+    if (offset <= 0) { return 0; }
+    let cursor: i32 = 0; let previous: i32 = 0;
+    while (cursor < input.len && cursor < offset) {
+        previous = cursor;
+        let next: i32 = utf8_next_grapheme(input, cursor);
+        if (next <= cursor || next >= offset) { return previous; }
+        cursor = next;
+    }
+    return previous;
+}
+
+fn utf8_grapheme_count(input: []u8) t27 {
+    if (utf8_validate(input).valid == 0) { return 0; }
+    let count: t27 = 0; let offset: i32 = 0;
+    while (offset < input.len) {
+        let next: i32 = utf8_next_grapheme(input, offset);
+        if (next <= offset) { return 0; }
+        count = count + 1; offset = next;
+    }
+    return count;
+}
+
+// Translate a logical grapheme position to its byte boundary. Positions are
+// clamped to the valid logical range; malformed UTF-8 has no valid mapping.
+fn utf8_grapheme_byte_offset(input: []u8, index: t27) t27 {
+    if (utf8_validate(input).valid == 0) { return -1; }
+    let target: t27 = index;
+    if (target < 0) { target = 0; }
+    let logical: t27 = 0;
+    let offset: i32 = 0;
+    while (offset < input.len && logical < target) {
+        let next: i32 = utf8_next_grapheme(input, offset);
+        if (next <= offset) { return -1; }
+        offset = next; logical = logical + 1;
+    }
+    return offset as t27;
+}
+
+// Return the logical index only when byte_offset is an exact grapheme
+// boundary. This prevents storage offsets in the middle of UTF-8 or a cluster
+// from leaking into editing state.
+fn utf8_grapheme_index_at_byte(input: []u8, byte_offset: t27) t27 {
+    if (utf8_validate(input).valid == 0 || byte_offset < 0 || byte_offset > input.len as t27) { return -1; }
+    if (byte_offset == 0) { return 0; }
+    let logical: t27 = 0;
+    let offset: i32 = 0;
+    while (offset < input.len) {
+        let next: i32 = utf8_next_grapheme(input, offset);
+        if (next <= offset) { return -1; }
+        logical = logical + 1;
+        if (next as t27 == byte_offset) { return logical; }
+        if (next as t27 > byte_offset) { return -1; }
+        offset = next;
+    }
+    return -1;
+}
+
+// Round a storage position forward to the first complete grapheme boundary.
+fn utf8_grapheme_index_at_or_after_byte(input: []u8, byte_offset: t27) t27 {
+    if (utf8_validate(input).valid == 0) { return -1; }
+    let target: t27 = byte_offset;
+    if (target < 0) { target = 0; }
+    if (target > input.len as t27) { target = input.len as t27; }
+    if (target == 0) { return 0; }
+    let logical: t27 = 0;
+    let offset: i32 = 0;
+    while (offset < input.len) {
+        let next: i32 = utf8_next_grapheme(input, offset);
+        if (next <= offset) { return -1; }
+        logical = logical + 1;
+        if (next as t27 >= target) { return logical; }
+        offset = next;
+    }
+    return logical;
+}
+
+fn selection_valid(input: []u8, start: t27, end: t27) i32 {
+    if (start < 0 || end < start || utf8_validate(input).valid == 0) { return 0; }
+    if (end > utf8_grapheme_count(input)) { return 0; }
+    return 1;
+}
+
+fn utf8_line_count(input: []u8) t27 {
+    if (input.len == 0) { return 0; }
+    if (utf8_validate(input).valid == 0) { return 0; }
+    let lines: t27 = 1; let offset: i32 = 0; let previous: t27 = 0;
+    while (offset < input.len) {
+        let decoded: Utf8Decode = utf8_decode_at(input, offset);
+        if ((decoded.codepoint == 10 && previous != 13) || decoded.codepoint == 13
+            || decoded.codepoint == 8232 || decoded.codepoint == 8233) { lines = lines + 1; }
+        previous = decoded.codepoint; offset = offset + decoded.width as i32;
+    }
+    return lines;
+}

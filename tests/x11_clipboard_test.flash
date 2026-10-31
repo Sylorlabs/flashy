@@ -1,0 +1,1665 @@
+@import("../src/flashy.flash")
+
+fn x11_clipboard_expect(ok: i32, message: []u8) i32 {
+    if (ok == 0) { _zag_print("FAIL "); _zag_println(message); return 1; }
+    return 0;
+}
+
+fn x11_clipboard_test_connection(fd: i64, resolved_atoms: i32) X11NativeConnection {
+    let connection: X11NativeConnection = x11_empty_connection();
+    connection.fd = fd; connection.connected = 1; connection.authenticated = 1;
+    connection.setup.maximum_request_length = 65535; connection.setup.valid = 1;
+    let _owner_registered: i32 = x11_connection_register_window(&connection, 100);
+    let _requestor_registered: i32 = x11_connection_register_window(&connection, 200);
+    if (resolved_atoms != 0) {
+        connection.utf8_string_atom = 201;
+        connection.clipboard_selection_atom = 202;
+        connection.clipboard_property_atom = 203;
+    }
+    return connection;
+}
+
+fn x11_clipboard_test_send(fd: i64, input: *WireBuffer) i32 {
+    let expected: i64 = len[u8](input.*.bytes) as i64;
+    let sent: LinuxWriteAllResult = linux_send_wire_all(fd, input);
+    wire_free(input);
+    if (sent.complete != 0 && sent.written == expected) { return 1; }
+    return 0;
+}
+
+fn x11_clipboard_test_owner_reply(sequence: t27, owner: t27) WireBuffer {
+    let out: WireBuffer = wire_new(32);
+    wire_push_u8(&out, 1); wire_push_u8(&out, 0); wire_push_u16_le(&out, sequence);
+    wire_push_u32_le(&out, 0); wire_push_u32_le(&out, owner);
+    while (len[u8](out.bytes) < 32) { wire_push_u8(&out, 0); }
+    return out;
+}
+
+fn x11_clipboard_test_intern_reply(sequence: t27, atom: t27) WireBuffer {
+    return x11_clipboard_test_owner_reply(sequence, atom);
+}
+
+fn x11_clipboard_test_property_reply(sequence: t27, property_type: t27,
+    format: t27, bytes_after: t27, data: []u8) WireBuffer {
+    let out: WireBuffer = wire_new(32 + data.len + 3);
+    let items: t27 = 0;
+    if (format == 8) { items = data.len as t27; }
+    else if (format == 16) { items = (data.len / 2) as t27; }
+    else if (format == 32) { items = (data.len / 4) as t27; }
+    wire_push_u8(&out, 1); wire_push_u8(&out, format); wire_push_u16_le(&out, sequence);
+    wire_push_u32_le(&out, ((data.len + 3) / 4) as t27);
+    wire_push_u32_le(&out, property_type); wire_push_u32_le(&out, bytes_after);
+    wire_push_u32_le(&out, items);
+    while (len[u8](out.bytes) < 32) { wire_push_u8(&out, 0); }
+    let i: i32 = 0;
+    while (i < data.len) { wire_push_u8(&out, data[i] as t27); i = i + 1; }
+    wire_pad4(&out); return out;
+}
+
+fn x11_clipboard_test_error(sequence: t27, major_opcode: t27) WireBuffer {
+    let out: WireBuffer = wire_new(32);
+    wire_push_u8(&out, 0); wire_push_u8(&out, 2);
+    wire_push_u16_le(&out, sequence); wire_push_u32_le(&out, 0);
+    wire_push_u16_le(&out, 0); wire_push_u8(&out, major_opcode);
+    while (len[u8](out.bytes) < 32) { wire_push_u8(&out, 0); }
+    return out;
+}
+
+fn x11_clipboard_test_map_event(window: t27, sequence: t27) WireBuffer {
+    let out: WireBuffer = wire_new(32);
+    wire_push_u8(&out, 19); wire_push_u8(&out, 0); wire_push_u16_le(&out, sequence);
+    wire_push_u32_le(&out, 256); wire_push_u32_le(&out, window);
+    while (len[u8](out.bytes) < 32) { wire_push_u8(&out, 0); }
+    return out;
+}
+
+fn x11_clipboard_test_selection_clear(owner: t27, selection: t27,
+    timestamp: t27, sequence: t27) WireBuffer {
+    let out: WireBuffer = wire_new(32);
+    wire_push_u8(&out, 29); wire_push_u8(&out, 0); wire_push_u16_le(&out, sequence);
+    wire_push_u32_le(&out, timestamp); wire_push_u32_le(&out, owner);
+    wire_push_u32_le(&out, selection);
+    while (len[u8](out.bytes) < 32) { wire_push_u8(&out, 0); }
+    return out;
+}
+
+fn x11_clipboard_test_selection_request(owner: t27, requestor: t27,
+    selection: t27, target: t27, property: t27, timestamp: t27,
+    sequence: t27) WireBuffer {
+    let out: WireBuffer = wire_new(32);
+    wire_push_u8(&out, 30); wire_push_u8(&out, 0); wire_push_u16_le(&out, sequence);
+    wire_push_u32_le(&out, timestamp); wire_push_u32_le(&out, owner);
+    wire_push_u32_le(&out, requestor); wire_push_u32_le(&out, selection);
+    wire_push_u32_le(&out, target); wire_push_u32_le(&out, property);
+    while (len[u8](out.bytes) < 32) { wire_push_u8(&out, 0); }
+    return out;
+}
+
+fn x11_clipboard_test_selection_notify(requestor: t27, selection: t27,
+    target: t27, property: t27, timestamp: t27, sequence: t27) WireBuffer {
+    let out: WireBuffer = x11_selection_notify_event(
+        requestor, selection, target, property, timestamp);
+    out.bytes.data[0] = (31 + 128) as u8;
+    out.bytes.data[2] = (sequence % 256) as u8;
+    out.bytes.data[3] = ((sequence / 256) % 256) as u8;
+    return out;
+}
+
+fn x11_clipboard_test_request_name(input: *WireBuffer,
+    offset: i32, expected: []u8) i32 {
+    let frame: X11Request = x11_decode_request(input, offset);
+    if (frame.valid == 0 || frame.opcode != 16
+        || wire_read_u16_le(input, frame.payload_offset) != expected.len as t27) { return 0; }
+    let start: i32 = frame.payload_offset + 4;
+    let actual: []u8 = input.*.bytes.data[start..start + expected.len];
+    return @strEq(actual, expected);
+}
+
+// SendEvent carries the 32-byte event at request offset 12.  The server sets
+// the synthetic bit when it delivers that exact payload to the requestor.
+fn x11_clipboard_test_decode_sent_event(input: *WireBuffer,
+    event_offset: i32) X11Event {
+    let frame: WireBuffer = wire_new(32);
+    if (event_offset < 0 || event_offset + 32 > len[u8](input.*.bytes)) {
+        let bad: X11Event = x11_decode_event(&frame, 0);
+        wire_free(&frame);
+        return bad;
+    }
+    let i: i32 = 0;
+    while (i < 32) {
+        wire_push_u8(&frame, input.*.bytes.data[event_offset + i] as t27);
+        i = i + 1;
+    }
+    if (wire_read_u8(&frame, 0) < 128) {
+        frame.bytes.data[0] = (wire_read_u8(&frame, 0) + 128) as u8;
+    }
+    let event: X11Event = x11_decode_event(&frame, 0);
+    wire_free(&frame);
+    return event;
+}
+
+fn x11_clipboard_test_fork() i64 {
+    // Linux x86-64 fork is confined to this fake-peer test boundary.
+    return _zag_raw_syscall(57, 0, 0, 0, 0, 0, 0);
+}
+
+fn x11_clipboard_test_child_exit(code: i32) void {
+    let _exited: i64 = _zag_raw_syscall(60, code as i64, 0, 0, 0, 0, 0);
+}
+
+fn x11_clipboard_test_wait_child(pid: i64) i32 {
+    let status: LinuxByteBuffer = linux_buffer_new(4);
+    status.len = 4;
+    let waited: i64 = _zag_raw_syscall(61, pid,
+        status.words.data as i64, 0, 0, 0, 0);
+    let raw: i64 = linux_buffer_u32(&status, 0);
+    linux_buffer_free(&status);
+    if (waited == pid && raw % 128 == 0 && (raw / 256) % 256 == 0) { return 1; }
+    return 0;
+}
+
+fn x11_clipboard_test_read_peer(fd: i64, positive: i32) i32 {
+    // This stale completion exists before the barrier request. The server-side
+    // peer does not fabricate the future completion until it has observed the
+    // client's DeleteProperty and ConvertSelection requests.
+    let stale: WireBuffer = x11_clipboard_test_selection_notify(
+        200, 202, 201, 203, 77, 40);
+    if (x11_clipboard_test_send(fd, &stale) == 0) { return 1; }
+    let barrier: WireBuffer = linux_receive_exact(fd, 8, 1000);
+    let barrier_frame: X11Request = x11_decode_request(&barrier, 0);
+    let barrier_ok: i32 = barrier.error == 0 && barrier_frame.valid == 1
+        && barrier_frame.opcode == 23 && wire_read_u32_le(&barrier, 4) == 202;
+    wire_free(&barrier);
+    if (barrier_ok == 0) { return 2; }
+    let owner_reply: WireBuffer = x11_clipboard_test_owner_reply(1, 777);
+    if (x11_clipboard_test_send(fd, &owner_reply) == 0) { return 3; }
+    let conversion: WireBuffer = linux_receive_exact(fd, 36, 1000);
+    let delete_frame: X11Request = x11_decode_request(&conversion, 0);
+    let convert_frame: X11Request = x11_decode_request(&conversion, 12);
+    let conversion_ok: i32 = conversion.error == 0
+        && len[u8](conversion.bytes) == 36
+        && delete_frame.valid == 1 && delete_frame.opcode == 19
+        && convert_frame.valid == 1 && convert_frame.opcode == 24
+        && wire_read_u32_le(&conversion, 4) == 200
+        && wire_read_u32_le(&conversion, 8) == 203
+        && wire_read_u32_le(&conversion, 16) == 200
+        && wire_read_u32_le(&conversion, 20) == 202
+        && wire_read_u32_le(&conversion, 24) == 201
+        && wire_read_u32_le(&conversion, 28) == 203
+        && wire_read_u32_le(&conversion, 32) == 77;
+    wire_free(&conversion);
+    if (conversion_ok == 0) { return 4; }
+    if (positive == 0) {
+        let unexpected: WireBuffer = linux_receive_exact(fd, 24, 250);
+        let no_get_property: i32 = len[u8](unexpected.bytes) == 0;
+        wire_free(&unexpected);
+        if (no_get_property == 0) { return 5; }
+        return 0;
+    }
+    let causal: WireBuffer = x11_clipboard_test_selection_notify(
+        200, 202, 201, 203, 77, 3);
+    if (x11_clipboard_test_send(fd, &causal) == 0) { return 6; }
+    let get_property: WireBuffer = linux_receive_exact(fd, 24, 1000);
+    let get_frame: X11Request = x11_decode_request(&get_property, 0);
+    let get_ok: i32 = get_property.error == 0 && get_frame.valid == 1
+        && len[u8](get_property.bytes) == 24
+        && get_frame.opcode == 20 && get_frame.detail == 1
+        && wire_read_u32_le(&get_property, 4) == 200
+        && wire_read_u32_le(&get_property, 8) == 203
+        && wire_read_u32_le(&get_property, 12) == 201
+        && wire_read_u32_le(&get_property, 16) == 0
+        && wire_read_u32_le(&get_property, 20) == 16;
+    wire_free(&get_property);
+    if (get_ok == 0) { return 7; }
+    let property_reply: WireBuffer = x11_clipboard_test_property_reply(
+        4, 201, 8, 0, "world");
+    if (x11_clipboard_test_send(fd, &property_reply) == 0) { return 8; }
+    return 0;
+}
+
+fn x11_clipboard_test_cleanup_requests(input: *WireBuffer) i32 {
+    let deleted: X11Request = x11_decode_request(input, 68);
+    let barrier: X11Request = x11_decode_request(input, 80);
+    if (deleted.valid == 0 || deleted.opcode != 19
+        || wire_read_u32_le(input, 72) != 200
+        || wire_read_u32_le(input, 76) != 203
+        || barrier.valid == 0 || barrier.opcode != 23
+        || wire_read_u32_le(input, 84) != 202) { return 0; }
+    return 1;
+}
+
+fn x11_clipboard_test_no_more_bytes(fd: i64) i32 {
+    let extra: WireBuffer = linux_receive_exact(fd, 1, 10);
+    let empty: i32 = len[u8](extra.bytes) == 0;
+    wire_free(&extra); return empty;
+}
+
+fn main() i32 {
+    let failures: i32 = 0;
+
+    let disconnected: X11NativeConnection = x11_empty_connection();
+    let disconnected_read: X11ClipboardReadResult = x11_clipboard_read(&disconnected,
+        200, X11SelectionKind.Clipboard, 0, 10, 16);
+    failures = failures + x11_clipboard_expect(x11_clipboard_copy(&disconnected,
+        100, X11SelectionKind.Clipboard, "offline", 0, 10)
+        == X11ClipboardStatus.TransportFailed
+        && disconnected_read.status == X11ClipboardStatus.TransportFailed,
+        "disconnected clipboard operations return typed transport failure");
+    x11_clipboard_read_result_free(&disconnected_read); x11_disconnect(&disconnected);
+
+    let change: WireBuffer = x11_change_property8_request(100, 300, 201, "hello");
+    let change_frame: X11Request = x11_decode_request(&change, 0);
+    failures = failures + x11_clipboard_expect(change_frame.valid == 1
+        && change_frame.opcode == 18 && change_frame.detail == 0
+        && wire_read_u32_le(&change, 4) == 100
+        && wire_read_u32_le(&change, 8) == 300
+        && wire_read_u32_le(&change, 12) == 201
+        && wire_read_u8(&change, 16) == 8
+        && wire_read_u32_le(&change, 20) == 5
+        && @strEq(change.bytes.data[24..29], "hello") == 1,
+        "ChangeProperty encodes bounded UTF8_STRING bytes exactly");
+    let get: WireBuffer = x11_get_property_range_request(100, 300, 201, 0, 65, 1);
+    let get_frame: X11Request = x11_decode_request(&get, 0);
+    failures = failures + x11_clipboard_expect(get_frame.valid == 1
+        && get_frame.opcode == 20 && get_frame.detail == 1
+        && wire_read_u32_le(&get, 4) == 100 && wire_read_u32_le(&get, 8) == 300
+        && wire_read_u32_le(&get, 12) == 201 && wire_read_u32_le(&get, 16) == 0
+        && wire_read_u32_le(&get, 20) == 65,
+        "GetProperty carries delete, type, offset, and bounded long length");
+    let set_owner: WireBuffer = x11_set_selection_owner_request(100, 202, 55);
+    let set_frame: X11Request = x11_decode_request(&set_owner, 0);
+    let get_owner: WireBuffer = x11_get_selection_owner_request(202);
+    let get_owner_frame: X11Request = x11_decode_request(&get_owner, 0);
+    let convert: WireBuffer = x11_convert_selection_request(200, 202, 201, 203, 77);
+    let convert_frame: X11Request = x11_decode_request(&convert, 0);
+    failures = failures + x11_clipboard_expect(set_frame.valid == 1
+        && set_frame.opcode == 22 && wire_read_u32_le(&set_owner, 4) == 100
+        && wire_read_u32_le(&set_owner, 8) == 202 && wire_read_u32_le(&set_owner, 12) == 55
+        && get_owner_frame.valid == 1 && get_owner_frame.opcode == 23
+        && wire_read_u32_le(&get_owner, 4) == 202
+        && convert_frame.valid == 1 && convert_frame.opcode == 24
+        && wire_read_u32_le(&convert, 4) == 200
+        && wire_read_u32_le(&convert, 8) == 202
+        && wire_read_u32_le(&convert, 12) == 201
+        && wire_read_u32_le(&convert, 16) == 203
+        && wire_read_u32_le(&convert, 20) == 77,
+        "selection owner and conversion core requests preserve every authority field");
+    let send_notify: WireBuffer = x11_send_selection_notify_request(200, 202, 201, 203, 77);
+    let send_frame: X11Request = x11_decode_request(&send_notify, 0);
+    let sent_event: X11Event = x11_clipboard_test_decode_sent_event(
+        &send_notify, 12);
+    failures = failures + x11_clipboard_expect(send_frame.valid == 1
+        && send_frame.opcode == 25 && send_frame.length_units == 11
+        && wire_read_u32_le(&send_notify, 4) == 200
+        && wire_read_u32_le(&send_notify, 8) == 0
+        && wire_read_u8(&send_notify, 12) == 31
+        && sent_event.valid == 1 && sent_event.kind == X11EventKind.SelectionNotify
+        && sent_event.response_type == 31 && sent_event.send_event == 1
+        && sent_event.requestor == 200 && sent_event.window == 200
+        && sent_event.selection_atom == 202 && sent_event.target_atom == 201
+        && sent_event.property_atom == 203 && sent_event.time == 77,
+        "SendEvent embeds an exact SelectionNotify frame");
+    let bad_change: WireBuffer = x11_change_property8_request(0, 300, 201, "bad");
+    let none_convert: WireBuffer = x11_convert_selection_request(200, 202, 201, 0, 77);
+    let oversized_id_change: WireBuffer = x11_change_property8_request(
+        536870912, 300, 201, "bad");
+    let oversized_atom_get: WireBuffer = x11_get_property_range_request(
+        100, 300, 536870912, 0, 1, 1);
+    failures = failures + x11_clipboard_expect(bad_change.error != 0
+        && none_convert.error == 0
+        && wire_read_u32_le(&none_convert, 16) == 0,
+        "selection builders reject invalid owners while ConvertSelection preserves property None");
+    failures = failures + x11_clipboard_expect(oversized_id_change.error != 0
+        && oversized_atom_get.error != 0,
+        "X11 XIDs and atoms reject values outside the 29-bit protocol domain");
+
+    let clear_wire: WireBuffer = x11_clipboard_test_selection_clear(100, 202, 60, 9);
+    let clear_event: X11Event = x11_decode_event(&clear_wire, 0);
+    let request_wire: WireBuffer = x11_clipboard_test_selection_request(
+        100, 200, 202, 201, 300, 61, 10);
+    let request_event: X11Event = x11_decode_event(&request_wire, 0);
+    let notify_wire: WireBuffer = x11_clipboard_test_selection_notify(
+        200, 202, 201, 300, 61, 11);
+    let notify_event: X11Event = x11_decode_event(&notify_wire, 0);
+    let synthetic_clear_wire: WireBuffer = x11_clipboard_test_selection_clear(
+        100, 202, 60, 12);
+    synthetic_clear_wire.bytes.data[0] = (29 + 128) as u8;
+    let synthetic_request_wire: WireBuffer = x11_clipboard_test_selection_request(
+        100, 200, 202, 201, 300, 61, 13);
+    synthetic_request_wire.bytes.data[0] = (30 + 128) as u8;
+    let synthetic_clear: X11Event = x11_decode_event(&synthetic_clear_wire, 0);
+    let synthetic_request: X11Event = x11_decode_event(&synthetic_request_wire, 0);
+    failures = failures + x11_clipboard_expect(clear_event.valid == 1
+        && clear_event.kind == X11EventKind.SelectionClear && clear_event.owner == 100
+        && clear_event.window == 100 && clear_event.selection_atom == 202
+        && request_event.valid == 1 && request_event.kind == X11EventKind.SelectionRequest
+        && request_event.owner == 100 && request_event.requestor == 200
+        && request_event.window == 100 && request_event.target_atom == 201
+        && request_event.property_atom == 300
+        && notify_event.valid == 1 && notify_event.kind == X11EventKind.SelectionNotify
+        && notify_event.requestor == 200 && notify_event.window == 200
+        && notify_event.property_atom == 300
+        && synthetic_clear.valid == 0 && synthetic_request.valid == 0,
+        "selection events decode exact identities and reject synthetic authority changes");
+
+    let owner_reply_wire: WireBuffer = x11_clipboard_test_owner_reply(2, 100);
+    let owner_reply: X11SelectionOwnerReply = x11_decode_get_selection_owner_reply(&owner_reply_wire);
+    let maximum_atom_wire: WireBuffer = x11_clipboard_test_intern_reply(
+        2, 536870911);
+    let oversized_atom_wire: WireBuffer = x11_clipboard_test_intern_reply(
+        2, 536870912);
+    let maximum_atom_reply: X11AtomReply = x11_decode_intern_atom_reply(
+        &maximum_atom_wire);
+    let oversized_atom_reply: X11AtomReply = x11_decode_intern_atom_reply(
+        &oversized_atom_wire);
+    let property_reply_wire: WireBuffer = x11_clipboard_test_property_reply(
+        3, 201, 8, 0, "world");
+    let property_reply: X11GetPropertyReply = x11_decode_get_property_reply(&property_reply_wire);
+    let malformed_property_wire: WireBuffer = x11_clipboard_test_property_reply(
+        3, 201, 8, 0, "x");
+    malformed_property_wire.bytes.data[16] = 5;
+    let malformed_property: X11GetPropertyReply = x11_decode_get_property_reply(
+        &malformed_property_wire);
+    failures = failures + x11_clipboard_expect(owner_reply.valid == 1
+        && owner_reply.owner == 100 && property_reply.valid == 1
+        && property_reply.property_type == 201 && property_reply.format == 8
+        && property_reply.value_items == 5 && property_reply.value_bytes == 5
+        && malformed_property.valid == 0
+        && maximum_atom_reply.valid == 1 && maximum_atom_reply.atom == 536870911
+        && oversized_atom_reply.valid == 0,
+        "selection replies validate exact type, format, item count, and padded tail");
+
+    wire_free(&change); wire_free(&get); wire_free(&set_owner); wire_free(&get_owner);
+    wire_free(&convert); wire_free(&send_notify);
+    wire_free(&bad_change); wire_free(&none_convert);
+    wire_free(&oversized_id_change); wire_free(&oversized_atom_get);
+    wire_free(&clear_wire); wire_free(&request_wire); wire_free(&notify_wire);
+    wire_free(&synthetic_clear_wire); wire_free(&synthetic_request_wire);
+    wire_free(&owner_reply_wire); wire_free(&maximum_atom_wire);
+    wire_free(&oversized_atom_wire); wire_free(&property_reply_wire);
+    wire_free(&malformed_property_wire);
+
+    let atom_pair: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + x11_clipboard_expect(atom_pair.ok == 1,
+        "clipboard atom fake peer opens");
+    if (atom_pair.ok == 1) {
+        let atom_connection: X11NativeConnection = x11_clipboard_test_connection(atom_pair.first, 0);
+        let utf8_reply: WireBuffer = x11_clipboard_test_intern_reply(1, 201);
+        let clipboard_reply: WireBuffer = x11_clipboard_test_intern_reply(2, 202);
+        let property_atom_reply: WireBuffer = x11_clipboard_test_intern_reply(3, 203);
+        let atom_sent: i32 = x11_clipboard_test_send(atom_pair.second, &utf8_reply)
+            && x11_clipboard_test_send(atom_pair.second, &clipboard_reply)
+            && x11_clipboard_test_send(atom_pair.second, &property_atom_reply);
+        let atom_status: X11ClipboardStatus = x11_clipboard_ensure_atoms(&atom_connection, 100);
+        let atom_requests: WireBuffer = linux_receive_exact(atom_pair.second, 68, 100);
+        failures = failures + x11_clipboard_expect(atom_sent == 1
+            && atom_status == X11ClipboardStatus.Ok
+            && atom_connection.primary_selection_atom == 1
+            && atom_connection.utf8_string_atom == 201
+            && atom_connection.clipboard_selection_atom == 202
+            && atom_connection.clipboard_property_atom == 203
+            && x11_clipboard_test_request_name(&atom_requests, 0, "UTF8_STRING") == 1
+            && x11_clipboard_test_request_name(&atom_requests, 20, "CLIPBOARD") == 1
+            && x11_clipboard_test_request_name(&atom_requests, 40, "_FLASHY_SELECTION") == 1,
+            "clipboard atoms are authoritative server replies while PRIMARY remains predefined");
+        wire_free(&atom_requests); x11_disconnect(&atom_connection);
+        let _atom_peer_closed: i64 = linux_close(atom_pair.second);
+    }
+
+    let malformed_atom_pair: LinuxFdPair = linux_socketpair_stream();
+    if (malformed_atom_pair.ok == 1) {
+        let malformed_atom_connection: X11NativeConnection =
+            x11_clipboard_test_connection(malformed_atom_pair.first, 0);
+        let _stale_primary: i32 = x11_clipboard_store_owned(
+            &malformed_atom_connection, 1, 100, 1, "stale");
+        let malformed_atom_reply_wire: WireBuffer = x11_clipboard_test_intern_reply(
+            1, 536870912);
+        let _malformed_atom_sent: i32 = x11_clipboard_test_send(
+            malformed_atom_pair.second, &malformed_atom_reply_wire);
+        let malformed_atom_status: X11ClipboardStatus = x11_clipboard_ensure_atoms(
+            &malformed_atom_connection, 100);
+        let malformed_atom_request: WireBuffer = linux_receive_exact(
+            malformed_atom_pair.second, 20, 100);
+        failures = failures + x11_clipboard_expect(
+            malformed_atom_status == X11ClipboardStatus.MalformedReply
+            && x11_decode_request(&malformed_atom_request, 0).opcode == 16
+            && malformed_atom_connection.authenticated == 0
+            && malformed_atom_connection.fd == -1
+            && malformed_atom_connection.primary_selection.valid == 0
+            && malformed_atom_connection.primary_selection.text.bytes.cap == 0,
+            "out-of-range InternAtom reply is terminal and retires cached authority");
+        wire_free(&malformed_atom_request);
+        x11_disconnect(&malformed_atom_connection);
+        let _malformed_atom_peer_closed: i64 = linux_close(
+            malformed_atom_pair.second);
+    } else { failures = failures + 1; }
+
+    let owner_pair: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + x11_clipboard_expect(owner_pair.ok == 1,
+        "clipboard owner fake peer opens");
+    if (owner_pair.ok == 1) {
+        let owner_connection: X11NativeConnection = x11_clipboard_test_connection(owner_pair.first, 1);
+        let interleaved_map: WireBuffer = x11_clipboard_test_map_event(777, 1);
+        let interleaved_request: WireBuffer = x11_clipboard_test_selection_request(
+            100, 200, 202, 201, 300, 55, 2);
+        let verified_owner: WireBuffer = x11_clipboard_test_owner_reply(2, 100);
+        let owner_frames_sent: i32 = x11_clipboard_test_send(owner_pair.second, &interleaved_map)
+            && x11_clipboard_test_send(owner_pair.second, &verified_owner);
+        let copy_status: X11ClipboardStatus = x11_clipboard_copy(
+            &owner_connection, 100, X11SelectionKind.Clipboard, "hello", 55, 100);
+        let owner_requests: WireBuffer = linux_receive_exact(owner_pair.second, 24, 100);
+        let set_request_frame: X11Request = x11_decode_request(&owner_requests, 0);
+        let get_request_frame: X11Request = x11_decode_request(&owner_requests, 16);
+        let queued_map: X11Event = x11_next_event(&owner_connection, 0);
+        let request_sent: i32 = x11_clipboard_test_send(
+            owner_pair.second, &interleaved_request);
+        let queued_request: X11Event = x11_next_event(&owner_connection, 100);
+        failures = failures + x11_clipboard_expect(owner_frames_sent == 1
+            && request_sent == 1
+            && copy_status == X11ClipboardStatus.Ok
+            && owner_connection.clipboard_selection.valid == 1
+            && owner_connection.clipboard_selection.owner_window == 100
+            && @strEq(text_buffer_view(&owner_connection.clipboard_selection.text), "hello") == 1
+            && set_request_frame.valid == 1 && set_request_frame.opcode == 22
+            && get_request_frame.valid == 1 && get_request_frame.opcode == 23
+            && queued_map.valid == 1 && queued_map.kind == X11EventKind.Mapped
+            && queued_map.window == 777
+            && queued_request.valid == 1
+            && queued_request.kind == X11EventKind.SelectionRequest
+            && queued_request.requestor == 200
+            && queued_request.selection_generation
+                == owner_connection.clipboard_selection.generation,
+            "copy verifies ownership while preserving multiwindow event and request FIFO order");
+        wire_free(&owner_requests);
+
+        let respond_change_barrier: WireBuffer = x11_clipboard_test_owner_reply(4, 100);
+        let respond_notify_barrier: WireBuffer = x11_clipboard_test_owner_reply(6, 100);
+        let _respond_change_barrier_sent: i32 = x11_clipboard_test_send(
+            owner_pair.second, &respond_change_barrier);
+        let _respond_notify_barrier_sent: i32 = x11_clipboard_test_send(
+            owner_pair.second, &respond_notify_barrier);
+        let respond_status: X11ClipboardStatus = x11_clipboard_respond(
+            &owner_connection, queued_request, 100);
+        let response_requests: WireBuffer = linux_receive_exact(owner_pair.second, 92, 100);
+        let change_response: X11Request = x11_decode_request(&response_requests, 0);
+        let change_response_barrier: X11Request = x11_decode_request(&response_requests, 32);
+        let notify_response: X11Request = x11_decode_request(&response_requests, 40);
+        let notify_response_barrier: X11Request = x11_decode_request(&response_requests, 84);
+        let delivered: X11Event = x11_clipboard_test_decode_sent_event(
+            &response_requests, 52);
+        failures = failures + x11_clipboard_expect(respond_status == X11ClipboardStatus.Ok
+            && change_response.valid == 1 && change_response.opcode == 18
+            && wire_read_u32_le(&response_requests, 4) == 200
+            && wire_read_u32_le(&response_requests, 8) == 300
+            && wire_read_u32_le(&response_requests, 12) == 201
+            && @strEq(response_requests.bytes.data[24..29], "hello") == 1
+            && change_response_barrier.valid == 1 && change_response_barrier.opcode == 23
+            && notify_response.valid == 1 && notify_response.opcode == 25
+            && notify_response_barrier.valid == 1 && notify_response_barrier.opcode == 23
+            && owner_connection.last_sent_sequence == 6
+            && wire_read_u32_le(&response_requests, 44) == 200
+            && wire_read_u32_le(&response_requests, 48) == 0
+            && wire_read_u8(&response_requests, 52) == 31
+            && delivered.valid == 1 && delivered.kind == X11EventKind.SelectionNotify
+            && delivered.send_event == 1
+            && delivered.sequence == 0 && delivered.requestor == 200
+            && delivered.selection_atom == 202 && delivered.target_atom == 201
+            && delivered.property_atom == 300 && delivered.time == 55,
+            "SelectionRequest response barriers confirm property mutation before exact notify");
+        wire_free(&response_requests);
+
+        let none_property_wire: WireBuffer = x11_clipboard_test_selection_request(
+            100, 200, 202, 201, 0, 0, 3);
+        let none_property_event: X11Event = x11_decode_event(&none_property_wire, 0);
+        none_property_event.selection_generation =
+            owner_connection.clipboard_selection.generation;
+        let none_change_barrier: WireBuffer = x11_clipboard_test_owner_reply(8, 100);
+        let none_notify_barrier: WireBuffer = x11_clipboard_test_owner_reply(10, 100);
+        let _none_change_barrier_sent: i32 = x11_clipboard_test_send(
+            owner_pair.second, &none_change_barrier);
+        let _none_notify_barrier_sent: i32 = x11_clipboard_test_send(
+            owner_pair.second, &none_notify_barrier);
+        let none_property_status: X11ClipboardStatus = x11_clipboard_respond(
+            &owner_connection, none_property_event, 100);
+        let none_property_requests: WireBuffer = linux_receive_exact(
+            owner_pair.second, 92, 100);
+        let none_property_change: X11Request = x11_decode_request(
+            &none_property_requests, 0);
+        let none_change_barrier_frame: X11Request = x11_decode_request(
+            &none_property_requests, 32);
+        let none_send_frame: X11Request = x11_decode_request(
+            &none_property_requests, 40);
+        let none_notify_barrier_frame: X11Request = x11_decode_request(
+            &none_property_requests, 84);
+        let none_property_notify: X11Event = x11_clipboard_test_decode_sent_event(
+            &none_property_requests, 52);
+        failures = failures + x11_clipboard_expect(
+            none_property_status == X11ClipboardStatus.Ok
+            && none_property_change.valid == 1
+            && wire_read_u32_le(&none_property_requests, 8) == 201
+            && none_change_barrier_frame.valid == 1
+            && none_change_barrier_frame.opcode == 23
+            && none_send_frame.valid == 1 && none_send_frame.opcode == 25
+            && none_notify_barrier_frame.valid == 1
+            && none_notify_barrier_frame.opcode == 23
+            && owner_connection.last_sent_sequence == 10
+            && wire_read_u32_le(&none_property_requests, 44) == 200
+            && wire_read_u32_le(&none_property_requests, 48) == 0
+            && wire_read_u8(&none_property_requests, 52) == 31
+            && none_property_notify.valid == 1
+            && none_property_notify.send_event == 1
+            && none_property_notify.requestor == 200
+            && none_property_notify.target_atom == 201
+            && none_property_notify.property_atom == 201,
+            "property None falls back to target while CurrentTime comparison stays explicitly fail-open");
+        wire_free(&none_property_wire); wire_free(&none_property_requests);
+
+        let old_request_wire: WireBuffer = x11_clipboard_test_selection_request(
+            100, 200, 202, 201, 303, 54, 4);
+        let old_request_event: X11Event = x11_decode_event(&old_request_wire, 0);
+        old_request_event.selection_generation =
+            owner_connection.clipboard_selection.generation;
+        let old_request_barrier: WireBuffer = x11_clipboard_test_owner_reply(12, 100);
+        let _old_request_barrier_sent: i32 = x11_clipboard_test_send(
+            owner_pair.second, &old_request_barrier);
+        let old_request_status: X11ClipboardStatus = x11_clipboard_respond(
+            &owner_connection, old_request_event, 100);
+        let old_request_notify: WireBuffer = linux_receive_exact(
+            owner_pair.second, 52, 100);
+        let old_request_send: X11Request = x11_decode_request(&old_request_notify, 0);
+        let old_request_barrier_frame: X11Request = x11_decode_request(
+            &old_request_notify, 44);
+        let old_request_delivered: X11Event = x11_clipboard_test_decode_sent_event(
+            &old_request_notify, 12);
+        failures = failures + x11_clipboard_expect(
+            old_request_status == X11ClipboardStatus.OwnershipRejected
+            && old_request_send.valid == 1 && old_request_send.opcode == 25
+            && old_request_barrier_frame.valid == 1
+            && old_request_barrier_frame.opcode == 23
+            && owner_connection.last_sent_sequence == 12
+            && wire_read_u32_le(&old_request_notify, 4) == 200
+            && wire_read_u32_le(&old_request_notify, 8) == 0
+            && wire_read_u8(&old_request_notify, 12) == 31
+            && old_request_delivered.valid == 1
+            && old_request_delivered.send_event == 1
+            && old_request_delivered.property_atom == 0
+            && len[u8](old_request_notify.bytes) == 52,
+            "request timestamp preceding ownership is refused before property mutation");
+        wire_free(&old_request_wire); wire_free(&old_request_notify);
+
+        let unsupported_wire: WireBuffer = x11_clipboard_test_selection_request(
+            100, 200, 202, 31, 301, 56, 5);
+        let unsupported_event: X11Event = x11_decode_event(&unsupported_wire, 0);
+        unsupported_event.selection_generation =
+            owner_connection.clipboard_selection.generation;
+        let unsupported_barrier: WireBuffer = x11_clipboard_test_owner_reply(14, 100);
+        let _unsupported_barrier_sent: i32 = x11_clipboard_test_send(
+            owner_pair.second, &unsupported_barrier);
+        let unsupported_status: X11ClipboardStatus = x11_clipboard_respond(
+            &owner_connection, unsupported_event, 100);
+        let unsupported_notify: WireBuffer = linux_receive_exact(owner_pair.second, 52, 100);
+        let unsupported_send: X11Request = x11_decode_request(&unsupported_notify, 0);
+        let unsupported_barrier_frame: X11Request = x11_decode_request(
+            &unsupported_notify, 44);
+        let unsupported_delivered: X11Event = x11_clipboard_test_decode_sent_event(
+            &unsupported_notify, 12);
+        failures = failures + x11_clipboard_expect(
+            unsupported_status == X11ClipboardStatus.UnsupportedTarget
+            && unsupported_send.valid == 1 && unsupported_send.opcode == 25
+            && unsupported_barrier_frame.valid == 1
+            && unsupported_barrier_frame.opcode == 23
+            && owner_connection.last_sent_sequence == 14
+            && unsupported_delivered.valid == 1
+            && unsupported_delivered.kind == X11EventKind.SelectionNotify
+            && unsupported_delivered.property_atom == 0,
+            "legacy STRING target is rejected without guessed encoding and notified with None");
+        wire_free(&unsupported_wire); wire_free(&unsupported_notify);
+
+        let clear_owner_wire: WireBuffer = x11_clipboard_test_selection_clear(100, 202, 60, 4);
+        let _clear_owner_sent: i32 = x11_clipboard_test_send(owner_pair.second, &clear_owner_wire);
+        let cleared_event: X11Event = x11_next_event(&owner_connection, 100);
+        failures = failures + x11_clipboard_expect(cleared_event.valid == 1
+            && cleared_event.kind == X11EventKind.SelectionClear
+            && owner_connection.clipboard_selection.valid == 0
+            && owner_connection.clipboard_selection.text.bytes.cap == 0,
+            "SelectionClear revokes and frees clipboard authority before publication");
+        let stale_request_wire: WireBuffer = x11_clipboard_test_selection_request(
+            100, 200, 202, 201, 302, 61, 5);
+        let stale_request: X11Event = x11_decode_event(&stale_request_wire, 0);
+        let stale_request_barrier: WireBuffer = x11_clipboard_test_owner_reply(16, 0);
+        let _stale_request_barrier_sent: i32 = x11_clipboard_test_send(
+            owner_pair.second, &stale_request_barrier);
+        let stale_status: X11ClipboardStatus = x11_clipboard_respond(
+            &owner_connection, stale_request, 100);
+        let stale_notify: WireBuffer = linux_receive_exact(owner_pair.second, 52, 100);
+        let stale_send: X11Request = x11_decode_request(&stale_notify, 0);
+        let stale_barrier_frame: X11Request = x11_decode_request(&stale_notify, 44);
+        let stale_delivered: X11Event = x11_clipboard_test_decode_sent_event(
+            &stale_notify, 12);
+        failures = failures + x11_clipboard_expect(stale_status == X11ClipboardStatus.NotOwner
+            && stale_send.valid == 1 && stale_send.opcode == 25
+            && stale_barrier_frame.valid == 1 && stale_barrier_frame.opcode == 23
+            && owner_connection.last_sent_sequence == 16
+            && stale_delivered.valid == 1 && stale_delivered.property_atom == 0,
+            "cleared clipboard bytes can never answer a later SelectionRequest");
+        wire_free(&stale_request_wire); wire_free(&stale_notify);
+
+        let invalid_response_wire: WireBuffer = x11_clipboard_test_selection_request(
+            100, 200, 202, 201, 302, 61, 6);
+        let invalid_response_event: X11Event = x11_decode_event(
+            &invalid_response_wire, 0);
+        invalid_response_event.time = 4294967296;
+        let invalid_response_status: X11ClipboardStatus = x11_clipboard_respond(
+            &owner_connection, invalid_response_event, 100);
+        failures = failures + x11_clipboard_expect(
+            invalid_response_status == X11ClipboardStatus.InvalidArgument
+            && owner_connection.last_sent_sequence == 16
+            && linux_poll_readable(owner_pair.second, 0) == 0,
+            "constructed out-of-domain SelectionRequest fails before property or notify bytes");
+        wire_free(&invalid_response_wire);
+
+        let invalid_utf8: ArrayList[u8] = make[u8](2);
+        push[u8](&invalid_utf8, 192 as u8); push[u8](&invalid_utf8, 128 as u8);
+        failures = failures + x11_clipboard_expect(x11_clipboard_copy(&owner_connection,
+            100, X11SelectionKind.Clipboard, invalid_utf8.data[0..2], 62, 100)
+            == X11ClipboardStatus.InvalidUtf8,
+            "copy rejects malformed UTF-8 before changing selection authority");
+        free[u8](&invalid_utf8);
+        let oversized: ArrayList[u8] = make[u8]((x11_selection_max_bytes() + 1) as i32);
+        let oversized_i: t27 = 0;
+        while (oversized_i <= x11_selection_max_bytes()) {
+            push[u8](&oversized, 0 as u8); oversized_i = oversized_i + 1;
+        }
+        let oversized_request: WireBuffer = x11_change_property8_request(100, 300, 201,
+            oversized.data[0..oversized.len]);
+        failures = failures + x11_clipboard_expect(oversized_request.error != 0
+            && len[u8](oversized_request.bytes) == 0
+            && x11_clipboard_copy(&owner_connection,
+            100, X11SelectionKind.Clipboard,
+            oversized.data[0..oversized.len], 63, 100) == X11ClipboardStatus.TooLarge,
+            "wire builder and copy reject payloads before unsupported INCR allocation");
+        wire_free(&oversized_request); free[u8](&oversized);
+
+        let _prior_owned: i32 = x11_clipboard_store_owned(&owner_connection,
+            202, 100, 63, "prior");
+        let prior_limit: t27 = owner_connection.setup.maximum_request_length;
+        owner_connection.setup.maximum_request_length = 6;
+        let server_bound_status: X11ClipboardStatus = x11_clipboard_copy(
+            &owner_connection, 200, X11SelectionKind.Clipboard, "x", 64, 100);
+        owner_connection.setup.maximum_request_length = prior_limit;
+        let unregistered_read: X11ClipboardReadResult = x11_clipboard_read(
+            &owner_connection, 999, X11SelectionKind.Clipboard, 64, 100, 64);
+        failures = failures + x11_clipboard_expect(
+            server_bound_status == X11ClipboardStatus.TooLarge
+            && x11_clipboard_copy(&owner_connection, 999,
+                X11SelectionKind.Clipboard, "x", 64, 100)
+                == X11ClipboardStatus.InvalidArgument
+            && unregistered_read.status == X11ClipboardStatus.InvalidArgument
+            && owner_connection.clipboard_selection.valid == 1
+            && owner_connection.clipboard_selection.owner_window == 100
+            && @strEq(text_buffer_view(
+                &owner_connection.clipboard_selection.text), "prior") == 1
+            && linux_poll_readable(owner_pair.second, 0) == 0,
+            "server request bound and unregistered XIDs reject before sending or replacing prior authority");
+        x11_clipboard_read_result_free(&unregistered_read);
+
+        let rejected_owner_reply: WireBuffer = x11_clipboard_test_owner_reply(18, 100);
+        let _rejected_owner_reply_sent: i32 = x11_clipboard_test_send(
+            owner_pair.second, &rejected_owner_reply);
+        let rejected_owner_status: X11ClipboardStatus = x11_clipboard_copy(
+            &owner_connection, 200, X11SelectionKind.Clipboard,
+            "replacement", 64, 100);
+        let rejected_owner_requests: WireBuffer = linux_receive_exact(
+            owner_pair.second, 24, 100);
+        failures = failures + x11_clipboard_expect(
+            rejected_owner_status == X11ClipboardStatus.OwnershipRejected
+            && owner_connection.clipboard_selection.valid == 1
+            && owner_connection.clipboard_selection.owner_window == 100
+            && @strEq(text_buffer_view(
+                &owner_connection.clipboard_selection.text), "prior") == 1
+            && x11_decode_request(&rejected_owner_requests, 0).opcode == 22
+            && x11_decode_request(&rejected_owner_requests, 16).opcode == 23,
+            "ignored multiwindow ownership timestamp preserves the prior local owner and bytes");
+        wire_free(&rejected_owner_requests);
+
+        let primary_owner_reply: WireBuffer = x11_clipboard_test_owner_reply(20, 100);
+        let _primary_reply_sent: i32 = x11_clipboard_test_send(
+            owner_pair.second, &primary_owner_reply);
+        let primary_status: X11ClipboardStatus = x11_clipboard_copy(
+            &owner_connection, 100, X11SelectionKind.Primary, "primary", 64, 100);
+        let primary_requests: WireBuffer = linux_receive_exact(owner_pair.second, 24, 100);
+        let ignored_release_preflight: WireBuffer = x11_clipboard_test_owner_reply(22, 100);
+        let ignored_release_reply: WireBuffer = x11_clipboard_test_owner_reply(24, 100);
+        let ignored_ungrab_reply: WireBuffer = x11_clipboard_test_owner_reply(26, 100);
+        let _ignored_release_reply_sent: i32 = x11_clipboard_test_send(
+            owner_pair.second, &ignored_release_preflight)
+            && x11_clipboard_test_send(owner_pair.second, &ignored_release_reply)
+            && x11_clipboard_test_send(owner_pair.second, &ignored_ungrab_reply);
+        let ignored_release_status: X11ClipboardStatus = x11_clipboard_release(
+            &owner_connection, X11SelectionKind.Primary, 1, 100);
+        let ignored_release_requests: WireBuffer = linux_receive_exact(
+            owner_pair.second, 48, 100);
+        let ignored_release_retained: i32 = owner_connection.primary_selection.valid == 1
+            && @strEq(text_buffer_view(
+                &owner_connection.primary_selection.text), "primary") == 1;
+        let primary_release_preflight: WireBuffer = x11_clipboard_test_owner_reply(28, 100);
+        let primary_release_reply: WireBuffer = x11_clipboard_test_owner_reply(30, 0);
+        let primary_ungrab_reply: WireBuffer = x11_clipboard_test_owner_reply(32, 0);
+        let _primary_release_reply_sent: i32 = x11_clipboard_test_send(
+            owner_pair.second, &primary_release_preflight)
+            && x11_clipboard_test_send(owner_pair.second, &primary_release_reply)
+            && x11_clipboard_test_send(owner_pair.second, &primary_ungrab_reply);
+        let primary_release_status: X11ClipboardStatus = x11_clipboard_release(
+            &owner_connection, X11SelectionKind.Primary, 65, 100);
+        let primary_release_request: WireBuffer = linux_receive_exact(owner_pair.second, 48, 100);
+        let _foreign_stale: i32 = x11_clipboard_store_owned(&owner_connection,
+            1, 100, 66, "foreign-stale");
+        let foreign_clear_wire: WireBuffer = x11_clipboard_test_selection_clear(
+            100, 1, 67, 33);
+        let foreign_release_reply: WireBuffer = x11_clipboard_test_owner_reply(34, 777);
+        let foreign_ungrab_reply: WireBuffer = x11_clipboard_test_owner_reply(36, 777);
+        let _foreign_release_reply_sent: i32 = x11_clipboard_test_send(
+            owner_pair.second, &foreign_clear_wire)
+            && x11_clipboard_test_send(owner_pair.second, &foreign_release_reply)
+            && x11_clipboard_test_send(owner_pair.second, &foreign_ungrab_reply);
+        let foreign_release_status: X11ClipboardStatus = x11_clipboard_release(
+            &owner_connection, X11SelectionKind.Primary, 66, 100);
+        let foreign_release_requests: WireBuffer = linux_receive_exact(
+            owner_pair.second, 24, 100);
+        let foreign_clear: X11Event = x11_next_event(&owner_connection, 0);
+        let foreign_no_tail: i32 = x11_clipboard_test_no_more_bytes(
+            owner_pair.second);
+        failures = failures + x11_clipboard_expect(primary_status == X11ClipboardStatus.Ok
+            && wire_read_u32_le(&primary_requests, 8) == 1
+            && ignored_release_status == X11ClipboardStatus.OwnershipRejected
+            && ignored_release_retained == 1
+            && owner_connection.primary_selection.valid == 0
+            && primary_release_status == X11ClipboardStatus.Ok
+            && x11_decode_request(&ignored_release_requests, 0).opcode == 36
+            && x11_decode_request(&ignored_release_requests, 4).opcode == 23
+            && wire_read_u32_le(&ignored_release_requests, 8) == 1
+            && x11_decode_request(&ignored_release_requests, 12).opcode == 22
+            && wire_read_u32_le(&ignored_release_requests, 16) == 0
+            && wire_read_u32_le(&ignored_release_requests, 20) == 1
+            && wire_read_u32_le(&ignored_release_requests, 24) == 1
+            && x11_decode_request(&ignored_release_requests, 28).opcode == 23
+            && wire_read_u32_le(&ignored_release_requests, 32) == 1
+            && x11_decode_request(&ignored_release_requests, 36).opcode == 37
+            && x11_decode_request(&ignored_release_requests, 40).opcode == 23
+            && wire_read_u32_le(&ignored_release_requests, 44) == 1
+            && x11_decode_request(&primary_release_request, 0).opcode == 36
+            && x11_decode_request(&primary_release_request, 4).opcode == 23
+            && wire_read_u32_le(&primary_release_request, 8) == 1
+            && x11_decode_request(&primary_release_request, 12).opcode == 22
+            && wire_read_u32_le(&primary_release_request, 16) == 0
+            && wire_read_u32_le(&primary_release_request, 20) == 1
+            && wire_read_u32_le(&primary_release_request, 24) == 65
+            && x11_decode_request(&primary_release_request, 28).opcode == 23
+            && wire_read_u32_le(&primary_release_request, 32) == 1
+            && x11_decode_request(&primary_release_request, 36).opcode == 37
+            && x11_decode_request(&primary_release_request, 40).opcode == 23
+            && wire_read_u32_le(&primary_release_request, 44) == 1,
+            "PRIMARY retains ignored release authority until GetSelectionOwner verifies None");
+        failures = failures + x11_clipboard_expect(
+            foreign_release_status == X11ClipboardStatus.NotOwner
+            && foreign_clear.valid == 1
+            && foreign_clear.kind == X11EventKind.SelectionClear
+            && foreign_clear.selection_generation != 0
+            && owner_connection.primary_selection.valid == 0
+            && owner_connection.primary_selection.text.bytes.cap == 0
+            && x11_decode_request(&foreign_release_requests, 0).opcode == 36
+            && x11_decode_request(&foreign_release_requests, 4).opcode == 23
+            && wire_read_u32_le(&foreign_release_requests, 8) == 1
+            && x11_decode_request(&foreign_release_requests, 12).opcode == 37
+            && x11_decode_request(&foreign_release_requests, 16).opcode == 23
+            && wire_read_u32_le(&foreign_release_requests, 20) == 1
+            && len[u8](foreign_release_requests.bytes) == 24
+            && foreign_no_tail == 1,
+            "server-grabbed foreign preflight revokes stale local PRIMARY without SetOwner(None)");
+        wire_free(&primary_requests); wire_free(&ignored_release_requests);
+        wire_free(&primary_release_request); wire_free(&foreign_release_requests);
+        x11_disconnect(&owner_connection);
+        let _owner_peer_closed: i64 = linux_close(owner_pair.second);
+    }
+
+    let alias_pair: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + x11_clipboard_expect(alias_pair.ok == 1,
+        "clipboard alias and generation fake peer opens");
+    if (alias_pair.ok == 1) {
+        let alias_connection: X11NativeConnection = x11_clipboard_test_connection(
+            alias_pair.first, 1);
+        let _alias_stored: i32 = x11_clipboard_store_owned(
+            &alias_connection, 202, 100, 50, "borrowed");
+        let first_generation: t27 = alias_connection.clipboard_selection.generation;
+        let future_copy: X11ClipboardStatus = x11_clipboard_copy(
+            &alias_connection, 100, X11SelectionKind.Clipboard,
+            "future", 51, 100);
+        let self_owner_reply: WireBuffer = x11_clipboard_test_owner_reply(1, 100);
+        let _self_owner_sent: i32 = x11_clipboard_test_send(
+            alias_pair.second, &self_owner_reply);
+        let future_self_read: X11ClipboardReadResult = x11_clipboard_read(
+            &alias_connection, 200, X11SelectionKind.Clipboard, 51, 100, 64);
+        let self_read_request: WireBuffer = linux_receive_exact(
+            alias_pair.second, 8, 100);
+
+        let old_generation_request_wire: WireBuffer =
+            x11_clipboard_test_selection_request(
+                100, 200, 202, 201, 300, 50, 2);
+        let old_generation_request: X11Event = x11_decode_event(
+            &old_generation_request_wire, 0);
+        let _old_request_queued: i32 = x11_note_event(
+            &alias_connection, old_generation_request);
+        let old_clear_wire: WireBuffer = x11_clipboard_test_selection_clear(
+            100, 202, 60, 2);
+        let old_clear: X11Event = x11_decode_event(&old_clear_wire, 0);
+        let _old_clear_queued: i32 = x11_note_event(&alias_connection, old_clear);
+        // Force the wrap candidate to one; the tagged request/clear collision
+        // must advance to generation two without evaluating max + one.
+        alias_connection.clipboard_selection.generation = flashy_t27_max();
+        let borrowed: []u8 = text_buffer_view(
+            &alias_connection.clipboard_selection.text);
+        let alias_owner_reply: WireBuffer = x11_clipboard_test_owner_reply(2, 100);
+        let _alias_owner_sent: i32 = x11_clipboard_test_send(
+            alias_pair.second, &alias_owner_reply);
+        let alias_copy: X11ClipboardStatus = x11_clipboard_copy(
+            &alias_connection, 100, X11SelectionKind.Clipboard,
+            borrowed, 0, 100);
+        let alias_requests: WireBuffer = linux_receive_exact(
+            alias_pair.second, 8, 100);
+        let dequeued_old_request: X11Event = x11_next_event(&alias_connection, 0);
+        let old_request_barrier: WireBuffer = x11_clipboard_test_owner_reply(4, 100);
+        let _old_request_barrier_sent: i32 = x11_clipboard_test_send(
+            alias_pair.second, &old_request_barrier);
+        let old_generation_status: X11ClipboardStatus = x11_clipboard_respond(
+            &alias_connection, dequeued_old_request, 100);
+        let old_generation_response: WireBuffer = linux_receive_exact(
+            alias_pair.second, 52, 100);
+        let old_generation_notify: X11Event = x11_clipboard_test_decode_sent_event(
+            &old_generation_response, 12);
+        let dequeued_old_clear: X11Event = x11_next_event(&alias_connection, 0);
+
+        let no_slot_clear_wire: WireBuffer = x11_clipboard_test_selection_clear(
+            100, 1, 70, 3);
+        let no_slot_clear: X11Event = x11_decode_event(&no_slot_clear_wire, 0);
+        let _no_slot_clear_queued: i32 = x11_note_event(
+            &alias_connection, no_slot_clear);
+        let _new_primary: i32 = x11_clipboard_store_owned(
+            &alias_connection, 1, 100, 70, "new-primary");
+        let dequeued_no_slot_clear: X11Event = x11_next_event(
+            &alias_connection, 0);
+        failures = failures + x11_clipboard_expect(
+            future_copy == X11ClipboardStatus.OwnershipRejected
+            && future_self_read.status == X11ClipboardStatus.ConversionRejected
+            && future_self_read.valid == 0
+            && len[u8](self_read_request.bytes) == 8
+            && x11_decode_request(&self_read_request, 0).opcode == 23
+            && alias_copy == X11ClipboardStatus.Ok
+            && len[u8](alias_requests.bytes) == 8
+            && x11_decode_request(&alias_requests, 0).opcode == 23
+            && wire_read_u32_le(&alias_requests, 4) == 202
+            && dequeued_old_request.valid == 1
+            && dequeued_old_request.kind == X11EventKind.SelectionRequest
+            && dequeued_old_request.selection_generation == first_generation
+            && old_generation_status == X11ClipboardStatus.OwnershipRejected
+            && x11_decode_request(&old_generation_response, 0).opcode == 25
+            && x11_decode_request(&old_generation_response, 44).opcode == 23
+            && old_generation_notify.valid == 1
+            && old_generation_notify.property_atom == 0
+            && dequeued_old_clear.valid == 1
+            && dequeued_old_clear.selection_generation == first_generation
+            && alias_connection.clipboard_selection.valid == 1
+            && alias_connection.clipboard_selection.generation == 2
+            && @strEq(text_buffer_view(
+                &alias_connection.clipboard_selection.text), "borrowed") == 1
+            && dequeued_no_slot_clear.valid == 1
+            && dequeued_no_slot_clear.selection_generation == 0
+            && alias_connection.primary_selection.valid == 1
+            && @strEq(text_buffer_view(
+                &alias_connection.primary_selection.text), "new-primary") == 1,
+            "same-owner future timestamps fail closed while borrowed bytes and new generations survive queued Clears");
+        wire_free(&self_read_request); wire_free(&old_generation_request_wire);
+        wire_free(&old_clear_wire); wire_free(&alias_requests);
+        wire_free(&old_generation_response); wire_free(&no_slot_clear_wire);
+        x11_clipboard_read_result_free(&future_self_read);
+        x11_disconnect(&alias_connection);
+        let _alias_peer_closed: i64 = linux_close(alias_pair.second);
+    }
+
+    let untagged_request_pair: LinuxFdPair = linux_socketpair_stream();
+    if (untagged_request_pair.ok == 1) {
+        let untagged_connection: X11NativeConnection = x11_clipboard_test_connection(
+            untagged_request_pair.first, 1);
+        let untagged_wire: WireBuffer = x11_clipboard_test_selection_request(
+            100, 200, 202, 201, 300, 1, 1);
+        let untagged_event: X11Event = x11_decode_event(&untagged_wire, 0);
+        let _untagged_queued: i32 = x11_note_event(
+            &untagged_connection, untagged_event);
+        let _later_owned: i32 = x11_clipboard_store_owned(
+            &untagged_connection, 202, 100, 1, "later");
+        let dequeued_untagged: X11Event = x11_next_event(
+            &untagged_connection, 0);
+        let untagged_barrier: WireBuffer = x11_clipboard_test_owner_reply(2, 100);
+        let _untagged_barrier_sent: i32 = x11_clipboard_test_send(
+            untagged_request_pair.second, &untagged_barrier);
+        let untagged_status: X11ClipboardStatus = x11_clipboard_respond(
+            &untagged_connection, dequeued_untagged, 100);
+        let untagged_response: WireBuffer = linux_receive_exact(
+            untagged_request_pair.second, 52, 100);
+        let untagged_notify: X11Event = x11_clipboard_test_decode_sent_event(
+            &untagged_response, 12);
+        failures = failures + x11_clipboard_expect(
+            dequeued_untagged.valid == 1
+            && dequeued_untagged.selection_generation == 0
+            && untagged_status == X11ClipboardStatus.OwnershipRejected
+            && x11_decode_request(&untagged_response, 0).opcode == 25
+            && x11_decode_request(&untagged_response, 44).opcode == 23
+            && untagged_notify.valid == 1 && untagged_notify.property_atom == 0
+            && untagged_connection.clipboard_selection.valid == 1
+            && @strEq(text_buffer_view(
+                &untagged_connection.clipboard_selection.text), "later") == 1,
+            "request queued without prior authority cannot expose a later acquisition");
+        wire_free(&untagged_wire); wire_free(&untagged_response);
+        x11_disconnect(&untagged_connection);
+        let _untagged_peer_closed: i64 = linux_close(untagged_request_pair.second);
+    } else { failures = failures + 1; }
+
+    let response_error_pair: LinuxFdPair = linux_socketpair_stream();
+    if (response_error_pair.ok == 1) {
+        let response_error_connection: X11NativeConnection =
+            x11_clipboard_test_connection(response_error_pair.first, 1);
+        let _response_owned: i32 = x11_clipboard_store_owned(
+            &response_error_connection, 202, 100, 1, "secret");
+        let response_error_wire: WireBuffer = x11_clipboard_test_selection_request(
+            100, 200, 202, 201, 300, 1, 1);
+        let response_error_event: X11Event = x11_decode_event(
+            &response_error_wire, 0);
+        response_error_event.selection_generation =
+            response_error_connection.clipboard_selection.generation;
+        let change_error: WireBuffer = x11_clipboard_test_error(1, 18);
+        let _change_error_sent: i32 = x11_clipboard_test_send(
+            response_error_pair.second, &change_error);
+        let response_error_status: X11ClipboardStatus = x11_clipboard_respond(
+            &response_error_connection, response_error_event, 100);
+        let response_error_requests: WireBuffer = linux_receive_exact(
+            response_error_pair.second, 40, 100);
+        let response_error_no_notify: i32 = x11_clipboard_test_no_more_bytes(
+            response_error_pair.second);
+        failures = failures + x11_clipboard_expect(
+            response_error_status == X11ClipboardStatus.TransportFailed
+            && x11_decode_request(&response_error_requests, 0).opcode == 18
+            && x11_decode_request(&response_error_requests, 32).opcode == 23
+            && len[u8](response_error_requests.bytes) == 40
+            && response_error_no_notify == 1
+            && response_error_connection.authenticated == 0
+            && response_error_connection.fd == -1
+            && response_error_connection.clipboard_selection.valid == 0,
+            "ChangeProperty X error is terminal before any success SelectionNotify");
+        wire_free(&response_error_wire); wire_free(&response_error_requests);
+        x11_disconnect(&response_error_connection);
+        let _response_error_peer_closed: i64 = linux_close(
+            response_error_pair.second);
+    } else { failures = failures + 1; }
+
+    let presend_timeout_pair: LinuxFdPair = linux_socketpair_stream();
+    if (presend_timeout_pair.ok == 1) {
+        let presend_timeout_connection: X11NativeConnection =
+            x11_clipboard_test_connection(presend_timeout_pair.first, 1);
+        let _presend_timeout_owned: i32 = x11_clipboard_store_owned(
+            &presend_timeout_connection, 202, 100, 1, "unsent");
+        let presend_timeout_status: X11ClipboardStatus =
+            x11_clipboard_finish_response(&presend_timeout_connection,
+                X11ClipboardStatus.Timeout);
+        let presend_bytes: WireBuffer = linux_receive_exact(
+            presend_timeout_pair.second, 1, 100);
+        failures = failures + x11_clipboard_expect(
+            presend_timeout_status == X11ClipboardStatus.Timeout
+            && len[u8](presend_bytes.bytes) == 0
+            && presend_timeout_connection.last_failure_timeout == 1
+            && presend_timeout_connection.authenticated == 0
+            && presend_timeout_connection.connected == 0
+            && presend_timeout_connection.fd == -1
+            && presend_timeout_connection.clipboard_selection.valid == 0,
+            "pre-send SelectionRequest deadline expiry retires without emitting partial authority");
+        wire_free(&presend_bytes); x11_disconnect(&presend_timeout_connection);
+        let _presend_timeout_peer_closed: i64 = linux_close(
+            presend_timeout_pair.second);
+    } else { failures = failures + 1; }
+
+    let response_timeout_pair: LinuxFdPair = linux_socketpair_stream();
+    if (response_timeout_pair.ok == 1) {
+        let response_timeout_connection: X11NativeConnection =
+            x11_clipboard_test_connection(response_timeout_pair.first, 1);
+        let _response_timeout_owned: i32 = x11_clipboard_store_owned(
+            &response_timeout_connection, 202, 100, 1, "slow");
+        let response_timeout_wire: WireBuffer = x11_clipboard_test_selection_request(
+            100, 200, 202, 201, 300, 1, 1);
+        let response_timeout_event: X11Event = x11_decode_event(
+            &response_timeout_wire, 0);
+        let _response_timeout_queued: i32 = x11_note_event(
+            &response_timeout_connection, response_timeout_event);
+        let consumed_timeout_event: X11Event = x11_next_event(
+            &response_timeout_connection, 0);
+        wire_free(&response_timeout_wire);
+        let verified_barrier_reply: WireBuffer = x11_clipboard_test_owner_reply(
+            1, 100);
+        let _verified_barrier_sent: i32 = x11_clipboard_test_send(
+            response_timeout_pair.second, &verified_barrier_reply);
+        let verified_barrier_status: X11ClipboardStatus =
+            x11_clipboard_round_trip_until(&response_timeout_connection,
+                202, linux_monotonic_ms() + 100);
+        let expired_notify_status: X11ClipboardStatus =
+            x11_clipboard_notify_success_until(&response_timeout_connection,
+                consumed_timeout_event, 300, linux_monotonic_ms() - 1);
+        let response_timeout_status: X11ClipboardStatus =
+            x11_clipboard_finish_response(&response_timeout_connection,
+                expired_notify_status);
+        let response_timeout_requests: WireBuffer = linux_receive_exact(
+            response_timeout_pair.second, 8, 100);
+        let response_timeout_no_notify: i32 =
+            x11_clipboard_test_no_more_bytes(response_timeout_pair.second);
+        failures = failures + x11_clipboard_expect(
+            consumed_timeout_event.valid == 1
+            && consumed_timeout_event.kind == X11EventKind.SelectionRequest
+            && consumed_timeout_event.selection_generation != 0
+            && verified_barrier_status == X11ClipboardStatus.Ok
+            && expired_notify_status == X11ClipboardStatus.Timeout
+            && response_timeout_status == X11ClipboardStatus.Timeout
+            && len[u8](response_timeout_requests.bytes) == 8
+            && x11_decode_request(&response_timeout_requests, 0).opcode == 23
+            && wire_read_u32_le(&response_timeout_requests, 4) == 202
+            && response_timeout_no_notify == 1
+            && response_timeout_connection.last_failure_timeout == 1
+            && response_timeout_connection.authenticated == 0
+            && response_timeout_connection.connected == 0
+            && response_timeout_connection.fd == -1
+            && response_timeout_connection.clipboard_selection.valid == 0
+            && len[X11Event](response_timeout_connection.pending_events) == 0,
+            "expired post-barrier success Notify emits no SendEvent and retires consumed request authority");
+        wire_free(&response_timeout_requests);
+        x11_disconnect(&response_timeout_connection);
+        let _response_timeout_peer_closed: i64 = linux_close(
+            response_timeout_pair.second);
+    } else { failures = failures + 1; }
+
+    let malformed_owner_pair: LinuxFdPair = linux_socketpair_stream();
+    if (malformed_owner_pair.ok == 1) {
+        let malformed_owner_connection: X11NativeConnection =
+            x11_clipboard_test_connection(malformed_owner_pair.first, 1);
+        let _malformed_owner_stale: i32 = x11_clipboard_store_owned(
+            &malformed_owner_connection, 202, 100, 1, "stale");
+        let malformed_owner_reply: WireBuffer = x11_clipboard_test_owner_reply(
+            2, 536870912);
+        let _malformed_owner_sent: i32 = x11_clipboard_test_send(
+            malformed_owner_pair.second, &malformed_owner_reply);
+        let malformed_owner_status: X11ClipboardStatus = x11_clipboard_copy(
+            &malformed_owner_connection, 200, X11SelectionKind.Clipboard,
+            "replacement", 1, 100);
+        let malformed_owner_requests: WireBuffer = linux_receive_exact(
+            malformed_owner_pair.second, 24, 100);
+        failures = failures + x11_clipboard_expect(
+            malformed_owner_status == X11ClipboardStatus.MalformedReply
+            && x11_decode_request(&malformed_owner_requests, 0).opcode == 22
+            && x11_decode_request(&malformed_owner_requests, 16).opcode == 23
+            && malformed_owner_connection.authenticated == 0
+            && malformed_owner_connection.fd == -1
+            && malformed_owner_connection.clipboard_selection.valid == 0
+            && malformed_owner_connection.clipboard_selection.text.bytes.cap == 0,
+            "malformed GetSelectionOwner verification is terminal, not ownership rejection");
+        wire_free(&malformed_owner_requests);
+        x11_disconnect(&malformed_owner_connection);
+        let _malformed_owner_peer_closed: i64 = linux_close(
+            malformed_owner_pair.second);
+    } else { failures = failures + 1; }
+
+    let malformed_release_pair: LinuxFdPair = linux_socketpair_stream();
+    if (malformed_release_pair.ok == 1) {
+        let malformed_release_connection: X11NativeConnection =
+            x11_clipboard_test_connection(malformed_release_pair.first, 1);
+        let _malformed_release_owned: i32 = x11_clipboard_store_owned(
+            &malformed_release_connection, 1, 100, 1, "stale");
+        let malformed_release_reply: WireBuffer = x11_clipboard_test_owner_reply(
+            2, 536870912);
+        let _malformed_release_sent: i32 = x11_clipboard_test_send(
+            malformed_release_pair.second, &malformed_release_reply);
+        let malformed_release_status: X11ClipboardStatus = x11_clipboard_release(
+            &malformed_release_connection, X11SelectionKind.Primary, 1, 100);
+        let malformed_release_requests: WireBuffer = linux_receive_exact(
+            malformed_release_pair.second, 12, 100);
+        let malformed_release_no_tail: i32 = x11_clipboard_test_no_more_bytes(
+            malformed_release_pair.second);
+        failures = failures + x11_clipboard_expect(
+            malformed_release_status == X11ClipboardStatus.MalformedReply
+            && x11_decode_request(&malformed_release_requests, 0).opcode == 36
+            && x11_decode_request(&malformed_release_requests, 4).opcode == 23
+            && malformed_release_no_tail == 1
+            && malformed_release_connection.authenticated == 0
+            && malformed_release_connection.primary_selection.valid == 0,
+            "malformed release verification retires transport and local authority");
+        wire_free(&malformed_release_requests);
+        x11_disconnect(&malformed_release_connection);
+        let _malformed_release_peer_closed: i64 = linux_close(
+            malformed_release_pair.second);
+    } else { failures = failures + 1; }
+
+    let stalled_release_pair: LinuxFdPair = linux_socketpair_stream();
+    if (stalled_release_pair.ok == 1) {
+        let stalled_release_connection: X11NativeConnection =
+            x11_clipboard_test_connection(stalled_release_pair.first, 1);
+        let _stalled_release_owned: i32 = x11_clipboard_store_owned(
+            &stalled_release_connection, 1, 100, 1, "stalled");
+        let stalled_started: i64 = linux_monotonic_ms();
+        let stalled_release_status: X11ClipboardStatus = x11_clipboard_release(
+            &stalled_release_connection, X11SelectionKind.Primary, 0, 5000);
+        let stalled_elapsed: i64 = linux_monotonic_ms() - stalled_started;
+        let stalled_release_requests: WireBuffer = linux_receive_exact(
+            stalled_release_pair.second, 12, 100);
+        let stalled_release_no_tail: i32 = x11_clipboard_test_no_more_bytes(
+            stalled_release_pair.second);
+        failures = failures + x11_clipboard_expect(
+            stalled_release_status == X11ClipboardStatus.Timeout
+            && stalled_elapsed < 1000
+            && x11_decode_request(&stalled_release_requests, 0).opcode == 36
+            && x11_decode_request(&stalled_release_requests, 4).opcode == 23
+            && stalled_release_no_tail == 1
+            && stalled_release_connection.authenticated == 0
+            && stalled_release_connection.fd == -1
+            && stalled_release_connection.primary_selection.valid == 0,
+            "server grab is capped at 250ms and stalled preflight retires the grabbing client");
+        wire_free(&stalled_release_requests);
+        x11_disconnect(&stalled_release_connection);
+        let _stalled_release_peer_closed: i64 = linux_close(
+            stalled_release_pair.second);
+    } else { failures = failures + 1; }
+
+    let release_clear_error_pair: LinuxFdPair = linux_socketpair_stream();
+    if (release_clear_error_pair.ok == 1) {
+        let release_clear_error_connection: X11NativeConnection =
+            x11_clipboard_test_connection(release_clear_error_pair.first, 1);
+        let _release_clear_owned: i32 = x11_clipboard_store_owned(
+            &release_clear_error_connection, 1, 100, 1, "clear-error");
+        let release_clear_preflight: WireBuffer = x11_clipboard_test_owner_reply(2, 100);
+        let release_clear_error: WireBuffer = x11_clipboard_test_error(3, 22);
+        let _release_clear_preflight_sent: i32 = x11_clipboard_test_send(
+            release_clear_error_pair.second, &release_clear_preflight);
+        let _release_clear_error_sent: i32 = x11_clipboard_test_send(
+            release_clear_error_pair.second, &release_clear_error);
+        let release_clear_status: X11ClipboardStatus = x11_clipboard_release(
+            &release_clear_error_connection, X11SelectionKind.Primary, 1, 100);
+        let release_clear_requests: WireBuffer = linux_receive_exact(
+            release_clear_error_pair.second, 36, 100);
+        let release_clear_no_tail: i32 = x11_clipboard_test_no_more_bytes(
+            release_clear_error_pair.second);
+        failures = failures + x11_clipboard_expect(
+            release_clear_status == X11ClipboardStatus.TransportFailed
+            && x11_decode_request(&release_clear_requests, 0).opcode == 36
+            && x11_decode_request(&release_clear_requests, 4).opcode == 23
+            && x11_decode_request(&release_clear_requests, 12).opcode == 22
+            && x11_decode_request(&release_clear_requests, 28).opcode == 23
+            && release_clear_no_tail == 1
+            && release_clear_error_connection.authenticated == 0
+            && release_clear_error_connection.fd == -1,
+            "SetSelectionOwner X error retires the client while server grab is active");
+        wire_free(&release_clear_requests);
+        x11_disconnect(&release_clear_error_connection);
+        let _release_clear_error_peer_closed: i64 = linux_close(
+            release_clear_error_pair.second);
+    } else { failures = failures + 1; }
+
+    let ungrab_error_pair: LinuxFdPair = linux_socketpair_stream();
+    if (ungrab_error_pair.ok == 1) {
+        let ungrab_error_connection: X11NativeConnection =
+            x11_clipboard_test_connection(ungrab_error_pair.first, 1);
+        let _ungrab_error_owned: i32 = x11_clipboard_store_owned(
+            &ungrab_error_connection, 1, 100, 1, "ungrab-error");
+        let ungrab_preflight: WireBuffer = x11_clipboard_test_owner_reply(2, 100);
+        let ungrab_verify: WireBuffer = x11_clipboard_test_owner_reply(4, 0);
+        let ungrab_error: WireBuffer = x11_clipboard_test_error(5, 37);
+        let _ungrab_preflight_sent: i32 = x11_clipboard_test_send(
+            ungrab_error_pair.second, &ungrab_preflight);
+        let _ungrab_verify_sent: i32 = x11_clipboard_test_send(
+            ungrab_error_pair.second, &ungrab_verify);
+        let _ungrab_error_sent: i32 = x11_clipboard_test_send(
+            ungrab_error_pair.second, &ungrab_error);
+        let ungrab_error_status: X11ClipboardStatus = x11_clipboard_release(
+            &ungrab_error_connection, X11SelectionKind.Primary, 1, 100);
+        let ungrab_error_requests: WireBuffer = linux_receive_exact(
+            ungrab_error_pair.second, 48, 100);
+        let ungrab_error_no_tail: i32 = x11_clipboard_test_no_more_bytes(
+            ungrab_error_pair.second);
+        failures = failures + x11_clipboard_expect(
+            ungrab_error_status == X11ClipboardStatus.TransportFailed
+            && x11_decode_request(&ungrab_error_requests, 36).opcode == 37
+            && x11_decode_request(&ungrab_error_requests, 40).opcode == 23
+            && ungrab_error_no_tail == 1
+            && ungrab_error_connection.authenticated == 0
+            && ungrab_error_connection.fd == -1,
+            "UngrabServer X error retires the client instead of leaking a global grab");
+        wire_free(&ungrab_error_requests);
+        x11_disconnect(&ungrab_error_connection);
+        let _ungrab_error_peer_closed: i64 = linux_close(
+            ungrab_error_pair.second);
+    } else { failures = failures + 1; }
+
+    let read_pair: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + x11_clipboard_expect(read_pair.ok == 1,
+        "clipboard read fake peer opens");
+    if (read_pair.ok == 1) {
+        let read_peer: i64 = x11_clipboard_test_fork();
+        if (read_peer == 0) {
+            let _child_connection_closed: i64 = linux_close(read_pair.first);
+            let child_status: i32 = x11_clipboard_test_read_peer(read_pair.second, 1);
+            let _child_peer_closed: i64 = linux_close(read_pair.second);
+            x11_clipboard_test_child_exit(child_status);
+            return child_status;
+        }
+        let _parent_peer_closed: i64 = linux_close(read_pair.second);
+        let read_connection: X11NativeConnection = x11_clipboard_test_connection(
+            read_pair.first, 1);
+        let read_result: X11ClipboardReadResult = x11_clipboard_read(
+            &read_connection, 200, X11SelectionKind.Clipboard, 77, 1000, 64);
+        let read_peer_ok: i32 = x11_clipboard_test_wait_child(read_peer);
+        failures = failures + x11_clipboard_expect(read_peer > 0 && read_peer_ok == 1
+            && read_result.valid == 1 && read_result.status == X11ClipboardStatus.Ok
+            && @strEq(text_buffer_view(&read_result.text), "world") == 1
+            && read_connection.last_sent_sequence == 4
+            && len[X11Event](read_connection.pending_events) == 0,
+            "a real peer observes barrier/Delete/Convert before sending the only causal completion");
+        x11_clipboard_read_result_free(&read_result);
+        x11_disconnect(&read_connection);
+    }
+
+    let no_owner_pair: LinuxFdPair = linux_socketpair_stream();
+    if (no_owner_pair.ok == 1) {
+        let no_owner_connection: X11NativeConnection = x11_clipboard_test_connection(
+            no_owner_pair.first, 1);
+        let no_owner_reply: WireBuffer = x11_clipboard_test_owner_reply(1, 0);
+        let _no_owner_sent: i32 = x11_clipboard_test_send(
+            no_owner_pair.second, &no_owner_reply);
+        let no_owner_result: X11ClipboardReadResult = x11_clipboard_read(
+            &no_owner_connection, 200, X11SelectionKind.Clipboard, 88, 100, 64);
+        let no_owner_request: WireBuffer = linux_receive_exact(
+            no_owner_pair.second, 8, 100);
+        failures = failures + x11_clipboard_expect(
+            no_owner_result.status == X11ClipboardStatus.NoSelection
+            && no_owner_result.valid == 0
+            && no_owner_connection.authenticated == 1
+            && x11_decode_request(&no_owner_request, 0).opcode == 23
+            && linux_poll_readable(no_owner_pair.second, 0) == 0,
+            "authoritative GetSelectionOwner None is NoSelection without conversion traffic");
+        wire_free(&no_owner_request);
+        x11_clipboard_read_result_free(&no_owner_result);
+        x11_disconnect(&no_owner_connection);
+        let _no_owner_peer_closed: i64 = linux_close(no_owner_pair.second);
+    } else { failures = failures + 1; }
+
+    let reject_pair: LinuxFdPair = linux_socketpair_stream();
+    if (reject_pair.ok == 1) {
+        let reject_connection: X11NativeConnection = x11_clipboard_test_connection(reject_pair.first, 1);
+        let reject_barrier: WireBuffer = x11_clipboard_test_owner_reply(1, 777);
+        let rejected_notify: WireBuffer = x11_clipboard_test_selection_notify(
+            200, 202, 201, 0, 78, 3);
+        let _rejected_barrier_sent: i32 = x11_clipboard_test_send(
+            reject_pair.second, &reject_barrier);
+        let _rejected_sent: i32 = x11_clipboard_test_send(
+            reject_pair.second, &rejected_notify);
+        let rejected: X11ClipboardReadResult = x11_clipboard_read(&reject_connection,
+            200, X11SelectionKind.Clipboard, 78, 100, 64);
+        let rejected_requests: WireBuffer = linux_receive_exact(reject_pair.second, 44, 100);
+        failures = failures + x11_clipboard_expect(
+            rejected.status == X11ClipboardStatus.ConversionRejected
+            && rejected.valid == 0 && len[u8](rejected_requests.bytes) == 44
+            && reject_connection.authenticated == 1,
+            "SelectionNotify with property None is a typed conversion rejection");
+        wire_free(&rejected_requests); x11_clipboard_read_result_free(&rejected);
+        x11_disconnect(&reject_connection); let _reject_closed: i64 = linux_close(reject_pair.second);
+    } else { failures = failures + 1; }
+
+    let wrong_sequence_pair: LinuxFdPair = linux_socketpair_stream();
+    if (wrong_sequence_pair.ok == 1) {
+        let wrong_sequence_connection: X11NativeConnection = x11_clipboard_test_connection(
+            wrong_sequence_pair.first, 1);
+        let _stale_stored: i32 = x11_clipboard_store_owned(&wrong_sequence_connection,
+            202, 100, 1, "stale");
+        let wrong_barrier: WireBuffer = x11_clipboard_test_owner_reply(1, 777);
+        let wrong_notify: WireBuffer = x11_clipboard_test_selection_notify(
+            200, 202, 201, 203, 79, 3);
+        let wrong_reply: WireBuffer = x11_clipboard_test_property_reply(5, 201, 8, 0, "wrong");
+        let _wrong_barrier_sent: i32 = x11_clipboard_test_send(
+            wrong_sequence_pair.second, &wrong_barrier);
+        let _wrong_notify_sent: i32 = x11_clipboard_test_send(wrong_sequence_pair.second, &wrong_notify);
+        let _wrong_reply_sent: i32 = x11_clipboard_test_send(wrong_sequence_pair.second, &wrong_reply);
+        let wrong_result: X11ClipboardReadResult = x11_clipboard_read(
+            &wrong_sequence_connection, 200, X11SelectionKind.Clipboard, 79, 100, 64);
+        let wrong_requests: WireBuffer = linux_receive_exact(wrong_sequence_pair.second, 68, 100);
+        failures = failures + x11_clipboard_expect(
+            wrong_result.status == X11ClipboardStatus.TransportFailed
+            && wrong_sequence_connection.authenticated == 0
+            && wrong_sequence_connection.fd == -1
+            && wrong_sequence_connection.clipboard_selection.valid == 0
+            && wrong_sequence_connection.clipboard_selection.text.bytes.cap == 0
+            && len[X11Event](wrong_sequence_connection.pending_events) == 0,
+            "wrong property reply sequence retires transport and all stale clipboard authority");
+        wire_free(&wrong_requests); x11_clipboard_read_result_free(&wrong_result);
+        x11_disconnect(&wrong_sequence_connection);
+        let _wrong_sequence_closed: i64 = linux_close(wrong_sequence_pair.second);
+    } else { failures = failures + 1; }
+
+    let timeout_pair: LinuxFdPair = linux_socketpair_stream();
+    if (timeout_pair.ok == 1) {
+        let timeout_peer: i64 = x11_clipboard_test_fork();
+        if (timeout_peer == 0) {
+            let _child_connection_closed: i64 = linux_close(timeout_pair.first);
+            let child_status: i32 = x11_clipboard_test_read_peer(timeout_pair.second, 0);
+            let _child_peer_closed: i64 = linux_close(timeout_pair.second);
+            x11_clipboard_test_child_exit(child_status);
+            return child_status;
+        }
+        let _parent_peer_closed: i64 = linux_close(timeout_pair.second);
+        let timeout_connection: X11NativeConnection = x11_clipboard_test_connection(
+            timeout_pair.first, 1);
+        let _timeout_stale: i32 = x11_clipboard_store_owned(
+            &timeout_connection, 202, 100, 1, "stale");
+        let timeout_result: X11ClipboardReadResult = x11_clipboard_read(
+            &timeout_connection, 200, X11SelectionKind.Clipboard, 77, 100, 64);
+        let timeout_peer_ok: i32 = x11_clipboard_test_wait_child(timeout_peer);
+        failures = failures + x11_clipboard_expect(
+            timeout_peer > 0 && timeout_peer_ok == 1
+            && timeout_result.status == X11ClipboardStatus.Timeout
+            && timeout_connection.authenticated == 0 && timeout_connection.fd == -1
+            && timeout_connection.clipboard_selection.valid == 0
+            && timeout_connection.clipboard_selection.text.bytes.cap == 0
+            && len[X11Event](timeout_connection.pending_events) == 0,
+            "pre-barrier stale notify is drained, never authorizes GetProperty, and timeout retires authority");
+        x11_clipboard_read_result_free(&timeout_result);
+        x11_disconnect(&timeout_connection);
+    } else { failures = failures + 1; }
+
+    let malformed_event_pair: LinuxFdPair = linux_socketpair_stream();
+    if (malformed_event_pair.ok == 1) {
+        let malformed_event_connection: X11NativeConnection = x11_clipboard_test_connection(
+            malformed_event_pair.first, 1);
+        let _malformed_stale: i32 = x11_clipboard_store_owned(
+            &malformed_event_connection, 202, 100, 1, "stale");
+        let malformed_event_wire: WireBuffer = x11_clipboard_test_selection_request(
+            0, 200, 202, 201, 203, 79, 1);
+        let _malformed_event_sent: i32 = x11_clipboard_test_send(
+            malformed_event_pair.second, &malformed_event_wire);
+        let malformed_event: X11Event = x11_next_event(&malformed_event_connection, 100);
+        failures = failures + x11_clipboard_expect(malformed_event.valid == 0
+            && malformed_event_connection.authenticated == 0
+            && malformed_event_connection.clipboard_selection.valid == 0
+            && malformed_event_connection.clipboard_selection.text.bytes.cap == 0,
+            "malformed selection event is terminal and cannot preserve stale ownership");
+        x11_disconnect(&malformed_event_connection);
+        let _malformed_event_closed: i64 = linux_close(malformed_event_pair.second);
+    } else { failures = failures + 1; }
+
+    let missing_property_pair: LinuxFdPair = linux_socketpair_stream();
+    if (missing_property_pair.ok == 1) {
+        let missing_property_connection: X11NativeConnection =
+            x11_clipboard_test_connection(missing_property_pair.first, 1);
+        let missing_barrier: WireBuffer = x11_clipboard_test_owner_reply(1, 777);
+        let missing_notify: WireBuffer = x11_clipboard_test_selection_notify(
+            200, 202, 201, 203, 87, 3);
+        let missing_reply: WireBuffer = x11_clipboard_test_property_reply(
+            4, 0, 0, 0, "");
+        let _missing_barrier_sent: i32 = x11_clipboard_test_send(
+            missing_property_pair.second, &missing_barrier);
+        let _missing_notify_sent: i32 = x11_clipboard_test_send(
+            missing_property_pair.second, &missing_notify);
+        let _missing_reply_sent: i32 = x11_clipboard_test_send(
+            missing_property_pair.second, &missing_reply);
+        let missing_result: X11ClipboardReadResult = x11_clipboard_read(
+            &missing_property_connection, 200,
+            X11SelectionKind.Clipboard, 87, 100, 64);
+        let missing_requests: WireBuffer = linux_receive_exact(
+            missing_property_pair.second, 68, 100);
+        failures = failures + x11_clipboard_expect(
+            missing_result.status == X11ClipboardStatus.PropertyMissing
+            && missing_result.valid == 0
+            && missing_property_connection.authenticated == 1
+            && len[u8](missing_requests.bytes) == 68
+            && linux_poll_readable(missing_property_pair.second, 0) == 0,
+            "type None GetProperty is a live typed miss with no redundant cleanup request");
+        wire_free(&missing_requests);
+        x11_clipboard_read_result_free(&missing_result);
+        x11_disconnect(&missing_property_connection);
+        let _missing_property_closed: i64 = linux_close(
+            missing_property_pair.second);
+    } else { failures = failures + 1; }
+
+    let wrong_type_pair: LinuxFdPair = linux_socketpair_stream();
+    if (wrong_type_pair.ok == 1) {
+        let wrong_type_connection: X11NativeConnection = x11_clipboard_test_connection(
+            wrong_type_pair.first, 1);
+        let type_barrier: WireBuffer = x11_clipboard_test_owner_reply(1, 777);
+        let type_notify: WireBuffer = x11_clipboard_test_selection_notify(
+            200, 202, 201, 203, 80, 3);
+        // When requested type UTF8_STRING does not match actual type STRING,
+        // GetProperty returns no value tail and reports the full bytes-after.
+        let type_reply: WireBuffer = x11_clipboard_test_property_reply(4, 31, 8, 6, "");
+        let type_cleanup_barrier: WireBuffer = x11_clipboard_test_owner_reply(6, 777);
+        let _type_barrier_sent: i32 = x11_clipboard_test_send(
+            wrong_type_pair.second, &type_barrier);
+        let _type_notify_sent: i32 = x11_clipboard_test_send(wrong_type_pair.second, &type_notify);
+        let _type_reply_sent: i32 = x11_clipboard_test_send(wrong_type_pair.second, &type_reply);
+        let _type_cleanup_sent: i32 = x11_clipboard_test_send(
+            wrong_type_pair.second, &type_cleanup_barrier);
+        let type_result: X11ClipboardReadResult = x11_clipboard_read(
+            &wrong_type_connection, 200, X11SelectionKind.Clipboard, 80, 100, 64);
+        let type_requests: WireBuffer = linux_receive_exact(wrong_type_pair.second, 88, 100);
+        failures = failures + x11_clipboard_expect(
+            type_result.status == X11ClipboardStatus.PropertyTypeMismatch
+            && type_result.valid == 0 && wrong_type_connection.authenticated == 1
+            && x11_clipboard_test_cleanup_requests(&type_requests) == 1
+            && wrong_type_connection.last_sent_sequence == 6,
+            "legacy property type is rejected, deleted, and fenced without reinterpretation");
+        wire_free(&type_requests); x11_clipboard_read_result_free(&type_result);
+        x11_disconnect(&wrong_type_connection); let _wrong_type_closed: i64 = linux_close(wrong_type_pair.second);
+    } else { failures = failures + 1; }
+
+    let wrong_format_pair: LinuxFdPair = linux_socketpair_stream();
+    if (wrong_format_pair.ok == 1) {
+        let wrong_format_connection: X11NativeConnection = x11_clipboard_test_connection(
+            wrong_format_pair.first, 1);
+        let format_barrier: WireBuffer = x11_clipboard_test_owner_reply(1, 777);
+        let format_notify: WireBuffer = x11_clipboard_test_selection_notify(
+            200, 202, 201, 203, 81, 3);
+        let format_data: ArrayList[u8] = make[u8](2);
+        push[u8](&format_data, 65 as u8); push[u8](&format_data, 0 as u8);
+        let format_reply: WireBuffer = x11_clipboard_test_property_reply(
+            4, 201, 16, 0, format_data.data[0..2]);
+        let format_cleanup_barrier: WireBuffer = x11_clipboard_test_owner_reply(6, 777);
+        let _format_barrier_sent: i32 = x11_clipboard_test_send(
+            wrong_format_pair.second, &format_barrier);
+        let _format_notify_sent: i32 = x11_clipboard_test_send(wrong_format_pair.second, &format_notify);
+        let _format_reply_sent: i32 = x11_clipboard_test_send(wrong_format_pair.second, &format_reply);
+        let _format_cleanup_sent: i32 = x11_clipboard_test_send(
+            wrong_format_pair.second, &format_cleanup_barrier);
+        let format_result: X11ClipboardReadResult = x11_clipboard_read(
+            &wrong_format_connection, 200, X11SelectionKind.Clipboard, 81, 100, 64);
+        let format_requests: WireBuffer = linux_receive_exact(wrong_format_pair.second, 88, 100);
+        failures = failures + x11_clipboard_expect(
+            format_result.status == X11ClipboardStatus.PropertyFormatMismatch
+            && format_result.valid == 0 && wrong_format_connection.authenticated == 1
+            && x11_clipboard_test_cleanup_requests(&format_requests) == 1
+            && wrong_format_connection.last_sent_sequence == 6,
+            "non-8-bit UTF8_STRING is deleted and fenced before typed format failure");
+        free[u8](&format_data); wire_free(&format_requests);
+        x11_clipboard_read_result_free(&format_result); x11_disconnect(&wrong_format_connection);
+        let _wrong_format_closed: i64 = linux_close(wrong_format_pair.second);
+    } else { failures = failures + 1; }
+
+    let truncated_pair: LinuxFdPair = linux_socketpair_stream();
+    if (truncated_pair.ok == 1) {
+        let truncated_connection: X11NativeConnection = x11_clipboard_test_connection(
+            truncated_pair.first, 1);
+        let truncated_barrier: WireBuffer = x11_clipboard_test_owner_reply(1, 777);
+        let truncated_notify: WireBuffer = x11_clipboard_test_selection_notify(
+            200, 202, 201, 203, 82, 3);
+        let truncated_reply: WireBuffer = x11_clipboard_test_property_reply(
+            4, 201, 8, 4, "part");
+        let truncated_cleanup_barrier: WireBuffer = x11_clipboard_test_owner_reply(6, 777);
+        let _truncated_barrier_sent: i32 = x11_clipboard_test_send(
+            truncated_pair.second, &truncated_barrier);
+        let _truncated_notify_sent: i32 = x11_clipboard_test_send(truncated_pair.second, &truncated_notify);
+        let _truncated_reply_sent: i32 = x11_clipboard_test_send(truncated_pair.second, &truncated_reply);
+        let _truncated_cleanup_sent: i32 = x11_clipboard_test_send(
+            truncated_pair.second, &truncated_cleanup_barrier);
+        let truncated_result: X11ClipboardReadResult = x11_clipboard_read(
+            &truncated_connection, 200, X11SelectionKind.Clipboard, 82, 100, 64);
+        let truncated_requests: WireBuffer = linux_receive_exact(truncated_pair.second, 88, 100);
+        failures = failures + x11_clipboard_expect(
+            truncated_result.status == X11ClipboardStatus.PropertyTruncated
+            && truncated_result.valid == 0 && truncated_connection.authenticated == 1
+            && x11_clipboard_test_cleanup_requests(&truncated_requests) == 1
+            && truncated_connection.last_sent_sequence == 6,
+            "bytes-after truncation is deleted and fenced without partial clipboard text");
+        wire_free(&truncated_requests); x11_clipboard_read_result_free(&truncated_result);
+        x11_disconnect(&truncated_connection); let _truncated_closed: i64 = linux_close(truncated_pair.second);
+    } else { failures = failures + 1; }
+
+    let malformed_property_pair: LinuxFdPair = linux_socketpair_stream();
+    if (malformed_property_pair.ok == 1) {
+        let malformed_property_connection: X11NativeConnection =
+            x11_clipboard_test_connection(malformed_property_pair.first, 1);
+        let malformed_barrier: WireBuffer = x11_clipboard_test_owner_reply(1, 777);
+        let malformed_notify: WireBuffer = x11_clipboard_test_selection_notify(
+            200, 202, 201, 203, 84, 3);
+        let malformed_reply: WireBuffer = x11_clipboard_test_property_reply(
+            4, 201, 8, 0, "");
+        malformed_reply.bytes.data[16] = 5 as u8;
+        let malformed_cleanup: WireBuffer = x11_clipboard_test_owner_reply(6, 777);
+        let _malformed_barrier_sent: i32 = x11_clipboard_test_send(
+            malformed_property_pair.second, &malformed_barrier);
+        let _malformed_notify_sent: i32 = x11_clipboard_test_send(
+            malformed_property_pair.second, &malformed_notify);
+        let _malformed_reply_sent: i32 = x11_clipboard_test_send(
+            malformed_property_pair.second, &malformed_reply);
+        let _malformed_cleanup_sent: i32 = x11_clipboard_test_send(
+            malformed_property_pair.second, &malformed_cleanup);
+        let malformed_result: X11ClipboardReadResult = x11_clipboard_read(
+            &malformed_property_connection, 200,
+            X11SelectionKind.Clipboard, 84, 100, 64);
+        let malformed_requests: WireBuffer = linux_receive_exact(
+            malformed_property_pair.second, 88, 100);
+        failures = failures + x11_clipboard_expect(
+            malformed_result.status == X11ClipboardStatus.MalformedReply
+            && malformed_result.valid == 0
+            && malformed_property_connection.authenticated == 1
+            && x11_clipboard_test_cleanup_requests(&malformed_requests) == 1,
+            "malformed property metadata is deleted and fenced before typed failure");
+        wire_free(&malformed_requests);
+        x11_clipboard_read_result_free(&malformed_result);
+        x11_disconnect(&malformed_property_connection);
+        let _malformed_property_closed: i64 = linux_close(
+            malformed_property_pair.second);
+    } else { failures = failures + 1; }
+
+    let property_too_large_pair: LinuxFdPair = linux_socketpair_stream();
+    if (property_too_large_pair.ok == 1) {
+        let property_too_large_connection: X11NativeConnection =
+            x11_clipboard_test_connection(property_too_large_pair.first, 1);
+        let too_large_barrier: WireBuffer = x11_clipboard_test_owner_reply(1, 777);
+        let too_large_notify: WireBuffer = x11_clipboard_test_selection_notify(
+            200, 202, 201, 203, 85, 3);
+        let too_large_reply: WireBuffer = x11_clipboard_test_property_reply(
+            4, 201, 8, 0, "xx");
+        let too_large_cleanup: WireBuffer = x11_clipboard_test_owner_reply(6, 777);
+        let _too_large_barrier_sent: i32 = x11_clipboard_test_send(
+            property_too_large_pair.second, &too_large_barrier);
+        let _too_large_notify_sent: i32 = x11_clipboard_test_send(
+            property_too_large_pair.second, &too_large_notify);
+        let _too_large_reply_sent: i32 = x11_clipboard_test_send(
+            property_too_large_pair.second, &too_large_reply);
+        let _too_large_cleanup_sent: i32 = x11_clipboard_test_send(
+            property_too_large_pair.second, &too_large_cleanup);
+        let too_large_result: X11ClipboardReadResult = x11_clipboard_read(
+            &property_too_large_connection, 200,
+            X11SelectionKind.Clipboard, 85, 100, 1);
+        let too_large_requests: WireBuffer = linux_receive_exact(
+            property_too_large_pair.second, 88, 100);
+        failures = failures + x11_clipboard_expect(
+            too_large_result.status == X11ClipboardStatus.TooLarge
+            && too_large_result.valid == 0
+            && property_too_large_connection.authenticated == 1
+            && x11_clipboard_test_cleanup_requests(&too_large_requests) == 1,
+            "over-limit property value is deleted and fenced without partial publication");
+        wire_free(&too_large_requests);
+        x11_clipboard_read_result_free(&too_large_result);
+        x11_disconnect(&property_too_large_connection);
+        let _property_too_large_closed: i64 = linux_close(
+            property_too_large_pair.second);
+    } else { failures = failures + 1; }
+
+    let cleanup_error_pair: LinuxFdPair = linux_socketpair_stream();
+    if (cleanup_error_pair.ok == 1) {
+        let cleanup_error_connection: X11NativeConnection =
+            x11_clipboard_test_connection(cleanup_error_pair.first, 1);
+        let cleanup_error_barrier: WireBuffer = x11_clipboard_test_owner_reply(1, 777);
+        let cleanup_error_notify: WireBuffer = x11_clipboard_test_selection_notify(
+            200, 202, 201, 203, 86, 3);
+        let cleanup_error_reply: WireBuffer = x11_clipboard_test_property_reply(
+            4, 31, 8, 6, "");
+        let cleanup_delete_error: WireBuffer = x11_clipboard_test_error(5, 19);
+        let _cleanup_error_barrier_sent: i32 = x11_clipboard_test_send(
+            cleanup_error_pair.second, &cleanup_error_barrier);
+        let _cleanup_error_notify_sent: i32 = x11_clipboard_test_send(
+            cleanup_error_pair.second, &cleanup_error_notify);
+        let _cleanup_error_reply_sent: i32 = x11_clipboard_test_send(
+            cleanup_error_pair.second, &cleanup_error_reply);
+        let _cleanup_delete_error_sent: i32 = x11_clipboard_test_send(
+            cleanup_error_pair.second, &cleanup_delete_error);
+        let cleanup_error_result: X11ClipboardReadResult = x11_clipboard_read(
+            &cleanup_error_connection, 200,
+            X11SelectionKind.Clipboard, 86, 100, 64);
+        let cleanup_error_requests: WireBuffer = linux_receive_exact(
+            cleanup_error_pair.second, 88, 100);
+        failures = failures + x11_clipboard_expect(
+            cleanup_error_result.status == X11ClipboardStatus.TransportFailed
+            && cleanup_error_result.valid == 0
+            && x11_clipboard_test_cleanup_requests(&cleanup_error_requests) == 1
+            && cleanup_error_connection.authenticated == 0
+            && cleanup_error_connection.fd == -1,
+            "DeleteProperty cleanup X error overrides parse status and retires transport");
+        wire_free(&cleanup_error_requests);
+        x11_clipboard_read_result_free(&cleanup_error_result);
+        x11_disconnect(&cleanup_error_connection);
+        let _cleanup_error_closed: i64 = linux_close(cleanup_error_pair.second);
+    } else { failures = failures + 1; }
+
+    let invalid_read_pair: LinuxFdPair = linux_socketpair_stream();
+    if (invalid_read_pair.ok == 1) {
+        let invalid_read_connection: X11NativeConnection = x11_clipboard_test_connection(
+            invalid_read_pair.first, 1);
+        let invalid_read_barrier: WireBuffer = x11_clipboard_test_owner_reply(1, 777);
+        let invalid_read_notify: WireBuffer = x11_clipboard_test_selection_notify(
+            200, 202, 201, 203, 83, 3);
+        let invalid_read_bytes: ArrayList[u8] = make[u8](2);
+        push[u8](&invalid_read_bytes, 192 as u8); push[u8](&invalid_read_bytes, 128 as u8);
+        let invalid_read_reply: WireBuffer = x11_clipboard_test_property_reply(
+            4, 201, 8, 0, invalid_read_bytes.data[0..2]);
+        let _invalid_read_barrier_sent: i32 = x11_clipboard_test_send(
+            invalid_read_pair.second, &invalid_read_barrier);
+        let _invalid_read_notify_sent: i32 = x11_clipboard_test_send(
+            invalid_read_pair.second, &invalid_read_notify);
+        let _invalid_read_reply_sent: i32 = x11_clipboard_test_send(
+            invalid_read_pair.second, &invalid_read_reply);
+        let invalid_read_result: X11ClipboardReadResult = x11_clipboard_read(
+            &invalid_read_connection, 200, X11SelectionKind.Clipboard, 83, 100, 64);
+        let invalid_read_requests: WireBuffer = linux_receive_exact(
+            invalid_read_pair.second, 68, 100);
+        failures = failures + x11_clipboard_expect(
+            invalid_read_result.status == X11ClipboardStatus.InvalidUtf8
+            && invalid_read_result.valid == 0 && invalid_read_connection.authenticated == 1,
+            "malformed UTF8_STRING property never becomes clipboard text");
+        free[u8](&invalid_read_bytes); wire_free(&invalid_read_requests);
+        x11_clipboard_read_result_free(&invalid_read_result);
+        x11_disconnect(&invalid_read_connection);
+        let _invalid_read_closed: i64 = linux_close(invalid_read_pair.second);
+    } else { failures = failures + 1; }
+
+    if (failures != 0) { return 1; }
+    _zag_println("x11_clipboard_test: ok");
+    return 0;
+}

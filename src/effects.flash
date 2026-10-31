@@ -1,0 +1,161 @@
+// Premultiplied layer compositing, masks, bounded blur, and shadows.
+
+enum EffectError { None, DimensionMismatch, InvalidRadius, InvalidOpacity }
+
+struct ColorMatrix {
+    rr: t27, rg: t27, rb: t27, ra: t27, ro: t27,
+    gr: t27, gg: t27, gb: t27, ga: t27, go: t27,
+    br: t27, bg: t27, bb: t27, ba: t27, bo: t27,
+    ar: t27, ag: t27, ab: t27, aa: t27, ao: t27,
+}
+
+struct EffectResult {
+    surface: Surface,
+    ok: i32,
+    error: EffectError,
+}
+
+fn effect_failed(error: EffectError) EffectResult {
+    return EffectResult{ .surface = surface_new(0, 0), .ok = 0, .error = error };
+}
+
+fn color_matrix_identity() ColorMatrix {
+    return ColorMatrix{
+        .rr = 255, .rg = 0, .rb = 0, .ra = 0, .ro = 0,
+        .gr = 0, .gg = 255, .gb = 0, .ga = 0, .go = 0,
+        .br = 0, .bg = 0, .bb = 255, .ba = 0, .bo = 0,
+        .ar = 0, .ag = 0, .ab = 0, .aa = 255, .ao = 0,
+    };
+}
+
+fn surface_color_matrix(source: *Surface, matrix: *ColorMatrix) EffectResult {
+    let output: Surface = surface_new(source.*.width, source.*.height); let pixel: t27 = 0;
+    while (pixel < source.*.width * source.*.height) {
+        let offset: i32 = (pixel * 4) as i32;
+        let red: t27 = source.*.pixels.data[offset] as t27;
+        let green: t27 = source.*.pixels.data[offset + 1] as t27;
+        let blue: t27 = source.*.pixels.data[offset + 2] as t27;
+        let alpha: t27 = source.*.pixels.data[offset + 3] as t27;
+        let red_out: t27 = (matrix.*.rr * red + matrix.*.rg * green + matrix.*.rb * blue + matrix.*.ra * alpha + matrix.*.ro * 255) / 255;
+        let green_out: t27 = (matrix.*.gr * red + matrix.*.gg * green + matrix.*.gb * blue + matrix.*.ga * alpha + matrix.*.go * 255) / 255;
+        let blue_out: t27 = (matrix.*.br * red + matrix.*.bg * green + matrix.*.bb * blue + matrix.*.ba * alpha + matrix.*.bo * 255) / 255;
+        let alpha_out: t27 = (matrix.*.ar * red + matrix.*.ag * green + matrix.*.ab * blue + matrix.*.aa * alpha + matrix.*.ao * 255) / 255;
+        output.pixels.data[offset] = clamp8(red_out) as u8;
+        output.pixels.data[offset + 1] = clamp8(green_out) as u8;
+        output.pixels.data[offset + 2] = clamp8(blue_out) as u8;
+        output.pixels.data[offset + 3] = clamp8(alpha_out) as u8;
+        pixel = pixel + 1;
+    }
+    return EffectResult{ .surface = output, .ok = 1, .error = EffectError.None };
+}
+
+fn surface_copy(source: *Surface) Surface {
+    let copy: Surface = surface_new(source.*.width, source.*.height); let i: i32 = 0;
+    while (i < len[u8](source.*.pixels)) { copy.pixels.data[i] = source.*.pixels.data[i]; i = i + 1; }
+    return copy;
+}
+
+fn surface_composite(destination: *Surface, source: *Surface, offset_x: t27, offset_y: t27,
+    opacity: t27, clip: Rect) EffectError {
+    if (opacity < 0 || opacity > 255) { return EffectError.InvalidOpacity; }
+    let bounded: Rect = rect_clip_to_surface(destination, clip); let sy: t27 = 0;
+    while (sy < source.*.height) {
+        let sx: t27 = 0;
+        while (sx < source.*.width) {
+            let dx: t27 = sx + offset_x; let dy: t27 = sy + offset_y;
+            if (rect_contains(bounded, dx, dy) == 1) {
+                let source_offset: i32 = ((sy * source.*.width + sx) * 4) as i32;
+                let destination_offset: i32 = ((dy * destination.*.width + dx) * 4) as i32;
+                let source_alpha: t27 = (source.*.pixels.data[source_offset + 3] as t27) * opacity / 255;
+                let inverse: t27 = 255 - source_alpha;
+                destination.*.pixels.data[destination_offset] = clamp8(
+                    (source.*.pixels.data[source_offset] as t27) * opacity / 255
+                    + (destination.*.pixels.data[destination_offset] as t27) * inverse / 255) as u8;
+                destination.*.pixels.data[destination_offset + 1] = clamp8(
+                    (source.*.pixels.data[source_offset + 1] as t27) * opacity / 255
+                    + (destination.*.pixels.data[destination_offset + 1] as t27) * inverse / 255) as u8;
+                destination.*.pixels.data[destination_offset + 2] = clamp8(
+                    (source.*.pixels.data[source_offset + 2] as t27) * opacity / 255
+                    + (destination.*.pixels.data[destination_offset + 2] as t27) * inverse / 255) as u8;
+                destination.*.pixels.data[destination_offset + 3] = clamp8(source_alpha
+                    + (destination.*.pixels.data[destination_offset + 3] as t27) * inverse / 255) as u8;
+                destination.*.painted_pixels = destination.*.painted_pixels + 1;
+            }
+            sx = sx + 1;
+        }
+        sy = sy + 1;
+    }
+    return EffectError.None;
+}
+
+fn surface_apply_mask(source: *Surface, mask: *Surface) EffectError {
+    if (source.*.width != mask.*.width || source.*.height != mask.*.height) { return EffectError.DimensionMismatch; }
+    let pixel: t27 = 0;
+    while (pixel < source.*.width * source.*.height) {
+        let offset: i32 = (pixel * 4) as i32; let alpha: t27 = mask.*.pixels.data[offset + 3] as t27;
+        source.*.pixels.data[offset] = ((source.*.pixels.data[offset] as t27) * alpha / 255) as u8;
+        source.*.pixels.data[offset + 1] = ((source.*.pixels.data[offset + 1] as t27) * alpha / 255) as u8;
+        source.*.pixels.data[offset + 2] = ((source.*.pixels.data[offset + 2] as t27) * alpha / 255) as u8;
+        source.*.pixels.data[offset + 3] = ((source.*.pixels.data[offset + 3] as t27) * alpha / 255) as u8;
+        pixel = pixel + 1;
+    }
+    return EffectError.None;
+}
+
+fn surface_box_blur(source: *Surface, radius: t27) EffectResult {
+    if (radius < 0 || radius > 27) { return effect_failed(EffectError.InvalidRadius); }
+    if (radius == 0) { return EffectResult{ .surface = surface_copy(source), .ok = 1, .error = EffectError.None }; }
+    let output: Surface = surface_new(source.*.width, source.*.height); let y: t27 = 0;
+    while (y < source.*.height) {
+        let x: t27 = 0;
+        while (x < source.*.width) {
+            let red: t27 = 0; let green: t27 = 0; let blue: t27 = 0; let alpha: t27 = 0; let count: t27 = 0;
+            let sample_y: t27 = y - radius;
+            while (sample_y <= y + radius) {
+                let sample_x: t27 = x - radius;
+                while (sample_x <= x + radius) {
+                    if (sample_x >= 0 && sample_y >= 0 && sample_x < source.*.width && sample_y < source.*.height) {
+                        let offset: i32 = ((sample_y * source.*.width + sample_x) * 4) as i32;
+                        red = red + source.*.pixels.data[offset] as t27;
+                        green = green + source.*.pixels.data[offset + 1] as t27;
+                        blue = blue + source.*.pixels.data[offset + 2] as t27;
+                        alpha = alpha + source.*.pixels.data[offset + 3] as t27; count = count + 1;
+                    }
+                    sample_x = sample_x + 1;
+                }
+                sample_y = sample_y + 1;
+            }
+            let target: i32 = ((y * output.width + x) * 4) as i32;
+            output.pixels.data[target] = (red / count) as u8; output.pixels.data[target + 1] = (green / count) as u8;
+            output.pixels.data[target + 2] = (blue / count) as u8; output.pixels.data[target + 3] = (alpha / count) as u8;
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return EffectResult{ .surface = output, .ok = 1, .error = EffectError.None };
+}
+
+fn surface_drop_shadow(source: *Surface, radius: t27, offset_x: t27, offset_y: t27, color: Color) EffectResult {
+    let alpha_source: Surface = surface_new(source.*.width, source.*.height); let pixel: t27 = 0;
+    while (pixel < source.*.width * source.*.height) {
+        let offset: i32 = (pixel * 4) as i32; alpha_source.pixels.data[offset + 3] = source.*.pixels.data[offset + 3];
+        pixel = pixel + 1;
+    }
+    let blurred: EffectResult = surface_box_blur(&alpha_source, radius); surface_free(&alpha_source);
+    if (blurred.ok == 0) { return blurred; }
+    let shadow_layer: Surface = blurred.surface; pixel = 0;
+    while (pixel < shadow_layer.width * shadow_layer.height) {
+        let offset: i32 = (pixel * 4) as i32;
+        let alpha: t27 = (shadow_layer.pixels.data[offset + 3] as t27) * color.a as t27 / 255;
+        shadow_layer.pixels.data[offset] = ((color.r as t27) * alpha / 255) as u8;
+        shadow_layer.pixels.data[offset + 1] = ((color.g as t27) * alpha / 255) as u8;
+        shadow_layer.pixels.data[offset + 2] = ((color.b as t27) * alpha / 255) as u8;
+        shadow_layer.pixels.data[offset + 3] = alpha as u8; pixel = pixel + 1;
+    }
+    let output: Surface = surface_new(source.*.width, source.*.height);
+    let full_clip: Rect = rect(0, 0, output.width, output.height);
+    let _shadow_error: EffectError = surface_composite(&output, &shadow_layer, offset_x, offset_y, 255, full_clip);
+    let _source_error: EffectError = surface_composite(&output, source, 0, 0, 255, full_clip);
+    surface_free(&shadow_layer);
+    return EffectResult{ .surface = output, .ok = 1, .error = EffectError.None };
+}

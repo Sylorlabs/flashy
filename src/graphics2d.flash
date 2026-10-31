@@ -1,0 +1,843 @@
+// Deterministic 2D geometry using balanced-ternary fixed point and 3x3 coverage sampling.
+
+struct Point2D { x: t27, y: t27 }
+
+struct Transform2D {
+    m00: t27, m01: t27, m10: t27, m11: t27,
+    tx: t27, ty: t27,
+}
+
+struct Path2D {
+    points: ArrayList[Point2D],
+    closed: i32,
+}
+
+enum StrokeJoin { Round, Bevel, Miter }
+enum GraphicsError { None, InvalidPath, InvalidWidth }
+
+struct StrokeResult {
+    painted: t27,
+    ok: i32,
+    error: GraphicsError,
+}
+
+fn graphics_t27_min() t27 { return (0 as t27) - flashy_t27_max(); }
+
+fn graphics_add_checked(a: t27, b: t27, out: *t27) i32 {
+    if (b > 0 && a > flashy_t27_max() - b) { return 0; }
+    if (b < 0 && a < graphics_t27_min() - b) { return 0; }
+    out.* = a + b;
+    return 1;
+}
+
+fn graphics_sub_checked(a: t27, b: t27, out: *t27) i32 {
+    // Unlike a binary two's-complement minimum, balanced t27_min negates
+    // exactly to t27_max, so this conversion is representable for every b.
+    return graphics_add_checked(a, (0 as t27) - b, out);
+}
+
+fn graphics_mul_checked(a: t27, b: t27, out: *t27) i32 {
+    if (a == 0 || b == 0) { out.* = 0; return 1; }
+    // Balanced t27 is symmetric, so both magnitudes are representable. Using
+    // positive magnitudes also avoids truncation asymmetry in max / negative:
+    // (-1) * t27_min and t27_min * (-1) must both accept +t27_max.
+    let magnitude_a: t27 = a; if (magnitude_a < 0) { magnitude_a = (0 as t27) - magnitude_a; }
+    let magnitude_b: t27 = b; if (magnitude_b < 0) { magnitude_b = (0 as t27) - magnitude_b; }
+    if (magnitude_a > flashy_t27_max() / magnitude_b) { return 0; }
+    out.* = a * b;
+    return 1;
+}
+
+fn graphics_abs(value: t27) t27 {
+    // The balanced range is symmetric: abs(t27_min) == t27_max.
+    if (value < 0) { return (0 as t27) - value; }
+    return value;
+}
+fn graphics_path_coordinate_limit() t27 { return 19683; }
+fn graphics_sample_coordinate_limit() t27 { return graphics_path_coordinate_limit() * 6 + 2187; }
+
+fn graphics_point_valid(point: Point2D) i32 {
+    return graphics_abs(point.x) <= graphics_path_coordinate_limit()
+        && graphics_abs(point.y) <= graphics_path_coordinate_limit();
+}
+
+fn graphics_scaled_sum_checked(a: t27, b: t27, c: t27, d: t27,
+    scale: t27, translation: t27, out: *t27) i32 {
+    if (scale < 1) { return 0; }
+    let first: t27 = 0;
+    let second: t27 = 0;
+    let sum: t27 = 0;
+    if (graphics_mul_checked(a, b, &first) == 0
+        || graphics_mul_checked(c, d, &second) == 0
+        || graphics_add_checked(first, second, &sum) == 0) { return 0; }
+    sum = sum / scale;
+    return graphics_add_checked(sum, translation, out);
+}
+
+fn transform_scale() t27 { return 729; }
+
+fn transform_identity() Transform2D {
+    return Transform2D{ .m00 = transform_scale(), .m01 = 0, .m10 = 0,
+        .m11 = transform_scale(), .tx = 0, .ty = 0 };
+}
+
+fn transform_translate(x: t27, y: t27) Transform2D {
+    let transform: Transform2D = transform_identity(); transform.tx = x; transform.ty = y; return transform;
+}
+
+fn transform_scaled(x_scale: t27, y_scale: t27) Transform2D {
+    return Transform2D{ .m00 = x_scale, .m01 = 0, .m10 = 0, .m11 = y_scale, .tx = 0, .ty = 0 };
+}
+
+fn transform_apply_checked(transform: Transform2D, point: Point2D, out: *Point2D) i32 {
+    let transformed: Point2D = Point2D{ .x = 0, .y = 0 };
+    if (graphics_scaled_sum_checked(transform.m00, point.x, transform.m01, point.y,
+            transform_scale(), transform.tx, &transformed.x) == 0
+        || graphics_scaled_sum_checked(transform.m10, point.x, transform.m11, point.y,
+            transform_scale(), transform.ty, &transformed.y) == 0) { return 0; }
+    out.* = transformed;
+    return 1;
+}
+
+fn transform_apply(transform: Transform2D, point: Point2D) Point2D {
+    let transformed: Point2D = Point2D{ .x = 0, .y = 0 };
+    let _valid: i32 = transform_apply_checked(transform, point, &transformed);
+    return transformed;
+}
+
+fn transform_compose_checked(parent: Transform2D, local: Transform2D, out: *Transform2D) i32 {
+    let scale: t27 = transform_scale();
+    let composed: Transform2D = Transform2D{ .m00 = 0, .m01 = 0, .m10 = 0, .m11 = 0, .tx = 0, .ty = 0 };
+    if (graphics_scaled_sum_checked(parent.m00, local.m00, parent.m01, local.m10,
+            scale, 0, &composed.m00) == 0
+        || graphics_scaled_sum_checked(parent.m00, local.m01, parent.m01, local.m11,
+            scale, 0, &composed.m01) == 0
+        || graphics_scaled_sum_checked(parent.m10, local.m00, parent.m11, local.m10,
+            scale, 0, &composed.m10) == 0
+        || graphics_scaled_sum_checked(parent.m10, local.m01, parent.m11, local.m11,
+            scale, 0, &composed.m11) == 0
+        || graphics_scaled_sum_checked(parent.m00, local.tx, parent.m01, local.ty,
+            scale, parent.tx, &composed.tx) == 0
+        || graphics_scaled_sum_checked(parent.m10, local.tx, parent.m11, local.ty,
+            scale, parent.ty, &composed.ty) == 0) { return 0; }
+    out.* = composed;
+    return 1;
+}
+
+fn transform_compose(parent: Transform2D, local: Transform2D) Transform2D {
+    let composed: Transform2D = Transform2D{ .m00 = 0, .m01 = 0, .m10 = 0, .m11 = 0, .tx = 0, .ty = 0 };
+    let _valid: i32 = transform_compose_checked(parent, local, &composed);
+    return composed;
+}
+
+fn path_new() Path2D { return Path2D{ .points = make[Point2D](16), .closed = 0 }; }
+
+fn path_move_to(path: *Path2D, x: t27, y: t27) void {
+    path.*.points.len = 0; push[Point2D](&path.*.points, Point2D{ .x = x, .y = y }); path.*.closed = 0;
+}
+
+fn path_line_to(path: *Path2D, x: t27, y: t27) i32 {
+    if (len[Point2D](path.*.points) == 0 || len[Point2D](path.*.points) >= 4096) { return 0; }
+    push[Point2D](&path.*.points, Point2D{ .x = x, .y = y }); return 1;
+}
+
+fn path_curve_subdivisions() t27 { return 27; }
+
+fn path_curve_subdivisions_for_curvature(curvature: t27) t27 {
+    let max: t27 = path_curve_subdivisions();
+    if (curvature <= 1) { return 3; }
+    if (curvature <= 4) { return 9; }
+    if (curvature <= 16) { return 15; }
+    if (curvature <= 64) { return 21; }
+    return max;
+}
+
+fn path_curve_curvature_score_checked(start: Point2D, control: Point2D, end: Point2D,
+    score: *t27) i32 {
+    if (graphics_point_valid(start) == 0 || graphics_point_valid(control) == 0
+        || graphics_point_valid(end) == 0) { return 0; }
+    let dx: t27 = 0; let dy: t27 = 0; let cx: t27 = 0; let cy: t27 = 0;
+    let dx2: t27 = 0; let dy2: t27 = 0; let chord2: t27 = 0;
+    let first_cross: t27 = 0; let second_cross: t27 = 0; let cross: t27 = 0; let scaled: t27 = 0;
+    if (graphics_sub_checked(end.x, start.x, &dx) == 0
+        || graphics_sub_checked(end.y, start.y, &dy) == 0
+        || graphics_sub_checked(control.x, start.x, &cx) == 0
+        || graphics_sub_checked(control.y, start.y, &cy) == 0
+        || graphics_mul_checked(dx, dx, &dx2) == 0
+        || graphics_mul_checked(dy, dy, &dy2) == 0
+        || graphics_add_checked(dx2, dy2, &chord2) == 0) { return 0; }
+    if (chord2 == 0) { score.* = 0; return 1; }
+    if (graphics_mul_checked(dx, cy, &first_cross) == 0
+        || graphics_mul_checked(dy, cx, &second_cross) == 0
+        || graphics_sub_checked(first_cross, second_cross, &cross) == 0
+        || graphics_mul_checked(graphics_abs(cross), 256, &scaled) == 0) { return 0; }
+    score.* = scaled / chord2;
+    return 1;
+}
+
+fn path_curve_curvature_score(start: Point2D, control: Point2D, end: Point2D) t27 {
+    let score: t27 = 0;
+    if (path_curve_curvature_score_checked(start, control, end, &score) == 0) {
+        return flashy_t27_max();
+    }
+    return score;
+}
+
+fn path_curve_subdivisions_for_controls(start: Point2D, control_a: Point2D, control_b: Point2D, end: Point2D) t27 {
+    let first: t27 = path_curve_curvature_score(start, control_a, end);
+    let second: t27 = path_curve_curvature_score(start, control_b, end);
+    let curve: t27 = path_curve_subdivisions();
+    if (second > first) { curve = path_curve_subdivisions_for_curvature(second); }
+    else { curve = path_curve_subdivisions_for_curvature(first); }
+    if (curve > 21) { return 21; }
+    return curve;
+}
+
+fn path_quadratic_to(path: *Path2D, control_x: t27, control_y: t27, x: t27, y: t27) i32 {
+    let count: i32 = len[Point2D](path.*.points);
+    if (count < 1 || count > 4096) { return 0; }
+    let start: Point2D = path.*.points.data[count - 1];
+    let control: Point2D = Point2D{ .x = control_x, .y = control_y };
+    let end: Point2D = Point2D{ .x = x, .y = y };
+    let curvature: t27 = 0;
+    if (path_curve_curvature_score_checked(start, control, end, &curvature) == 0) { return 0; }
+    let subdivisions: t27 = path_curve_subdivisions_for_curvature(curvature);
+    if (subdivisions > (4096 - count) as t27) { return 0; }
+    let denominator: t27 = subdivisions * subdivisions;
+    let step: t27 = 1;
+    while (step <= subdivisions) {
+        let inverse: t27 = subdivisions - step;
+        let point_x: t27 = (inverse * inverse * start.x + 2 * inverse * step * control_x + step * step * x) / denominator;
+        let point_y: t27 = (inverse * inverse * start.y + 2 * inverse * step * control_y + step * step * y) / denominator;
+        push[Point2D](&path.*.points, Point2D{ .x = point_x, .y = point_y }); step = step + 1;
+    }
+    return 1;
+}
+
+fn path_cubic_to(path: *Path2D, control1_x: t27, control1_y: t27,
+    control2_x: t27, control2_y: t27, x: t27, y: t27) i32 {
+    let count: i32 = len[Point2D](path.*.points);
+    if (count < 1 || count > 4096) { return 0; }
+    let start: Point2D = path.*.points.data[count - 1];
+    let control1: Point2D = Point2D{ .x = control1_x, .y = control1_y };
+    let control2: Point2D = Point2D{ .x = control2_x, .y = control2_y };
+    let end: Point2D = Point2D{ .x = x, .y = y };
+    if (graphics_point_valid(start) == 0 || graphics_point_valid(control1) == 0
+        || graphics_point_valid(control2) == 0 || graphics_point_valid(end) == 0) { return 0; }
+    let first_curvature: t27 = 0; let second_curvature: t27 = 0;
+    if (path_curve_curvature_score_checked(start, control1, end, &first_curvature) == 0
+        || path_curve_curvature_score_checked(start, control2, end, &second_curvature) == 0) { return 0; }
+    let subdivisions: t27 = path_curve_subdivisions();
+    if (second_curvature > first_curvature) {
+        subdivisions = path_curve_subdivisions_for_curvature(second_curvature);
+    } else {
+        subdivisions = path_curve_subdivisions_for_curvature(first_curvature);
+    }
+    if (subdivisions > 21) { subdivisions = 21; }
+    if (subdivisions > (4096 - count) as t27) { return 0; }
+    let denominator: t27 = subdivisions * subdivisions * subdivisions; let step: t27 = 1;
+    while (step <= subdivisions) {
+        let inverse: t27 = subdivisions - step;
+        let point_x: t27 = (inverse * inverse * inverse * start.x
+            + 3 * inverse * inverse * step * control1_x
+            + 3 * inverse * step * step * control2_x + step * step * step * x) / denominator;
+        let point_y: t27 = (inverse * inverse * inverse * start.y
+            + 3 * inverse * inverse * step * control1_y
+            + 3 * inverse * step * step * control2_y + step * step * step * y) / denominator;
+        push[Point2D](&path.*.points, Point2D{ .x = point_x, .y = point_y }); step = step + 1;
+    }
+    return 1;
+}
+
+fn path_close(path: *Path2D) i32 {
+    if (len[Point2D](path.*.points) < 3 || len[Point2D](path.*.points) > 4096) { return 0; }
+    path.*.closed = 1; return 1;
+}
+
+fn path_free(path: *Path2D) void { free[Point2D](&path.*.points); path.*.closed = 0; }
+
+fn graphics_points_valid(points: *ArrayList[Point2D], minimum: i32) i32 {
+    let count: i32 = len[Point2D](points.*);
+    if (count < minimum || count > 4096) { return 0; }
+    let i: i32 = 0;
+    while (i < count) {
+        if (graphics_point_valid(get[Point2D](points.*, i)) == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn point_in_polygon_six_validated(points: *ArrayList[Point2D], px6: t27, py6: t27) i32 {
+    let inside: i32 = 0; let count: i32 = len[Point2D](points.*); let i: i32 = 0;
+    let previous: i32 = count - 1;
+    while (i < count) {
+        let a: Point2D = get[Point2D](points.*, i); let b: Point2D = get[Point2D](points.*, previous);
+        let ax6: t27 = a.x * 6; let ay6: t27 = a.y * 6; let bx6: t27 = b.x * 6; let by6: t27 = b.y * 6;
+        if ((ay6 > py6) != (by6 > py6)) {
+            let crossing_x6: t27 = ax6 + ((py6 - ay6) * (bx6 - ax6)) / (by6 - ay6);
+            if (px6 < crossing_x6) { if (inside == 0) { inside = 1; } else { inside = 0; } }
+        }
+        previous = i; i = i + 1;
+    }
+    return inside;
+}
+
+fn point_in_polygon_six(points: *ArrayList[Point2D], px6: t27, py6: t27) i32 {
+    if (graphics_points_valid(points, 3) == 0
+        || graphics_abs(px6) > graphics_sample_coordinate_limit()
+        || graphics_abs(py6) > graphics_sample_coordinate_limit()) { return 0; }
+    return point_in_polygon_six_validated(points, px6, py6);
+}
+
+fn graphics_surface_valid(surface: *Surface) i32 {
+    if (surface_dimensions_valid(surface.*.width, surface.*.height) == 0) { return 0; }
+    if (surface.*.width == 0 && surface.*.height == 0) { return len[u8](surface.*.pixels) == 0; }
+    let expected: t27 = surface.*.width * surface.*.height * 4;
+    return expected == len[u8](surface.*.pixels) as t27;
+}
+
+fn rect_clip_to_surface(surface: *Surface, clip: Rect) Rect {
+    if (graphics_surface_valid(surface) == 0 || surface.*.width == 0 || surface.*.height == 0
+        || clip.w <= 0 || clip.h <= 0) { return rect(0, 0, 0, 0); }
+    let start_x: t27 = clip.x;
+    let end_x: t27 = 0;
+    if (clip.x < 0) {
+        let hidden: t27 = (0 as t27) - clip.x;
+        if (clip.w <= hidden) { return rect(0, 0, 0, 0); }
+        start_x = 0;
+        let visible: t27 = clip.w - hidden;
+        if (visible > surface.*.width) { end_x = surface.*.width; } else { end_x = visible; }
+    } else {
+        if (clip.x >= surface.*.width) { return rect(0, 0, 0, 0); }
+        start_x = clip.x;
+        let remaining: t27 = surface.*.width - clip.x;
+        if (clip.w >= remaining) { end_x = surface.*.width; } else { end_x = clip.x + clip.w; }
+    }
+    let start_y: t27 = clip.y;
+    let end_y: t27 = 0;
+    if (clip.y < 0) {
+        let hidden: t27 = (0 as t27) - clip.y;
+        if (clip.h <= hidden) { return rect(0, 0, 0, 0); }
+        start_y = 0;
+        let visible: t27 = clip.h - hidden;
+        if (visible > surface.*.height) { end_y = surface.*.height; } else { end_y = visible; }
+    } else {
+        if (clip.y >= surface.*.height) { return rect(0, 0, 0, 0); }
+        start_y = clip.y;
+        let remaining: t27 = surface.*.height - clip.y;
+        if (clip.h >= remaining) { end_y = surface.*.height; } else { end_y = clip.y + clip.h; }
+    }
+    return rect(start_x, start_y, end_x - start_x, end_y - start_y);
+}
+
+fn surface_fill_path_aa(surface: *Surface, path: *Path2D, transform: Transform2D, clip: Rect, color: Color) t27 {
+    if (path.*.closed != 1 || graphics_points_valid(&path.*.points, 3) == 0
+        || graphics_surface_valid(surface) == 0) { return 0; }
+    let bounded: Rect = rect_clip_to_surface(surface, clip);
+    if (bounded.w == 0 || bounded.h == 0) { return 0; }
+    let transformed: ArrayList[Point2D] = make[Point2D](len[Point2D](path.*.points));
+    let min_x: t27 = 0; let min_y: t27 = 0; let max_x: t27 = 0; let max_y: t27 = 0; let i: i32 = 0;
+    while (i < len[Point2D](path.*.points)) {
+        let point: Point2D = Point2D{ .x = 0, .y = 0 };
+        if (transform_apply_checked(transform, get[Point2D](path.*.points, i), &point) == 0
+            || graphics_point_valid(point) == 0) { free[Point2D](&transformed); return 0; }
+        push[Point2D](&transformed, point);
+        if (i == 0 || point.x < min_x) { min_x = point.x; } if (i == 0 || point.y < min_y) { min_y = point.y; }
+        if (i == 0 || point.x > max_x) { max_x = point.x; } if (i == 0 || point.y > max_y) { max_y = point.y; }
+        i = i + 1;
+    }
+    let bound_end_x: t27 = bounded.x + bounded.w;
+    let bound_end_y: t27 = bounded.y + bounded.h;
+    if (min_x < bounded.x) { min_x = bounded.x; } if (min_y < bounded.y) { min_y = bounded.y; }
+    if (max_x >= bound_end_x) { max_x = bound_end_x - 1; }
+    if (max_y >= bound_end_y) { max_y = bound_end_y - 1; }
+    if (min_x > max_x || min_y > max_y) { free[Point2D](&transformed); return 0; }
+    let painted: t27 = 0; let y: t27 = min_y;
+    while (y <= max_y) {
+        let x: t27 = min_x;
+        while (x <= max_x) {
+            let coverage: t27 = 0; let sample_y: t27 = 1;
+            while (sample_y <= 5) {
+                let sample_x: t27 = 1;
+                while (sample_x <= 5) {
+                    coverage = coverage + point_in_polygon_six_validated(&transformed,
+                        x * 6 + sample_x, y * 6 + sample_y) as t27;
+                    sample_x = sample_x + 2;
+                }
+                sample_y = sample_y + 2;
+            }
+            if (coverage > 0) {
+                let covered: Color = color; covered.a = ((color.a as t27) * coverage / 9) as t9;
+                surface_blend(surface, x, y, covered); painted = painted + 1;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    free[Point2D](&transformed); return painted;
+}
+
+fn point_near_segment_six(point_x: t27, point_y: t27, a: Point2D, b: Point2D, radius_six: t27) i32 {
+    if (graphics_point_valid(a) == 0 || graphics_point_valid(b) == 0 || radius_six < 0 || radius_six > 2187
+        || graphics_abs(point_x) > graphics_sample_coordinate_limit()
+        || graphics_abs(point_y) > graphics_sample_coordinate_limit()) { return 0; }
+    let ax: t27 = a.x * 6; let ay: t27 = a.y * 6; let bx: t27 = b.x * 6; let by: t27 = b.y * 6;
+    let vx: t27 = bx - ax; let vy: t27 = by - ay; let wx: t27 = point_x - ax; let wy: t27 = point_y - ay;
+    let dot: t27 = wx * vx + wy * vy; let length_squared: t27 = vx * vx + vy * vy;
+    if (length_squared == 0 || dot <= 0) {
+        return wx * wx + wy * wy <= radius_six * radius_six;
+    }
+    if (dot >= length_squared) {
+        let dx: t27 = point_x - bx; let dy: t27 = point_y - by;
+        return dx * dx + dy * dy <= radius_six * radius_six;
+    }
+    let cross: t27 = wx * vy - wy * vx;
+    return graphics_abs(cross) <= radius_six * integer_sqrt(length_squared);
+}
+
+fn point_near_segment_body_six(point_x: t27, point_y: t27, a: Point2D, b: Point2D, radius_six: t27) i32 {
+    if (graphics_point_valid(a) == 0 || graphics_point_valid(b) == 0 || radius_six < 0 || radius_six > 2187
+        || graphics_abs(point_x) > graphics_sample_coordinate_limit()
+        || graphics_abs(point_y) > graphics_sample_coordinate_limit()) { return 0; }
+    let ax: t27 = a.x * 6; let ay: t27 = a.y * 6; let bx: t27 = b.x * 6; let by: t27 = b.y * 6;
+    let vx: t27 = bx - ax; let vy: t27 = by - ay; let wx: t27 = point_x - ax; let wy: t27 = point_y - ay;
+    let dot: t27 = wx * vx + wy * vy; let length_squared: t27 = vx * vx + vy * vy;
+    if (length_squared == 0 || dot < 0 || dot > length_squared) { return 0; }
+    let cross: t27 = wx * vy - wy * vx;
+    return graphics_abs(cross) <= radius_six * integer_sqrt(length_squared);
+}
+
+fn point_in_triangle_six(point_x: t27, point_y: t27, a: Point2D, b: Point2D, c: Point2D) i32 {
+    let limit: t27 = graphics_sample_coordinate_limit();
+    if (graphics_abs(point_x) > limit || graphics_abs(point_y) > limit
+        || graphics_abs(a.x) > limit || graphics_abs(a.y) > limit
+        || graphics_abs(b.x) > limit || graphics_abs(b.y) > limit
+        || graphics_abs(c.x) > limit || graphics_abs(c.y) > limit) { return 0; }
+    let area: t27 = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    if (area == 0) { return 0; }
+    let ab: t27 = (b.x - a.x) * (point_y - a.y) - (b.y - a.y) * (point_x - a.x);
+    let bc: t27 = (c.x - b.x) * (point_y - b.y) - (c.y - b.y) * (point_x - b.x);
+    let ca: t27 = (a.x - c.x) * (point_y - c.y) - (a.y - c.y) * (point_x - c.x);
+    let negative: i32 = 0; let positive: i32 = 0;
+    if (ab < 0 || bc < 0 || ca < 0) { negative = 1; }
+    if (ab > 0 || bc > 0 || ca > 0) { positive = 1; }
+    return !(negative == 1 && positive == 1);
+}
+
+fn integer_sqrt(value: t27) t27 {
+    if (value <= 0) { return 0; }
+    let low: t27 = 1; let high: t27 = value; let answer: t27 = 1;
+    while (low <= high) {
+        let middle: t27 = low + (high - low) / 2;
+        if (middle <= value / middle) { answer = middle; low = middle + 1; }
+        else { high = middle - 1; }
+    }
+    return answer;
+}
+
+fn path_arc_scale() t27 { return 729; }
+fn path_arc_coordinate_limit() t27 { return 19683; }
+fn path_arc_hypot_component_limit() t27 { return 531441; }
+
+fn path_arc_abs(value: t27) t27 { return graphics_abs(value); }
+
+fn path_arc_ceil_div(value: t27, divisor: t27) t27 {
+    if (value <= 0 || divisor <= 0) { return 0; }
+    let quotient: t27 = value / divisor;
+    if ((value % divisor) != 0) { quotient = quotient + 1; }
+    return quotient;
+}
+
+// Conservative integer hypot. Scaling uses powers of three and rounds each
+// component upward, so radius correction never leaves an impossible chord
+// hidden by an overflowing square.
+fn path_arc_hypot_upper(x: t27, y: t27) t27 {
+    let ax: t27 = path_arc_abs(x); let ay: t27 = path_arc_abs(y);
+    let divisor: t27 = 1;
+    while (ax / divisor > path_arc_hypot_component_limit()
+        || ay / divisor > path_arc_hypot_component_limit()) {
+        if (divisor > flashy_t27_max() / 3) { return flashy_t27_max(); }
+        divisor = divisor * 3;
+    }
+    let sx: t27 = path_arc_ceil_div(ax, divisor);
+    let sy: t27 = path_arc_ceil_div(ay, divisor);
+    let squared: t27 = sx * sx + sy * sy;
+    let root: t27 = integer_sqrt(squared);
+    if (root * root < squared) { root = root + 1; }
+    let result: t27 = 0;
+    if (graphics_mul_checked(root, divisor, &result) == 0) { return flashy_t27_max(); }
+    return result;
+}
+
+fn path_arc_normalize(x: t27, y: t27, normalized_x: *t27, normalized_y: *t27) i32 {
+    if (path_arc_abs(x) > path_arc_hypot_component_limit()
+        || path_arc_abs(y) > path_arc_hypot_component_limit()) { return 0; }
+    let squared: t27 = x * x + y * y;
+    if (squared <= 0) { return 0; }
+    let length: t27 = integer_sqrt(squared);
+    if (length <= 0) { return 0; }
+    normalized_x.* = (x * path_arc_scale()) / length;
+    normalized_y.* = (y * path_arc_scale()) / length;
+    return 1;
+}
+
+fn path_arc_round_fixed(value: t27) t27 {
+    let half: t27 = path_arc_scale() / 2;
+    let magnitude: t27 = path_arc_abs(value);
+    let rounded: t27 = magnitude / path_arc_scale();
+    if ((magnitude % path_arc_scale()) >= path_arc_scale() - half) { rounded = rounded + 1; }
+    if (value < 0) { return (0 as t27) - rounded; }
+    return rounded;
+}
+
+fn path_arc_axis_aligned_to(path: *Path2D, radius_x: t27, radius_y: t27,
+    large_arc: i32, sweep: i32, x: t27, y: t27) i32 {
+    let count: i32 = len[Point2D](path.*.points);
+    if (count < 1 || count > 4096 || radius_x < 0 || radius_y < 0
+        || radius_x > path_arc_coordinate_limit() || radius_y > path_arc_coordinate_limit()
+        || (large_arc != 0 && large_arc != 1) || (sweep != 0 && sweep != 1)
+        || x < 0 - path_arc_coordinate_limit() || x > path_arc_coordinate_limit()
+        || y < 0 - path_arc_coordinate_limit() || y > path_arc_coordinate_limit()) { return 0; }
+    let start: Point2D = path.*.points.data[count - 1];
+    if (graphics_point_valid(start) == 0) { return 0; }
+    if (start.x == x && start.y == y) { return 1; }
+    if (radius_x == 0 || radius_y == 0) { return path_line_to(path, x, y); }
+
+    let rx: t27 = radius_x; let ry: t27 = radius_y;
+    let delta_x: t27 = start.x - x; let delta_y: t27 = start.y - y;
+    let chord_x: t27 = 0; let chord_y: t27 = 0;
+    let diameter_product: t27 = 0; let radius_product: t27 = 0;
+    if (graphics_mul_checked(delta_x, ry, &chord_x) == 0
+        || graphics_mul_checked(delta_y, rx, &chord_y) == 0
+        || graphics_mul_checked(rx, ry, &radius_product) == 0
+        || graphics_mul_checked(radius_product, 2, &diameter_product) == 0) { return 0; }
+    let chord_length: t27 = path_arc_hypot_upper(chord_x, chord_y);
+    if (chord_length <= 0 || diameter_product <= 0) { return 0; }
+
+    if (chord_length > diameter_product) {
+        let scale_numerator: t27 = 0;
+        let scaled_rx: t27 = 0; let scaled_ry: t27 = 0;
+        if (graphics_mul_checked(chord_length, path_arc_scale(), &scale_numerator) == 0) { return 0; }
+        let scale_fixed: t27 = path_arc_ceil_div(scale_numerator, diameter_product);
+        if (graphics_mul_checked(rx, scale_fixed, &scaled_rx) == 0
+            || graphics_mul_checked(ry, scale_fixed, &scaled_ry) == 0) { return 0; }
+        rx = path_arc_ceil_div(scaled_rx, path_arc_scale());
+        ry = path_arc_ceil_div(scaled_ry, path_arc_scale());
+        if (rx < 1 || ry < 1 || rx > path_arc_coordinate_limit() || ry > path_arc_coordinate_limit()) { return 0; }
+        if (graphics_mul_checked(delta_x, ry, &chord_x) == 0
+            || graphics_mul_checked(delta_y, rx, &chord_y) == 0
+            || graphics_mul_checked(rx, ry, &radius_product) == 0
+            || graphics_mul_checked(radius_product, 2, &diameter_product) == 0) { return 0; }
+        chord_length = path_arc_hypot_upper(chord_x, chord_y);
+        if (chord_length <= 0 || chord_length > diameter_product) { return 0; }
+    }
+
+    let height_divisor: t27 = 1;
+    while (diameter_product / height_divisor > path_arc_hypot_component_limit()
+        || chord_length / height_divisor > path_arc_hypot_component_limit()) {
+        height_divisor = height_divisor * 3;
+    }
+    let scaled_diameter: t27 = diameter_product / height_divisor;
+    let scaled_chord: t27 = chord_length / height_divisor;
+    if (scaled_diameter <= 0 || scaled_chord > scaled_diameter) { return 0; }
+    let height_squared: t27 = scaled_diameter * scaled_diameter - scaled_chord * scaled_chord;
+    let height: t27 = integer_sqrt(height_squared);
+    let height_fixed: t27 = (height * path_arc_scale()) / scaled_diameter;
+
+    let perpendicular_x: t27 = (chord_y * path_arc_scale()) / chord_length;
+    let perpendicular_y: t27 = (0 - chord_x * path_arc_scale()) / chord_length;
+    let offset_x_fixed: t27 = rx * ((perpendicular_x * height_fixed) / path_arc_scale());
+    let offset_y_fixed: t27 = ry * ((perpendicular_y * height_fixed) / path_arc_scale());
+    let center_sign: t27 = 1;
+    if (large_arc == sweep) { center_sign = -1; }
+    let center_x_fixed: t27 = ((start.x + x) * path_arc_scale()) / 2 + center_sign * offset_x_fixed;
+    let center_y_fixed: t27 = ((start.y + y) * path_arc_scale()) / 2 + center_sign * offset_y_fixed;
+    let center_limit: t27 = path_arc_coordinate_limit() * path_arc_scale() * 2;
+    if (path_arc_abs(center_x_fixed) > center_limit || path_arc_abs(center_y_fixed) > center_limit) { return 0; }
+
+    let radius_x_fixed: t27 = rx * path_arc_scale();
+    let radius_y_fixed: t27 = ry * path_arc_scale();
+    let start_direction_x: t27 = 0; let start_direction_y: t27 = 0;
+    let end_direction_x: t27 = 0; let end_direction_y: t27 = 0;
+    let start_raw_x: t27 = ((start.x * path_arc_scale() - center_x_fixed) * path_arc_scale()) / radius_x_fixed;
+    let start_raw_y: t27 = ((start.y * path_arc_scale() - center_y_fixed) * path_arc_scale()) / radius_y_fixed;
+    let end_raw_x: t27 = ((x * path_arc_scale() - center_x_fixed) * path_arc_scale()) / radius_x_fixed;
+    let end_raw_y: t27 = ((y * path_arc_scale() - center_y_fixed) * path_arc_scale()) / radius_y_fixed;
+    if (path_arc_normalize(start_raw_x, start_raw_y, &start_direction_x, &start_direction_y) == 0
+        || path_arc_normalize(end_raw_x, end_raw_y, &end_direction_x, &end_direction_y) == 0) { return 0; }
+
+    let midpoint_raw_x: t27 = start_direction_x + end_direction_x;
+    let midpoint_raw_y: t27 = start_direction_y + end_direction_y;
+    if (path_arc_abs(midpoint_raw_x) + path_arc_abs(midpoint_raw_y) <= 1) {
+        if (sweep == 1) { midpoint_raw_x = 0 - start_direction_y; midpoint_raw_y = start_direction_x; }
+        else { midpoint_raw_x = start_direction_y; midpoint_raw_y = 0 - start_direction_x; }
+    } else if (large_arc == 1) {
+        midpoint_raw_x = 0 - midpoint_raw_x; midpoint_raw_y = 0 - midpoint_raw_y;
+    }
+    let midpoint_x: t27 = 0; let midpoint_y: t27 = 0;
+    if (path_arc_normalize(midpoint_raw_x, midpoint_raw_y, &midpoint_x, &midpoint_y) == 0) { return 0; }
+
+    let subdivisions: i32 = 27;
+    if (count > 4096 - subdivisions) { return 0; }
+    let step: i32 = 1;
+    while (step <= subdivisions) {
+        if (step == subdivisions) {
+            if (path_line_to(path, x, y) == 0) { return 0; }
+        } else {
+            let raw_x: t27 = 0; let raw_y: t27 = 0;
+            if (step <= 13) {
+                raw_x = ((13 - step) as t27) * start_direction_x + (step as t27) * midpoint_x;
+                raw_y = ((13 - step) as t27) * start_direction_y + (step as t27) * midpoint_y;
+            } else {
+                let local: t27 = (step - 13) as t27;
+                raw_x = (14 - local) * midpoint_x + local * end_direction_x;
+                raw_y = (14 - local) * midpoint_y + local * end_direction_y;
+            }
+            let direction_x: t27 = 0; let direction_y: t27 = 0;
+            if (path_arc_normalize(raw_x, raw_y, &direction_x, &direction_y) == 0) { return 0; }
+            let point_x_fixed: t27 = center_x_fixed + (radius_x_fixed * direction_x) / path_arc_scale();
+            let point_y_fixed: t27 = center_y_fixed + (radius_y_fixed * direction_y) / path_arc_scale();
+            let point_x: t27 = path_arc_round_fixed(point_x_fixed);
+            let point_y: t27 = path_arc_round_fixed(point_y_fixed);
+            if (point_x < 0 - path_arc_coordinate_limit() || point_x > path_arc_coordinate_limit()
+                || point_y < 0 - path_arc_coordinate_limit() || point_y > path_arc_coordinate_limit()
+                || path_line_to(path, point_x, point_y) == 0) { return 0; }
+        }
+        step = step + 1;
+    }
+    return 1;
+}
+
+fn point_in_join_six(point_x: t27, point_y: t27, previous: Point2D, vertex: Point2D, next: Point2D,
+    radius_six: t27, join: StrokeJoin) i32 {
+    if (graphics_point_valid(previous) == 0 || graphics_point_valid(vertex) == 0
+        || graphics_point_valid(next) == 0 || radius_six < 0 || radius_six > 2187
+        || graphics_abs(point_x) > graphics_sample_coordinate_limit()
+        || graphics_abs(point_y) > graphics_sample_coordinate_limit()) { return 0; }
+    let vx: t27 = vertex.x * 6; let vy: t27 = vertex.y * 6;
+    if (join == StrokeJoin.Round) {
+        let dx: t27 = point_x - vx; let dy: t27 = point_y - vy;
+        return dx * dx + dy * dy <= radius_six * radius_six;
+    }
+    let previous_x: t27 = previous.x * 6; let previous_y: t27 = previous.y * 6;
+    let next_x: t27 = next.x * 6; let next_y: t27 = next.y * 6;
+    let direction1_x: t27 = vx - previous_x; let direction1_y: t27 = vy - previous_y;
+    let direction2_x: t27 = next_x - vx; let direction2_y: t27 = next_y - vy;
+    let turn: t27 = direction1_x * direction2_y - direction1_y * direction2_x;
+    if (turn == 0) { return 0; }
+    let length1: t27 = integer_sqrt(direction1_x * direction1_x + direction1_y * direction1_y);
+    let length2: t27 = integer_sqrt(direction2_x * direction2_x + direction2_y * direction2_y);
+    if (length1 == 0 || length2 == 0) { return 0; }
+    let side: t27 = 1; if (turn > 0) { side = -1; }
+    let outer1: Point2D = Point2D{ .x = vx + side * (-direction1_y) * radius_six / length1,
+        .y = vy + side * direction1_x * radius_six / length1 };
+    let outer2: Point2D = Point2D{ .x = vx + side * (-direction2_y) * radius_six / length2,
+        .y = vy + side * direction2_x * radius_six / length2 };
+    let center: Point2D = Point2D{ .x = vx, .y = vy };
+    if (join == StrokeJoin.Bevel) { return point_in_triangle_six(point_x, point_y, center, outer1, outer2); }
+    let denominator: t27 = direction1_x * direction2_y - direction1_y * direction2_x;
+    let delta_x: t27 = outer2.x - outer1.x; let delta_y: t27 = outer2.y - outer1.y;
+    let numerator_first: t27 = 0; let numerator_second: t27 = 0; let numerator: t27 = 0;
+    if (graphics_mul_checked(delta_x, direction2_y, &numerator_first) == 0
+        || graphics_mul_checked(delta_y, direction2_x, &numerator_second) == 0
+        || graphics_sub_checked(numerator_first, numerator_second, &numerator) == 0) {
+        return point_in_triangle_six(point_x, point_y, center, outer1, outer2);
+    }
+    let miter_offset_x_product: t27 = 0; let miter_offset_y_product: t27 = 0;
+    let miter_offset_x: t27 = 0; let miter_offset_y: t27 = 0;
+    let miter: Point2D = Point2D{ .x = 0, .y = 0 };
+    if (denominator == 0 || graphics_mul_checked(direction1_x, numerator, &miter_offset_x_product) == 0
+        || graphics_mul_checked(direction1_y, numerator, &miter_offset_y_product) == 0) {
+        return point_in_triangle_six(point_x, point_y, center, outer1, outer2);
+    }
+    miter_offset_x = miter_offset_x_product / denominator;
+    miter_offset_y = miter_offset_y_product / denominator;
+    if (graphics_add_checked(outer1.x, miter_offset_x, &miter.x) == 0
+        || graphics_add_checked(outer1.y, miter_offset_y, &miter.y) == 0) {
+        return point_in_triangle_six(point_x, point_y, center, outer1, outer2);
+    }
+    let miter_dx: t27 = 0; let miter_dy: t27 = 0;
+    if (graphics_sub_checked(miter.x, vx, &miter_dx) == 0
+        || graphics_sub_checked(miter.y, vy, &miter_dy) == 0) {
+        return point_in_triangle_six(point_x, point_y, center, outer1, outer2);
+    }
+    let miter_limit: t27 = radius_six * 4;
+    if (graphics_abs(miter_dx) > miter_limit || graphics_abs(miter_dy) > miter_limit) {
+        return point_in_triangle_six(point_x, point_y, center, outer1, outer2);
+    }
+    if (miter_dx * miter_dx + miter_dy * miter_dy > 16 * radius_six * radius_six) {
+        return point_in_triangle_six(point_x, point_y, center, outer1, outer2);
+    }
+    if (point_in_triangle_six(point_x, point_y, center, outer1, miter) == 1) { return 1; }
+    return point_in_triangle_six(point_x, point_y, center, miter, outer2);
+}
+
+fn surface_stroke_path_aa(surface: *Surface, path: *Path2D, transform: Transform2D, clip: Rect,
+    width: t27, color: Color, join: StrokeJoin) StrokeResult {
+    let result: StrokeResult = StrokeResult{ .painted = 0, .ok = 0, .error = GraphicsError.InvalidPath };
+    if (graphics_points_valid(&path.*.points, 2) == 0 || (path.*.closed != 0 && path.*.closed != 1)
+        || graphics_surface_valid(surface) == 0) { return result; }
+    if (width < 1 || width > 729) { result.error = GraphicsError.InvalidWidth; return result; }
+    let bounded: Rect = rect_clip_to_surface(surface, clip);
+    if (bounded.w == 0 || bounded.h == 0) {
+        result.ok = 1; result.error = GraphicsError.None; return result;
+    }
+    let transformed: ArrayList[Point2D] = make[Point2D](len[Point2D](path.*.points)); let i: i32 = 0;
+    let min_x: t27 = 0; let min_y: t27 = 0; let max_x: t27 = 0; let max_y: t27 = 0;
+    while (i < len[Point2D](path.*.points)) {
+        let point: Point2D = Point2D{ .x = 0, .y = 0 };
+        if (transform_apply_checked(transform, get[Point2D](path.*.points, i), &point) == 0
+            || graphics_point_valid(point) == 0) { free[Point2D](&transformed); return result; }
+        push[Point2D](&transformed, point);
+        if (i == 0 || point.x < min_x) { min_x = point.x; } if (i == 0 || point.y < min_y) { min_y = point.y; }
+        if (i == 0 || point.x > max_x) { max_x = point.x; } if (i == 0 || point.y > max_y) { max_y = point.y; }
+        i = i + 1;
+    }
+    let radius: t27 = (width + 1) / 2;
+    if (graphics_sub_checked(min_x, radius, &min_x) == 0
+        || graphics_sub_checked(min_y, radius, &min_y) == 0
+        || graphics_add_checked(max_x, radius, &max_x) == 0
+        || graphics_add_checked(max_y, radius, &max_y) == 0) {
+        free[Point2D](&transformed); return result;
+    }
+    let bound_end_x: t27 = bounded.x + bounded.w;
+    let bound_end_y: t27 = bounded.y + bounded.h;
+    if (min_x < bounded.x) { min_x = bounded.x; } if (min_y < bounded.y) { min_y = bounded.y; }
+    if (max_x >= bound_end_x) { max_x = bound_end_x - 1; }
+    if (max_y >= bound_end_y) { max_y = bound_end_y - 1; }
+    if (min_x > max_x || min_y > max_y) {
+        free[Point2D](&transformed); result.ok = 1; result.error = GraphicsError.None; return result;
+    }
+    let radius_six: t27 = width * 3; let y: t27 = min_y;
+    while (y <= max_y) {
+        let x: t27 = min_x;
+        while (x <= max_x) {
+            let coverage: t27 = 0; let sample_y: t27 = 1;
+            while (sample_y <= 5) {
+                let sample_x: t27 = 1;
+                while (sample_x <= 5) {
+                    let covered: i32 = 0; let segment: i32 = 0; let point_x: t27 = x * 6 + sample_x;
+                    let point_y: t27 = y * 6 + sample_y;
+                    while (segment + 1 < len[Point2D](transformed)) {
+                        if ((join == StrokeJoin.Round && point_near_segment_six(point_x, point_y,
+                            transformed.data[segment], transformed.data[segment + 1], radius_six) == 1)
+                            || (join != StrokeJoin.Round && point_near_segment_body_six(point_x, point_y,
+                            transformed.data[segment], transformed.data[segment + 1], radius_six) == 1)) { covered = 1; }
+                        segment = segment + 1;
+                    }
+                    if (path.*.closed == 1) {
+                        if ((join == StrokeJoin.Round && point_near_segment_six(point_x, point_y,
+                            transformed.data[len[Point2D](transformed) - 1], transformed.data[0], radius_six) == 1)
+                            || (join != StrokeJoin.Round && point_near_segment_body_six(point_x, point_y,
+                            transformed.data[len[Point2D](transformed) - 1], transformed.data[0], radius_six) == 1)) { covered = 1; }
+                    } else if (join != StrokeJoin.Round) {
+                        if (point_near_segment_six(point_x, point_y, transformed.data[0], transformed.data[0], radius_six) == 1
+                            || point_near_segment_six(point_x, point_y, transformed.data[len[Point2D](transformed) - 1],
+                            transformed.data[len[Point2D](transformed) - 1], radius_six) == 1) { covered = 1; }
+                    }
+                    let vertex: i32 = 1;
+                    while (vertex + 1 < len[Point2D](transformed)) {
+                        if (point_in_join_six(point_x, point_y, transformed.data[vertex - 1], transformed.data[vertex],
+                            transformed.data[vertex + 1], radius_six, join) == 1) { covered = 1; }
+                        vertex = vertex + 1;
+                    }
+                    if (path.*.closed == 1 && len[Point2D](transformed) > 2) {
+                        let last: i32 = len[Point2D](transformed) - 1;
+                        if (point_in_join_six(point_x, point_y, transformed.data[last], transformed.data[0],
+                            transformed.data[1], radius_six, join) == 1
+                            || point_in_join_six(point_x, point_y, transformed.data[last - 1], transformed.data[last],
+                            transformed.data[0], radius_six, join) == 1) { covered = 1; }
+                    }
+                    coverage = coverage + covered as t27; sample_x = sample_x + 2;
+                }
+                sample_y = sample_y + 2;
+            }
+            if (coverage > 0) {
+                let stroke_color: Color = color; stroke_color.a = ((color.a as t27) * coverage / 9) as t9;
+                surface_blend(surface, x, y, stroke_color); result.painted = result.painted + 1;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    free[Point2D](&transformed); result.ok = 1; result.error = GraphicsError.None; return result;
+}
+
+fn color_lerp_channel(start: t9, finish: t9, numerator: t27, denominator: t27) t9 {
+    let first: t27 = clamp8(start) as t27;
+    let last: t27 = clamp8(finish) as t27;
+    if (denominator < 1) { return first as t9; }
+    let n: t27 = numerator;
+    if (n < 0) { n = 0; }
+    if (n > denominator) { n = denominator; }
+    let delta: t27 = last - first;
+    let magnitude: t27 = graphics_abs(delta);
+    let quotient: t27 = 0;
+    let remainder: t27 = 0;
+    let i: t27 = 0;
+    let threshold: t27 = denominator - n;
+    while (i < magnitude) {
+        if (remainder >= threshold) {
+            remainder = remainder - threshold;
+            quotient = quotient + 1;
+        } else {
+            remainder = remainder + n;
+        }
+        i = i + 1;
+    }
+    if (delta < 0) { return (first - quotient) as t9; }
+    return (first + quotient) as t9;
+}
+
+fn color_lerp(start: Color, finish: Color, numerator: t27, denominator: t27) Color {
+    return color_rgba(color_lerp_channel(start.r, finish.r, numerator, denominator),
+        color_lerp_channel(start.g, finish.g, numerator, denominator),
+        color_lerp_channel(start.b, finish.b, numerator, denominator),
+        color_lerp_channel(start.a, finish.a, numerator, denominator));
+}
+
+fn graphics_rect_intersection(a: Rect, b: Rect) Rect {
+    if (a.w <= 0 || a.h <= 0 || b.w <= 0 || b.h <= 0) { return rect(0, 0, 0, 0); }
+    let start_x: t27 = a.x; if (b.x > start_x) { start_x = b.x; }
+    let start_y: t27 = a.y; if (b.y > start_y) { start_y = b.y; }
+    let end_x: t27 = 0; let b_end_x: t27 = 0;
+    let end_y: t27 = 0; let b_end_y: t27 = 0;
+    if (graphics_add_checked(a.x, a.w, &end_x) == 0
+        || graphics_add_checked(b.x, b.w, &b_end_x) == 0
+        || graphics_add_checked(a.y, a.h, &end_y) == 0
+        || graphics_add_checked(b.y, b.h, &b_end_y) == 0) { return rect(0, 0, 0, 0); }
+    if (b_end_x < end_x) { end_x = b_end_x; }
+    if (b_end_y < end_y) { end_y = b_end_y; }
+    if (start_x >= end_x || start_y >= end_y) { return rect(0, 0, 0, 0); }
+    return rect(start_x, start_y, end_x - start_x, end_y - start_y);
+}
+
+fn surface_fill_linear_gradient(surface: *Surface, bounds: Rect, clip: Rect, start: Color, finish: Color,
+    horizontal: i32) t27 {
+    if (graphics_surface_valid(surface) == 0 || bounds.w <= 0 || bounds.h <= 0) { return 0; }
+    let bounded_clip: Rect = rect_clip_to_surface(surface, clip);
+    let bounded_fill: Rect = rect_clip_to_surface(surface, bounds);
+    let visible: Rect = graphics_rect_intersection(bounded_clip, bounded_fill);
+    if (visible.w == 0 || visible.h == 0) { return 0; }
+    let painted: t27 = 0;
+    let end_x: t27 = visible.x + visible.w;
+    let end_y: t27 = visible.y + visible.h;
+    let y: t27 = visible.y;
+    while (y < end_y) {
+        let x: t27 = visible.x;
+        while (x < end_x) {
+            let numerator: t27 = 0;
+            let denominator: t27 = bounds.h - 1;
+            if (graphics_sub_checked(y, bounds.y, &numerator) == 0) { return painted; }
+            if (horizontal == 1) {
+                if (graphics_sub_checked(x, bounds.x, &numerator) == 0) { return painted; }
+                denominator = bounds.w - 1;
+            }
+            surface_blend(surface, x, y, color_lerp(start, finish, numerator, denominator));
+            painted = painted + 1;
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return painted;
+}

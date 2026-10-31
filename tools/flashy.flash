@@ -1,0 +1,212 @@
+@import("../src/flashy.flash")
+
+fn usage() void {
+    _zag_println("flashy <doctor|inspect|check|test|run|build|dev|init|assets> [entry-or-asset] [--hot --emit-hot-manifest]");
+}
+
+fn cli_exec(command: []u8) i32 { return _zag_exec_cmd(command); }
+fn cli_write(path: []u8, text: []u8) i32 { return _zag_write_file(path, text); }
+
+fn cli_safe_path(path: []u8) i32 {
+    if (path.len < 1) { return 0; }
+    let i: i32 = 0;
+    while (i < path.len) {
+        let c: t27 = path[i] as t27;
+        if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+            || c == 47 || c == 46 || c == 95 || c == 45)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn cli_ends_with(value: []u8, suffix: []u8) i32 {
+    if (suffix.len > value.len) { return 0; }
+    let start: i32 = value.len - suffix.len; let i: i32 = 0;
+    while (i < suffix.len) { if (value[start + i] != suffix[i]) { return 0; } i = i + 1; }
+    return 1;
+}
+
+fn cli_flashc() []u8 {
+    let flash_home: []u8 = _zag_getenv("FLASH_HOME");
+    if (flash_home.len > 0) {
+        let candidate: []u8 = _zag_str_concat(flash_home, "/flashc");
+        if (cli_safe_path(candidate) == 1 && _zag_file_exists(candidate) == 1) { return candidate; }
+    }
+    if (_zag_file_exists("../flash/flashc") == 1) { return "../flash/flashc"; }
+    if (_zag_file_exists("../../flash/flashc") == 1) { return "../../flash/flashc"; }
+    if (_zag_file_exists("../../../flash/flashc") == 1) { return "../../../flash/flashc"; }
+    return "";
+}
+
+fn cli_entry(default_path: []u8) []u8 {
+    let i: i32 = 2;
+    while (i < _zag_argc()) {
+        let arg: []u8 = _zag_arg(i);
+        if ((arg.len > 0) && (arg[0] != 45)) { return arg; }
+        i = (i + 1);
+    }
+    return default_path;
+}
+
+fn cli_collect_flags() []u8 {
+    let flags: []u8 = "";
+    let i: i32 = 2;
+    while (i < _zag_argc()) {
+        let arg: []u8 = _zag_arg(i);
+        if (arg.len > 0 && arg[0] == 45) {
+            if (@strEq(arg, "--emit-manifest") == 1) {
+                flags = _zag_str_concat(flags, " --emit-manifest");
+            } else if (@strEq(arg, "--emit-hot-manifest") == 1) {
+                flags = _zag_str_concat(flags, " --emit-manifest");
+            } else if (@strEq(arg, "--hot") == 1) {
+                flags = _zag_str_concat(flags, " --hot");
+            } else if (@strEq(arg, "--check") == 1) {
+                flags = _zag_str_concat(flags, " --check");
+            } else if (@strEq(arg, "--help") == 1) {
+                flags = _zag_str_concat(flags, " --help");
+            }
+        }
+        i = i + 1;
+    }
+    return flags;
+}
+
+fn cli_project_ready(entry: []u8) i32 {
+    if (_zag_file_exists("flash.mod") == 0) { _zag_eprintln("flashy: flash.mod not found"); return 0; }
+    if (cli_safe_path(entry) == 0) { _zag_eprintln("flashy: entry path contains unsupported shell characters"); return 0; }
+    if (_zag_file_exists(entry) == 0) { _zag_eprintln("flashy: entry source not found"); return 0; }
+    if (cli_flashc().len == 0) { _zag_eprintln("flashy: Flash compiler not found; set FLASH_HOME"); return 0; }
+    return 1;
+}
+
+fn cli_check(entry: []u8) i32 {
+    if (cli_project_ready(entry) == 0) { return 2; }
+    let command: []u8 = _zag_str_concat(_zag_str_concat(_zag_str_concat(cli_flashc(), " "), entry), cli_collect_flags());
+    command = _zag_str_concat(command, " --check");
+    return cli_exec(command);
+}
+
+fn cli_build_to(entry: []u8, output: []u8) i32 {
+    if (cli_project_ready(entry) == 0 || cli_safe_path(output) == 0) { return 2; }
+    if (cli_exec("mkdir -p .flashy/build") != 0) { return 3; }
+    let command: []u8 = _zag_str_concat(_zag_str_concat(_zag_str_concat(_zag_str_concat(cli_flashc(), " "), entry), cli_collect_flags()), " -o ");
+    command = _zag_str_concat(command, output);
+    return cli_exec(command);
+}
+
+fn cli_run(entry: []u8) i32 {
+    let built: i32 = cli_build_to(entry, ".flashy/build/app");
+    if (built != 0) { return built; }
+    return cli_exec(".flashy/build/app");
+}
+
+fn cli_test(entry: []u8) i32 {
+    let built: i32 = cli_build_to(entry, ".flashy/build/tests");
+    if (built != 0) { return built; }
+    return cli_exec(".flashy/build/tests");
+}
+
+fn cli_init() i32 {
+    if (_zag_file_exists("flash.mod") == 1 || _zag_file_exists("src/main.flash") == 1) {
+        _zag_println("flashy init: existing project preserved"); return 0;
+    }
+    if (cli_exec("mkdir -p src tests") != 0) { return 3; }
+    let flashy_home: []u8 = _zag_getenv("FLASHY_HOME");
+    if (flashy_home.len == 0) { flashy_home = "../Flashy"; }
+    if (cli_safe_path(flashy_home) == 0) { _zag_eprintln("flashy init: FLASHY_HOME path is unsupported"); return 2; }
+    let manifest: []u8 = _zag_str_concat("name = \"flashy-app\"\nversion = \"0.1.0\"\nedition = \"2026\"\n\n[deps]\nflashy = { path = \"",
+        _zag_str_concat(flashy_home, "\" }\n\n[target]\ndefault = \"x86_64-emul\"\n"));
+    let source: []u8 = "@import(\"flashy\") as fy\n\nfn main() i32 {\n    let app: fy.App = fy.app_new(fy.BackendKind.Headless);\n    let window: i32 = fy.app_open_window(&app, 1, \"Flashy App\", 640, 480);\n    if (window < 0) { return 1; }\n    let _presented: i32 = fy.app_present_window(&app, window, 1);\n    fy.app_shutdown(&app);\n    return 0;\n}\n";
+    if (cli_write("flash.mod", manifest) != 0 || cli_write("src/main.flash", source) != 0) { return 3; }
+    _zag_println("flashy init: created flash.mod and src/main.flash"); return 0;
+}
+
+fn cli_assets(path: []u8) i32 {
+    if (cli_safe_path(path) == 0 || _zag_file_exists(path) == 0) { _zag_eprintln("flashy assets: resource not found or unsafe path"); return 2; }
+    if (cli_ends_with(path, ".svg") == 1) {
+        let parsed: SvgResult = svg_load_file(path);
+        if (parsed.valid == 0) { svg_free(&parsed); _zag_eprintln("flashy assets: SVG validation failed"); return 3; }
+        svg_free(&parsed);
+    } else if (cli_ends_with(path, ".png") == 1) {
+        let animation: PngAnimationResult = png_load_animation_file(path);
+        if (animation.valid == 1) {
+            png_animation_free(&animation);
+        } else if (animation.error == PngError.NotAnimated) {
+            png_animation_free(&animation);
+            let parsed: PngResult = png_load_file(path);
+            if (parsed.valid == 0) { png_free(&parsed); _zag_eprintln("flashy assets: PNG validation failed"); return 3; }
+            png_free(&parsed);
+        } else {
+            png_animation_free(&animation);
+            _zag_eprintln("flashy assets: APNG validation failed"); return 3;
+        }
+    } else if (cli_ends_with(path, ".jpg") == 1 || cli_ends_with(path, ".jpeg") == 1) {
+        let parsed: JpegDecodeResult = jpeg_load_file(path);
+        if (parsed.valid == 0) { jpeg_free(&parsed); _zag_eprintln("flashy assets: JPEG validation failed"); return 3; }
+        jpeg_free(&parsed);
+    } else {
+        _zag_eprintln("flashy assets: supported validation formats are SVG, PNG/APNG, and JPEG"); return 2;
+    }
+    if (cli_exec("mkdir -p .flashy") != 0) { return 3; }
+    if (cli_write(".flashy/assets.last", path) != 0) { return 3; }
+    _zag_print("flashy assets: recorded resource identity "); _zag_println(path); return 0;
+}
+
+fn main() i32 {
+    if (_zag_argc() < 2) { usage(); return 2; }
+    let cmd: []u8 = _zag_arg(1);
+    if (@strEq(cmd, "doctor") == 1) {
+        _zag_println("Flashy doctor");
+        _zag_print("version: "); _zag_println(flashy_version());
+        _zag_println("headless: available (deterministic RGBA8 CPU)");
+        _zag_println("assets: bounded PNG/APNG decode and encode; baseline and progressive JPEG CPU decode");
+        _zag_println("linux AF_UNIX transport: available");
+        let wayland_connection: WaylandNativeConnection = wayland_connect_local();
+        if (wayland_connection.registry_ready == 1 && wayland_bind_shell(&wayland_connection) == 1) {
+            _zag_println("wayland: registry, xdg-shell binding, and wl_shm client available; live compositor window unverified");
+        } else {
+            _zag_print("wayland: wire client available; required live compositor path unavailable: "); _zag_println(wayland_connection.error);
+        }
+        wayland_disconnect(&wayland_connection);
+        let x11_connection: X11NativeConnection = x11_connect_local();
+        if (x11_connection.authenticated == 1) {
+            let doctor_window: X11NativeWindow = x11_open_window(&x11_connection, 64, 48);
+            let doctor_surface: Surface = surface_new(64, 48);
+            surface_fill(&doctor_surface, rect(0, 0, 64, 48), color_rgba(22, 25, 34, 255));
+            let doctor_ready: i32 = x11_wait_window_ready(&x11_connection, &doctor_window, 2000);
+            let doctor_metadata: i32 = x11_set_window_metadata(&x11_connection, &doctor_window, "Flashy Doctor");
+            let doctor_present: X11PresentResult = x11_present_surface(&x11_connection, &doctor_window, &doctor_surface);
+            let doctor_sync: i32 = 0;
+            if (doctor_present.ok == 1) { doctor_sync = x11_sync_window_geometry(&x11_connection, &doctor_window, 2000); }
+            let doctor_pid: i32 = 0;
+            if (doctor_metadata == 1) { doctor_pid = x11_verify_window_pid(&x11_connection, &doctor_window, 2000); }
+            if (doctor_ready == 1 && doctor_present.ok == 1 && doctor_sync == 1 && doctor_pid == 1) {
+                _zag_println("x11: authenticated windows, CPU presentation, and PID association available");
+            } else {
+                _zag_println("x11: authenticated setup available; window or presentation probe failed");
+            }
+            if (doctor_window.live == 1) { x11_close_window(&x11_connection, &doctor_window); }
+            x11_disconnect(&x11_connection);
+        } else {
+            _zag_print("x11: wire codec available; setup unavailable: "); _zag_println(x11_connection.error);
+        }
+        _zag_println("hardware acceleration: uncertified");
+        return 0;
+    }
+    if (@strEq(cmd, "inspect") == 1) {
+        _zag_println("Flashy inspector: use ui_inspect for hierarchy, bounds, focus order, dirty state, reconciliation, and violations");
+        return 0;
+    }
+    if (@strEq(cmd, "check") == 1) { return cli_check(cli_entry("src/main.flash")); }
+    if (@strEq(cmd, "build") == 1) { return cli_build_to(cli_entry("src/main.flash"), ".flashy/build/app"); }
+    if (@strEq(cmd, "run") == 1) { return cli_run(cli_entry("src/main.flash")); }
+    if (@strEq(cmd, "test") == 1) { return cli_test(cli_entry("tests/main.flash")); }
+    if (@strEq(cmd, "dev") == 1) {
+        _zag_println("flashy dev: controlled rebuild/run; hot patching is not implemented yet");
+        return cli_run(cli_entry("src/main.flash"));
+    }
+    if (@strEq(cmd, "init") == 1) { return cli_init(); }
+    if (@strEq(cmd, "assets") == 1) { return cli_assets(cli_entry("assets")); }
+    usage();
+    return 2;
+}

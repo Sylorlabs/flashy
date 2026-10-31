@@ -1,0 +1,776 @@
+@import("../src/flashy.flash")
+
+fn wayland_native_clipboard_expect(ok: i32, message: []u8) i32 {
+    if (ok == 0) { _zag_print("FAIL "); _zag_println(message); return 1; }
+    return 0;
+}
+
+fn wayland_native_clipboard_connection(fd: i64,
+    first_surface: t27, second_surface: t27) WaylandNativeConnection {
+    let connection: WaylandNativeConnection = wayland_empty_connection();
+    connection.fd = fd; connection.connected = 1; connection.registry_ready = 1;
+    connection.seat_id = 7; connection.seat_version = 3;
+    connection.seat_has_keyboard = 1;
+    connection.keyboard_focus_surface = first_surface;
+    let _first_registered: i32 = wayland_connection_register_surface(
+        &connection, first_surface);
+    if (second_surface != 0) {
+        let _second_registered: i32 = wayland_connection_register_surface(
+            &connection, second_surface);
+    }
+    connection.clipboard_manager_id = 8;
+    connection.clipboard_device_id = 9;
+    connection.clipboard_state = wayland_clipboard_state_new(8, 9, 7);
+    connection.clipboard_available = 1;
+    connection.clipboard_order = 1;
+    connection.clipboard_serial = WaylandNativeClipboardSerial{
+        .value = 0, .seat_id = 7, .surface_id = first_surface,
+        .order = 1, .valid = 1 };
+    connection.next_id = 100;
+    return connection;
+}
+
+fn wayland_native_clipboard_process_no_fd(
+    connection: *WaylandNativeConnection, input: *WireBuffer) i32 {
+    let handled: i32 = wayland_native_clipboard_process_frame(
+        connection, input, 0 - 1, 0, 1);
+    wire_free(input); return handled;
+}
+
+fn wayland_native_clipboard_process_callback(
+    connection: *WaylandNativeConnection, callback_id: t27) i32 {
+    let done: WireBuffer = wayland_u32_request(callback_id, 0, 1);
+    let handled: i32 = wayland_native_clipboard_process_callback_frame(
+        connection, &done, 0 - 1, 0, 1);
+    wire_free(&done); return handled;
+}
+
+fn wayland_native_clipboard_fork() i64 {
+    return _zag_raw_syscall(57, 0, 0, 0, 0, 0, 0);
+}
+
+fn wayland_native_clipboard_child_exit(code: i32) void {
+    let _exited: i64 = _zag_raw_syscall(60, code as i64, 0, 0, 0, 0, 0);
+}
+
+fn wayland_native_clipboard_wait_child(pid: i64) i32 {
+    let status: LinuxByteBuffer = linux_buffer_new(4); status.len = 4;
+    let waited: i64 = _zag_raw_syscall(61, pid,
+        status.words.data as i64, 0, 0, 0, 0);
+    let raw: i64 = linux_buffer_u32(&status, 0);
+    linux_buffer_free(&status);
+    if (waited == pid && raw % 128 == 0
+        && (raw / 256) % 256 == 0) { return 1; }
+    return 0;
+}
+
+fn wayland_native_clipboard_remote_peer(fd: i64, expected_offer: t27,
+    value: []u8) i32 {
+    let received: WaylandNativeFrameReceive =
+        wayland_receive_frame_with_fd(fd, 1000);
+    let frame: WaylandFrame = wayland_decode(&received.input, 0);
+    let mime: WireString = wire_read_string(&received.input,
+        frame.payload_offset, frame.size as i32);
+    let ok: i32 = received.valid != 0 && received.fd_count == 1
+        && received.received_fd >= 0 && frame.valid != 0
+        && frame.object_id == expected_offer && frame.opcode == 1
+        && frame.size == 40
+        && frame.size == len[u8](received.input.bytes) as t27
+        && mime.valid != 0 && mime.next_offset == frame.size as i32
+        && @strEq(mime.value, wayland_clipboard_text_mime()) != 0;
+    if (ok != 0) {
+        let packed: LinuxByteBuffer = linux_buffer_new(value.len);
+        let i: i32 = 0;
+        while (i < value.len) {
+            linux_buffer_set_byte(&packed, i, value[i] as t9); i = i + 1;
+        }
+        packed.len = value.len;
+        let wrote: LinuxPipeWriteResult = linux_pipe_write_buffer_all_until(
+            received.received_fd, &packed, linux_monotonic_ms() + 1000);
+        if (wrote.complete == 0 || wrote.written != value.len as i64) { ok = 0; }
+        linux_buffer_free(&packed);
+    }
+    if (received.received_fd >= 0) {
+        let _closed_data: i64 = linux_close(received.received_fd);
+        received.received_fd = 0 - 1; received.has_fd = 0;
+    }
+    wayland_native_frame_free(&received);
+    return ok;
+}
+
+fn main() i32 {
+    let failures: i32 = 0;
+    let peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + wayland_native_clipboard_expect(peer.ok == 1,
+        "native clipboard fake compositor opens a Unix socketpair");
+    if (peer.ok == 1) {
+        let connection: WaylandNativeConnection =
+            wayland_native_clipboard_connection(peer.first, 30, 31);
+        let expired_next_before: t27 = connection.next_id;
+        let expired_obligations_before: t27 =
+            connection.clipboard_callback_obligations;
+        let expired_native_sources_before: i32 =
+            len[WaylandNativeClipboardSourceRecord](
+                connection.clipboard_sources);
+        let expired_low_sources_before: i32 = len[WaylandClipboardSource](
+            connection.clipboard_state.sources);
+        let expired_copy: WaylandNativeClipboardStatus =
+            wayland_native_clipboard_copy(&connection, 30, "expired", 0);
+        failures = failures + wayland_native_clipboard_expect(
+            expired_copy == WaylandNativeClipboardStatus.Timeout
+            && connection.next_id == expired_next_before
+            && connection.clipboard_callback_obligations
+                == expired_obligations_before
+            && len[WaylandNativeClipboardSourceRecord](
+                connection.clipboard_sources) == expired_native_sources_before
+            && len[WaylandClipboardSource](
+                connection.clipboard_state.sources) == expired_low_sources_before
+            && linux_poll_readable(peer.second, 0) == 0,
+            "zero-byte create timeout rolls back dense source ID and callback obligation");
+        let copied: WaylandNativeClipboardStatus =
+            wayland_native_clipboard_copy(&connection, 30, "alpha", 1000);
+        let create: WireBuffer = wayland_receive_frame(peer.second, 100);
+        let offer: WireBuffer = wayland_receive_frame(peer.second, 100);
+        let select: WireBuffer = wayland_receive_frame(peer.second, 100);
+        let create_frame: WaylandFrame = wayland_decode(&create, 0);
+        let offer_frame: WaylandFrame = wayland_decode(&offer, 0);
+        let select_frame: WaylandFrame = wayland_decode(&select, 0);
+        failures = failures + wayland_native_clipboard_expect(
+            copied == WaylandNativeClipboardStatus.Ok
+            && create_frame.valid != 0 && create_frame.object_id == 8
+            && create_frame.opcode == 0
+            && wire_read_u32_le(&create, create_frame.payload_offset) == 100
+            && offer_frame.valid != 0 && offer_frame.object_id == 100
+            && offer_frame.opcode == 0
+            && select_frame.valid != 0 && select_frame.object_id == 9
+            && select_frame.opcode == 1
+            && wire_read_u32_le(&select, select_frame.payload_offset) == 100
+            && wire_read_u32_le(&select, select_frame.payload_offset + 4) == 0
+            && len[WaylandNativeClipboardSourceRecord](
+                connection.clipboard_sources) == 1,
+            "copy reserves before create and publishes with authoritative serial zero");
+        wire_free(&create); wire_free(&offer); wire_free(&select);
+
+        let wrong_focus: WaylandNativeClipboardReadResult =
+            wayland_native_clipboard_read(&connection, 31, 100, 64);
+        let local: WaylandNativeClipboardReadResult =
+            wayland_native_clipboard_read(&connection, 30, 100, 64);
+        failures = failures + wayland_native_clipboard_expect(
+            wrong_focus.status == WaylandNativeClipboardStatus.OwnershipRejected
+            && local.valid != 0 && local.status == WaylandNativeClipboardStatus.Ok
+            && len[u8](local.bytes) == 5
+            && @strEq(local.bytes.data[0..len[u8](local.bytes)], "alpha") != 0
+            && linux_poll_readable(peer.second, 0) == 0,
+            "local self-read requires the exact focused surface and emits no receive request");
+        wayland_native_clipboard_read_result_free(&wrong_focus);
+        wayland_native_clipboard_read_result_free(&local);
+
+        let saved_serial: WaylandNativeClipboardSerial =
+            connection.clipboard_serial;
+        connection.clipboard_serial = wayland_native_empty_clipboard_serial();
+        let no_serial_copy: WaylandNativeClipboardStatus =
+            wayland_native_clipboard_copy(&connection, 30, "rejected", 100);
+        let no_serial_read: WaylandNativeClipboardReadResult =
+            wayland_native_clipboard_read(&connection, 30, 100, 64);
+        failures = failures + wayland_native_clipboard_expect(
+            no_serial_copy == WaylandNativeClipboardStatus.OwnershipRejected
+            && no_serial_read.status
+                == WaylandNativeClipboardStatus.OwnershipRejected
+            && connection.next_id == 101
+            && linux_poll_readable(peer.second, 0) == 0,
+            "serial.valid false rejects copy/read before transport while numeric serial zero remains valid");
+        wayland_native_clipboard_read_result_free(&no_serial_read);
+        connection.clipboard_serial = saved_serial;
+
+        let first_pipe: LinuxFdPair = linux_pipe_cloexec();
+        let source_send: WireBuffer = wayland_clipboard_source_send_event(
+            100, wayland_clipboard_text_mime());
+        let source_serviced: i32 = wayland_native_clipboard_process_frame(
+            &connection, &source_send, first_pipe.second, 1, 1);
+        let first_bytes: WireBuffer = linux_receive_exact(first_pipe.first, 5, 100);
+        let _first_read_closed: i64 = linux_close(first_pipe.first);
+        failures = failures + wayland_native_clipboard_expect(
+            first_pipe.ok != 0 && source_serviced == 1
+            && first_bytes.error == 0
+            && @strEq(first_bytes.bytes.data[0..len[u8](first_bytes.bytes)],
+                "alpha") != 0
+            && linux_fd_flags(first_pipe.second) < 0
+            && len[WaylandNativeQueuedFrame](connection.pending_frames) == 0,
+            "SourceSend is serviced immediately from exact generation bytes and never queues an FD");
+        wire_free(&source_send); wire_free(&first_bytes);
+
+        // Release remains valid after focus/serial loss and emits only
+        // source.destroy followed by a sync barrier--never set_selection(NULL).
+        connection.clipboard_serial = wayland_native_empty_clipboard_serial();
+        connection.keyboard_focus_surface = 0;
+        let released: WaylandNativeClipboardStatus =
+            wayland_native_clipboard_release(&connection, 30, 1000);
+        let destroy: WireBuffer = wayland_receive_frame(peer.second, 100);
+        let barrier: WireBuffer = wayland_receive_frame(peer.second, 100);
+        let destroy_frame: WaylandFrame = wayland_decode(&destroy, 0);
+        let barrier_frame: WaylandFrame = wayland_decode(&barrier, 0);
+        let release_barrier_id: t27 = wire_read_u32_le(
+            &barrier, barrier_frame.payload_offset);
+        failures = failures + wayland_native_clipboard_expect(
+            released == WaylandNativeClipboardStatus.Ok
+            && destroy_frame.valid != 0 && destroy_frame.object_id == 100
+            && destroy_frame.opcode == 1 && destroy_frame.size == 8
+            && barrier_frame.valid != 0 && barrier_frame.object_id == 1
+            && barrier_frame.opcode == 0 && release_barrier_id == 101
+            && linux_poll_readable(peer.second, 0) == 0
+            && connection.clipboard_published_kind
+                == WaylandNativeClipboardAuthorityKind.None
+            && wayland_native_clipboard_mirror_epoch_live(&connection) != 0,
+            "owner release uses unconditional destroy, retains its barrier epoch, and sends no NULL selection");
+        wire_free(&destroy); wire_free(&barrier);
+
+        let retiring_pipe: LinuxFdPair = linux_pipe_cloexec();
+        let retiring_send: WireBuffer = wayland_clipboard_source_send_event(
+            100, wayland_clipboard_text_mime());
+        let retiring_serviced: i32 = wayland_native_clipboard_process_frame(
+            &connection, &retiring_send, retiring_pipe.second, 1, 1);
+        let retiring_bytes: WireBuffer = linux_receive_exact(
+            retiring_pipe.first, 5, 100);
+        let _retiring_read_closed: i64 = linux_close(retiring_pipe.first);
+        failures = failures + wayland_native_clipboard_expect(
+            retiring_serviced == 1 && retiring_bytes.error == 0
+            && @strEq(retiring_bytes.bytes.data[0..
+                len[u8](retiring_bytes.bytes)], "alpha") != 0,
+            "retiring source bytes remain serviceable until the exact destroy barrier");
+        wire_free(&retiring_send); wire_free(&retiring_bytes);
+
+        let mirror_offer_id: t27 = 4278190080;
+        let mirror_offer: WireBuffer = wayland_clipboard_data_offer_event(
+            9, mirror_offer_id);
+        let mirror_mime: WireBuffer = wayland_clipboard_offer_mime_event(
+            mirror_offer_id, wayland_clipboard_text_mime());
+        let mirror_select: WireBuffer = wayland_clipboard_selection_event(
+            9, mirror_offer_id);
+        let mirror_ok: i32 = wayland_native_clipboard_process_no_fd(
+            &connection, &mirror_offer)
+            && wayland_native_clipboard_process_no_fd(&connection, &mirror_mime)
+            && wayland_native_clipboard_process_no_fd(&connection, &mirror_select);
+        let mirror_destroy: WireBuffer = wayland_receive_frame(peer.second, 100);
+        let mirror_destroy_frame: WaylandFrame = wayland_decode(&mirror_destroy, 0);
+        let mirror_pending: WaylandNativePendingEvent =
+            wayland_connection_take_pending_event(&connection);
+        let mirror_marked: i32 = mirror_pending.valid != 0
+            && mirror_pending.kind == WaylandNativePendingKind.Clipboard
+            && mirror_pending.clipboard.local_mirror != 0;
+        let mirror_applied: i32 = wayland_native_clipboard_apply_transition(
+            &connection, &mirror_pending.clipboard);
+        wayland_native_pending_event_free(&mirror_pending);
+        failures = failures + wayland_native_clipboard_expect(
+            mirror_ok != 0 && mirror_destroy_frame.valid != 0
+            && mirror_destroy_frame.object_id == mirror_offer_id
+            && mirror_destroy_frame.opcode == 2
+            && mirror_marked != 0 && mirror_applied != 0
+            && connection.clipboard_published_kind
+                == WaylandNativeClipboardAuthorityKind.None,
+            "pre-barrier self mirror is destroyed and cannot republish Remote after release");
+        wire_free(&mirror_destroy);
+
+        failures = failures + wayland_native_clipboard_expect(
+            wayland_native_clipboard_process_callback(
+                &connection, release_barrier_id) == 1
+            && len[WaylandNativeClipboardSourceRecord](
+                connection.clipboard_sources) == 0
+            && wayland_native_clipboard_mirror_epoch_live(&connection) == 0,
+            "destroy callback commits the exact source and finally releases immutable bytes");
+
+        // A real remote selection after the retiring epoch publishes normally.
+        let remote_offer_id: t27 = 4278190081;
+        let remote_offer: WireBuffer = wayland_clipboard_data_offer_event(
+            9, remote_offer_id);
+        let remote_mime: WireBuffer = wayland_clipboard_offer_mime_event(
+            remote_offer_id, wayland_clipboard_text_mime());
+        let remote_select: WireBuffer = wayland_clipboard_selection_event(
+            9, remote_offer_id);
+        let remote_ok: i32 = wayland_native_clipboard_process_no_fd(
+            &connection, &remote_offer)
+            && wayland_native_clipboard_process_no_fd(&connection, &remote_mime)
+            && wayland_native_clipboard_process_no_fd(&connection, &remote_select);
+        let remote_pending: WaylandNativePendingEvent =
+            wayland_connection_take_pending_event(&connection);
+        let remote_applied: i32 = wayland_native_clipboard_apply_transition(
+            &connection, &remote_pending.clipboard);
+        wayland_native_pending_event_free(&remote_pending);
+        let failed_pipe: LinuxFdPair = LinuxFdPair{
+            .first = 0 - 1, .second = 0 - 1, .ok = 0 };
+        let failed_transfer: WaylandClipboardReceiveRequest =
+            wayland_clipboard_begin_receive_with_pipe(
+                &connection.clipboard_state,
+                connection.clipboard_published_identity, failed_pipe);
+        let failed_transfer_status: WaylandNativeClipboardStatus =
+            wayland_native_clipboard_abort_receive_request(&failed_transfer);
+        failures = failures + wayland_native_clipboard_expect(
+            failed_transfer.error == WaylandClipboardError.TransferFailed
+            && failed_transfer_status
+                == WaylandNativeClipboardStatus.TransportFailed
+            && failed_transfer.read_fd < 0 && failed_transfer.write_fd < 0
+            && linux_poll_readable(peer.second, 0) == 0,
+            "failed receive construction remains TransportFailed through native cleanup");
+        connection.keyboard_focus_surface = 31;
+        connection.clipboard_order = connection.clipboard_order + 1;
+        connection.clipboard_serial = WaylandNativeClipboardSerial{
+            .value = 0, .seat_id = 7, .surface_id = 31,
+            .order = connection.clipboard_order, .valid = 1 };
+        let child: i64 = wayland_native_clipboard_fork();
+        if (child == 0) {
+            let _child_connection_closed: i64 = linux_close(peer.first);
+            let child_ok: i32 = wayland_native_clipboard_remote_peer(
+                peer.second, remote_offer_id, "remote");
+            let _child_peer_closed: i64 = linux_close(peer.second);
+            wayland_native_clipboard_child_exit(1 - child_ok); return 1 - child_ok;
+        }
+        let remote_read: WaylandNativeClipboardReadResult =
+            wayland_native_clipboard_read(&connection, 31, 1000, 64);
+        let child_ok: i32 = wayland_native_clipboard_wait_child(child);
+        failures = failures + wayland_native_clipboard_expect(
+            remote_ok != 0 && remote_applied != 0
+            && connection.clipboard_published_kind
+                == WaylandNativeClipboardAuthorityKind.Remote
+            && child > 0 && child_ok != 0 && remote_read.valid != 0
+            && @strEq(remote_read.bytes.data[0..len[u8](remote_read.bytes)],
+                "remote") != 0,
+            "remote receive moves request ownership, sends one FD, and reads EOF under one deadline");
+        wayland_native_clipboard_read_result_free(&remote_read);
+
+        // Leave(A)->Enter(B) keeps the offer through the callback. A true later
+        // loss withdraws it only when callback.done reaches FIFO position.
+        let leave: WaylandKeyboardEvent = wayland_empty_keyboard_event();
+        leave.kind = WaylandKeyboardEventKind.Leave; leave.surface_id = 31;
+        leave.serial = 5; leave.valid = 1;
+        connection.keyboard_focus_surface = 0;
+        let leave_observed: i32 = wayland_native_clipboard_observe_keyboard_event(
+            &connection, &leave);
+        let handoff_sync: WireBuffer = wayland_receive_frame(peer.second, 100);
+        let handoff_frame: WaylandFrame = wayland_decode(&handoff_sync, 0);
+        let handoff_callback: t27 = wire_read_u32_le(
+            &handoff_sync, handoff_frame.payload_offset);
+        let enter: WaylandKeyboardEvent = wayland_empty_keyboard_event();
+        enter.kind = WaylandKeyboardEventKind.Enter; enter.surface_id = 30;
+        enter.serial = 0; enter.valid = 1;
+        connection.keyboard_focus_surface = 30;
+        let enter_observed: i32 = wayland_native_clipboard_observe_keyboard_event(
+            &connection, &enter);
+        let handoff_done: i32 = wayland_native_clipboard_process_callback(
+            &connection, handoff_callback);
+        failures = failures + wayland_native_clipboard_expect(
+            leave_observed != 0 && enter_observed != 0 && handoff_done == 1
+            && handoff_frame.valid != 0 && handoff_frame.object_id == 1
+            && connection.clipboard_serial.valid != 0
+            && connection.clipboard_serial.value == 0
+            && connection.clipboard_serial.surface_id == 30
+            && connection.clipboard_state.current_offer.valid != 0
+            && len[WaylandNativeQueuedFrame](connection.pending_frames) == 0,
+            "multiwindow Leave-to-Enter cancels focus withdrawal while tracking callback identity");
+        wire_free(&handoff_sync);
+
+        let loss_leave: WaylandKeyboardEvent = wayland_empty_keyboard_event();
+        loss_leave.kind = WaylandKeyboardEventKind.Leave;
+        loss_leave.surface_id = 30; loss_leave.serial = 6;
+        loss_leave.valid = 1;
+        connection.keyboard_focus_surface = 0;
+        let loss_observed: i32 = wayland_native_clipboard_observe_keyboard_event(
+            &connection, &loss_leave);
+        let loss_sync: WireBuffer = wayland_receive_frame(peer.second, 100);
+        let loss_sync_frame: WaylandFrame = wayland_decode(&loss_sync, 0);
+        let loss_callback: t27 = wire_read_u32_le(
+            &loss_sync, loss_sync_frame.payload_offset);
+        let suspended_read: WaylandNativeClipboardReadResult =
+            wayland_native_clipboard_read(&connection, 30, 100, 64);
+        let loss_done: i32 = wayland_native_clipboard_process_callback(
+            &connection, loss_callback);
+        let loss_offer_destroy: WireBuffer = wayland_receive_frame(
+            peer.second, 100);
+        let loss_offer_destroy_frame: WaylandFrame = wayland_decode(
+            &loss_offer_destroy, 0);
+        let loss_pending: WaylandNativePendingEvent =
+            wayland_connection_take_pending_event(&connection);
+        let loss_pending_exact: i32 = loss_pending.valid != 0
+            && loss_pending.kind == WaylandNativePendingKind.Clipboard
+            && loss_pending.clipboard.dispatch.kind
+                == WaylandClipboardEventKind.SelectionCleared;
+        let remote_before_loss_apply: i32 =
+            connection.clipboard_published_kind
+                == WaylandNativeClipboardAuthorityKind.Remote;
+        let loss_applied: i32 = wayland_native_clipboard_apply_transition(
+            &connection, &loss_pending.clipboard);
+        wayland_native_pending_event_free(&loss_pending);
+        failures = failures + wayland_native_clipboard_expect(
+            loss_observed != 0 && loss_sync_frame.valid != 0
+            && loss_sync_frame.object_id == 1 && loss_sync_frame.opcode == 0
+            && loss_callback == 103
+            && suspended_read.status
+                == WaylandNativeClipboardStatus.OwnershipRejected
+            && loss_done == 1 && loss_offer_destroy_frame.valid != 0
+            && loss_offer_destroy_frame.object_id == remote_offer_id
+            && loss_offer_destroy_frame.opcode == 2
+            && remote_before_loss_apply != 0 && loss_pending_exact != 0
+            && loss_applied == 1
+            && connection.clipboard_published_kind
+                == WaylandNativeClipboardAuthorityKind.None
+            && connection.clipboard_state.current_offer.valid == 0
+            && linux_poll_readable(peer.second, 0) == 0,
+            "true focus loss suspends reads, retires the offer at sync FIFO position, then publishes None");
+        wayland_native_clipboard_read_result_free(&suspended_read);
+        wire_free(&loss_sync); wire_free(&loss_offer_destroy);
+
+        wayland_disconnect(&connection);
+        let _peer_closed: i64 = linux_close(peer.second);
+    }
+
+    // Cancellation revokes public Local authority in FIFO order, while the
+    // exact immutable generation remains retained until its destroy barrier.
+    let cancelled_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + wayland_native_clipboard_expect(
+        cancelled_peer.ok == 1, "cancelled-source fake compositor opens");
+    if (cancelled_peer.ok == 1) {
+        let cancelled: WaylandNativeConnection =
+            wayland_native_clipboard_connection(cancelled_peer.first, 35, 0);
+        let cancel_copy: WaylandNativeClipboardStatus =
+            wayland_native_clipboard_copy(&cancelled, 35, "cancelled", 1000);
+        let cancel_create: WireBuffer = wayland_receive_frame(
+            cancelled_peer.second, 100);
+        let cancel_offer: WireBuffer = wayland_receive_frame(
+            cancelled_peer.second, 100);
+        let cancel_select: WireBuffer = wayland_receive_frame(
+            cancelled_peer.second, 100);
+        wire_free(&cancel_create); wire_free(&cancel_offer);
+        wire_free(&cancel_select);
+        let cancel_identity: WaylandClipboardIdentity =
+            cancelled.clipboard_published_identity;
+        let cancel_event: WireBuffer = wayland_clipboard_source_cancelled_event(
+            cancel_identity.object_id);
+        let cancel_processed: i32 = wayland_native_clipboard_process_no_fd(
+            &cancelled, &cancel_event);
+        let cancel_destroy: WireBuffer = wayland_receive_frame(
+            cancelled_peer.second, 100);
+        let cancel_sync: WireBuffer = wayland_receive_frame(
+            cancelled_peer.second, 100);
+        let cancel_destroy_frame: WaylandFrame = wayland_decode(
+            &cancel_destroy, 0);
+        let cancel_sync_frame: WaylandFrame = wayland_decode(&cancel_sync, 0);
+        let cancel_callback_id: t27 = wire_read_u32_le(
+            &cancel_sync, cancel_sync_frame.payload_offset);
+        let cancel_index_before: i32 = wayland_native_clipboard_source_index(
+            &cancelled, cancel_identity);
+        let cancel_pending: WaylandNativePendingEvent =
+            wayland_connection_take_pending_event(&cancelled);
+        let cancel_transition_exact: i32 = cancel_pending.valid != 0
+            && cancel_pending.kind == WaylandNativePendingKind.Clipboard
+            && cancel_pending.clipboard.dispatch.kind
+                == WaylandClipboardEventKind.SourceCancelled
+            && wayland_clipboard_identity_equal(
+                cancel_pending.clipboard.dispatch.identity,
+                cancel_identity) != 0;
+        failures = failures + wayland_native_clipboard_expect(
+            cancel_copy == WaylandNativeClipboardStatus.Ok
+            && cancel_processed == 1 && cancel_transition_exact != 0
+            && cancel_destroy_frame.valid != 0
+            && cancel_destroy_frame.object_id == 100
+            && cancel_destroy_frame.opcode == 1
+            && cancel_sync_frame.valid != 0
+            && cancel_sync_frame.object_id == 1
+            && cancel_sync_frame.opcode == 0 && cancel_callback_id == 101
+            && cancel_index_before >= 0
+            && cancelled.clipboard_sources.data[
+                cancel_index_before].cancelled != 0
+            && cancelled.clipboard_sources.data[
+                cancel_index_before].destroy_barrier_sent != 0
+            && @strEq(cancelled.clipboard_sources.data[
+                cancel_index_before].text.data[0..
+                    len[u8](cancelled.clipboard_sources.data[
+                        cancel_index_before].text)], "cancelled") != 0
+            && cancelled.clipboard_published_kind
+                == WaylandNativeClipboardAuthorityKind.Local
+            && linux_poll_readable(cancelled_peer.second, 0) == 0,
+            "source.cancelled retains exact bytes and Local publication until queued cancellation applies");
+        let cancel_applied: i32 = wayland_native_clipboard_apply_transition(
+            &cancelled, &cancel_pending.clipboard);
+        wayland_native_pending_event_free(&cancel_pending);
+        let cancel_index_pending_barrier: i32 =
+            wayland_native_clipboard_source_index(&cancelled, cancel_identity);
+        failures = failures + wayland_native_clipboard_expect(
+            cancel_applied == 1
+            && cancelled.clipboard_published_kind
+                == WaylandNativeClipboardAuthorityKind.None
+            && cancel_index_pending_barrier >= 0
+            && len[u8](cancelled.clipboard_sources.data[
+                cancel_index_pending_barrier].text) == 9,
+            "queued cancellation clears public Local authority but preserves barrier-owned generation bytes");
+        let cancel_committed: i32 = wayland_native_clipboard_process_callback(
+            &cancelled, cancel_callback_id);
+        failures = failures + wayland_native_clipboard_expect(
+            cancel_committed == 1
+            && wayland_native_clipboard_source_index(
+                &cancelled, cancel_identity) < 0
+            && cancelled.clipboard_callback_obligations == 0,
+            "cancel destroy callback frees the exact retained source generation");
+        wire_free(&cancel_destroy); wire_free(&cancel_sync);
+        wayland_disconnect(&cancelled);
+        let _cancelled_peer_closed: i64 = linux_close(cancelled_peer.second);
+    }
+
+    // A stalled transfer pipe is isolated from the display stream. The fixed
+    // immediate-service budget expires, consumes the exact FD, and records a
+    // typed status without terminally corrupting the Wayland connection.
+    let stalled_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + wayland_native_clipboard_expect(
+        stalled_peer.ok == 1, "stalled SourceSend fake compositor opens");
+    if (stalled_peer.ok == 1) {
+        let stalled: WaylandNativeConnection =
+            wayland_native_clipboard_connection(stalled_peer.first, 36, 0);
+        let full_text: ArrayList[u8] = make[u8](
+            wayland_clipboard_max_transfer_bytes() as i32);
+        let full_i: t27 = 0;
+        while (full_i < wayland_clipboard_max_transfer_bytes()) {
+            push[u8](&full_text, 'x'); full_i = full_i + 1;
+        }
+        let stalled_copy: WaylandNativeClipboardStatus =
+            wayland_native_clipboard_copy(&stalled, 36,
+                full_text.data[0..len[u8](full_text)], 1000);
+        let stalled_create: WireBuffer = wayland_receive_frame(
+            stalled_peer.second, 100);
+        let stalled_offer: WireBuffer = wayland_receive_frame(
+            stalled_peer.second, 100);
+        let stalled_select: WireBuffer = wayland_receive_frame(
+            stalled_peer.second, 100);
+        wire_free(&stalled_create); wire_free(&stalled_offer);
+        wire_free(&stalled_select);
+        let stalled_pipe: LinuxFdPair = linux_pipe_cloexec();
+        let stalled_send: WireBuffer = wayland_clipboard_source_send_event(
+            100, wayland_clipboard_text_mime());
+        let stalled_serviced: i32 = wayland_native_clipboard_process_frame(
+            &stalled, &stalled_send, stalled_pipe.second, 1, 1);
+        failures = failures + wayland_native_clipboard_expect(
+            stalled_copy == WaylandNativeClipboardStatus.Ok
+            && stalled_pipe.ok != 0 && stalled_serviced == 1
+            && wayland_native_clipboard_service_timeout() == 250
+            && stalled.clipboard_last_error == WaylandClipboardError.Timeout
+            && linux_fd_flags(stalled_pipe.second) < 0
+            && stalled.connected != 0 && stalled.clipboard_state.terminal == 0
+            && len[WaylandNativeQueuedFrame](stalled.pending_frames) == 0
+            && linux_poll_readable(stalled_peer.second, 0) == 0,
+            "stalled SourceSend times out at the immediate budget, closes its FD, and leaves display live");
+        wire_free(&stalled_send); free[u8](&full_text);
+        let _stalled_read_closed: i64 = linux_close(stalled_pipe.first);
+        wayland_disconnect(&stalled);
+        let _stalled_peer_closed: i64 = linux_close(stalled_peer.second);
+    }
+
+    // A valid 27-offer by 27-MIME stream queues authority transitions only;
+    // resource-only offer/MIME dispatches cannot exhaust the 256-entry FIFO.
+    let bounded_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + wayland_native_clipboard_expect(bounded_peer.ok == 1,
+        "bounded resource stream fake compositor opens");
+    if (bounded_peer.ok == 1) {
+        let bounded: WaylandNativeConnection =
+            wayland_native_clipboard_connection(bounded_peer.first, 40, 0);
+        let offer_i: t27 = 0;
+        let bounded_ok: i32 = 1;
+        while (offer_i < 27 && bounded_ok != 0) {
+            let object_id: t27 = 4278190080 + offer_i;
+            let introduced: WireBuffer = wayland_clipboard_data_offer_event(
+                9, object_id);
+            bounded_ok = wayland_native_clipboard_process_no_fd(
+                &bounded, &introduced);
+            let mime_i: t27 = 0;
+            while (mime_i < 27 && bounded_ok != 0) {
+                let mime: WireBuffer = wayland_clipboard_offer_mime_event(
+                    object_id, wayland_clipboard_text_mime());
+                bounded_ok = wayland_native_clipboard_process_no_fd(
+                    &bounded, &mime);
+                mime_i = mime_i + 1;
+            }
+            let selected: WireBuffer = wayland_clipboard_selection_event(
+                9, object_id);
+            bounded_ok = bounded_ok
+                && wayland_native_clipboard_process_no_fd(&bounded, &selected);
+            offer_i = offer_i + 1;
+        }
+        failures = failures + wayland_native_clipboard_expect(
+            bounded_ok != 0 && bounded.connected != 0
+            && bounded.clipboard_state.terminal == 0
+            && len[WaylandNativeQueuedFrame](bounded.pending_frames) == 27,
+            "27x27 valid resource transitions consume immediately and queue only 27 publications");
+        wayland_disconnect(&bounded);
+        let _bounded_peer_closed: i64 = linux_close(bounded_peer.second);
+    }
+
+    // Closing a stable owner schedules every retained generation, even when an
+    // older source is no longer the currently published one.
+    let close_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + wayland_native_clipboard_expect(close_peer.ok == 1,
+        "multi-generation close fake compositor opens");
+    if (close_peer.ok == 1) {
+        let closing: WaylandNativeConnection =
+            wayland_native_clipboard_connection(close_peer.first, 50, 0);
+        let first_copy: WaylandNativeClipboardStatus =
+            wayland_native_clipboard_copy(&closing, 50, "first", 1000);
+        let first_create: WireBuffer = wayland_receive_frame(close_peer.second, 100);
+        let first_offer: WireBuffer = wayland_receive_frame(close_peer.second, 100);
+        let first_select: WireBuffer = wayland_receive_frame(close_peer.second, 100);
+        wire_free(&first_create); wire_free(&first_offer); wire_free(&first_select);
+        let second_copy: WaylandNativeClipboardStatus =
+            wayland_native_clipboard_copy(&closing, 50, "second", 1000);
+        let second_create: WireBuffer = wayland_receive_frame(close_peer.second, 100);
+        let second_offer: WireBuffer = wayland_receive_frame(close_peer.second, 100);
+        let second_select: WireBuffer = wayland_receive_frame(close_peer.second, 100);
+        wire_free(&second_create); wire_free(&second_offer); wire_free(&second_select);
+        let close_status: WaylandNativeClipboardStatus =
+            wayland_native_clipboard_close_surface_until(&closing, 50,
+                linux_monotonic_ms() + 1000);
+        let close_destroy_first: WireBuffer = wayland_receive_frame(
+            close_peer.second, 100);
+        let close_sync_first: WireBuffer = wayland_receive_frame(
+            close_peer.second, 100);
+        let close_destroy_second: WireBuffer = wayland_receive_frame(
+            close_peer.second, 100);
+        let close_sync_second: WireBuffer = wayland_receive_frame(
+            close_peer.second, 100);
+        let close_focus_sync: WireBuffer = wayland_receive_frame(
+            close_peer.second, 100);
+        let close_destroy_first_frame: WaylandFrame = wayland_decode(
+            &close_destroy_first, 0);
+        let close_sync_first_frame: WaylandFrame = wayland_decode(
+            &close_sync_first, 0);
+        let close_destroy_second_frame: WaylandFrame = wayland_decode(
+            &close_destroy_second, 0);
+        let close_sync_second_frame: WaylandFrame = wayland_decode(
+            &close_sync_second, 0);
+        let close_focus_sync_frame: WaylandFrame = wayland_decode(
+            &close_focus_sync, 0);
+        let all_destroying: i32 = 1;
+        let source_i: i32 = 0;
+        while (source_i < len[WaylandNativeClipboardSourceRecord](
+            closing.clipboard_sources)) {
+            if (closing.clipboard_sources.data[source_i].owner_surface_id != 50
+                || closing.clipboard_sources.data[source_i].destroy_requested == 0
+                || closing.clipboard_sources.data[source_i].destroy_sent == 0
+                || closing.clipboard_sources.data[source_i].destroy_barrier_sent == 0) {
+                all_destroying = 0;
+            }
+            source_i = source_i + 1;
+        }
+        failures = failures + wayland_native_clipboard_expect(
+            first_copy == WaylandNativeClipboardStatus.Ok
+            && second_copy == WaylandNativeClipboardStatus.Ok
+            && len[WaylandNativeClipboardSourceRecord](
+                closing.clipboard_sources) == 2
+            && close_status == WaylandNativeClipboardStatus.Ok
+            && close_destroy_first_frame.valid != 0
+            && close_destroy_first_frame.object_id == 100
+            && close_destroy_first_frame.opcode == 1
+            && close_sync_first_frame.valid != 0
+            && close_sync_first_frame.object_id == 1
+            && close_sync_first_frame.opcode == 0
+            && wire_read_u32_le(&close_sync_first,
+                close_sync_first_frame.payload_offset) == 102
+            && close_destroy_second_frame.valid != 0
+            && close_destroy_second_frame.object_id == 101
+            && close_destroy_second_frame.opcode == 1
+            && close_sync_second_frame.valid != 0
+            && close_sync_second_frame.object_id == 1
+            && close_sync_second_frame.opcode == 0
+            && wire_read_u32_le(&close_sync_second,
+                close_sync_second_frame.payload_offset) == 103
+            && close_focus_sync_frame.valid != 0
+            && close_focus_sync_frame.object_id == 1
+            && close_focus_sync_frame.opcode == 0
+            && wire_read_u32_le(&close_focus_sync,
+                close_focus_sync_frame.payload_offset) == 104
+            && linux_poll_readable(close_peer.second, 0) == 0
+            && all_destroying != 0
+            && closing.clipboard_published_kind
+                == WaylandNativeClipboardAuthorityKind.None,
+            "owner close emits destroy100/sync102/destroy101/sync103/focus-sync104 exactly once with no NULL selection");
+        wire_free(&close_destroy_first); wire_free(&close_sync_first);
+        wire_free(&close_destroy_second); wire_free(&close_sync_second);
+        wire_free(&close_focus_sync);
+        wayland_disconnect(&closing);
+        let _close_peer_closed: i64 = linux_close(close_peer.second);
+    }
+
+    // Boundary arithmetic is tested without emitting artificial sparse IDs.
+    // With no prior obligations, 0xfefffffe can be the final source and the
+    // next dense 0xfeffffff can satisfy its logical destroy callback.
+    let boundary: WaylandNativeConnection = wayland_empty_connection();
+    boundary.next_id = wayland_native_max_client_object_id() - 1;
+    let boundary_source_available: i32 = wayland_native_client_ids_available(
+        &boundary, 1, 1);
+    let boundary_source_id: t27 = wayland_native_take_client_ids(&boundary, 1);
+    boundary.clipboard_callback_obligations = 1;
+    let boundary_callback_id: t27 =
+        wayland_native_take_reserved_clipboard_callback(&boundary);
+    failures = failures + wayland_native_clipboard_expect(
+        boundary_source_available != 0
+        && boundary_source_id == wayland_native_max_client_object_id() - 1
+        && boundary_callback_id == wayland_native_max_client_object_id()
+        && boundary.next_id == wayland_native_max_client_object_id() + 1
+        && boundary.clipboard_callback_obligations == 0,
+        "pure dense allocator preserves the final client source/callback capacity pair");
+    wayland_disconnect(&boundary);
+
+    let exhausted_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + wayland_native_clipboard_expect(exhausted_peer.ok == 1,
+        "exhausted-ID preflight fake compositor opens");
+    if (exhausted_peer.ok == 1) {
+        let exhausted: WaylandNativeConnection =
+            wayland_native_clipboard_connection(exhausted_peer.first, 61, 0);
+        exhausted.next_id = wayland_native_max_client_object_id();
+        let exhausted_copy: WaylandNativeClipboardStatus =
+            wayland_native_clipboard_copy(&exhausted, 61, "never", 1000);
+        failures = failures + wayland_native_clipboard_expect(
+            exhausted_copy == WaylandNativeClipboardStatus.ResourceLimit
+            && exhausted.next_id == wayland_native_max_client_object_id()
+            && len[WaylandNativeClipboardSourceRecord](
+                exhausted.clipboard_sources) == 0
+            && len[WaylandClipboardSource](exhausted.clipboard_state.sources) == 0
+            && linux_poll_readable(exhausted_peer.second, 0) == 0,
+            "missing callback-ID capacity returns ResourceLimit before create transport");
+        wayland_disconnect(&exhausted);
+        let _exhausted_peer_closed: i64 = linux_close(exhausted_peer.second);
+    }
+
+    let present_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + wayland_native_clipboard_expect(present_peer.ok == 1,
+        "presentation reservation fake compositor opens");
+    if (present_peer.ok == 1) {
+        let presenting: WaylandNativeConnection =
+            wayland_native_clipboard_connection(present_peer.first, 62, 0);
+        presenting.shm_id = 6;
+        presenting.next_id = wayland_native_max_client_object_id() - 1;
+        presenting.clipboard_callback_obligations = 1;
+        let retained_text: ArrayList[u8] = make[u8](1);
+        push[u8](&retained_text, 'x');
+        push[WaylandNativeClipboardSourceRecord](&presenting.clipboard_sources,
+            WaylandNativeClipboardSourceRecord{
+                .identity = WaylandClipboardIdentity{
+                    .object_id = 100, .generation = 1, .valid = 1 },
+                .text = retained_text, .owner_surface_id = 62,
+                .publication_order = 1, .destroy_barrier_id = 0,
+                .cancelled = 0, .destroy_requested = 0, .destroy_sent = 0,
+                .destroy_barrier_sent = 0, .live = 1 });
+        let present_window: WaylandNativeWindow = app_empty_wayland_window();
+        present_window.surface_id = 62; present_window.width = 1;
+        present_window.height = 1; present_window.live = 1;
+        present_window.configured = 1;
+        let present_surface: Surface = surface_new(1, 1);
+        let present_result: WaylandPresentResult = wayland_present_surface(
+            &presenting, &present_window, &present_surface);
+        failures = failures + wayland_native_clipboard_expect(
+            present_result.ok == 0 && present_window.memory.valid == 0
+            && presenting.next_id == wayland_native_max_client_object_id() - 1
+            && presenting.clipboard_callback_obligations == 1
+            && linux_poll_readable(present_peer.second, 0) == 0,
+            "presentation preflight preserves a live source callback obligation before shm allocation/wire");
+        surface_free(&present_surface);
+        wayland_disconnect(&presenting);
+        let _present_peer_closed: i64 = linux_close(present_peer.second);
+    }
+
+    if (failures != 0) { return 1; }
+    _zag_println("wayland_native_clipboard_test: ok"); return 0;
+}

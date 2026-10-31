@@ -1,0 +1,305 @@
+// Public pathname endpoint lifecycle for the local automation protocol.
+//
+// The Flash runtime creates the AF_UNIX node owner-only before listen(2).
+// Listener paths and accepted/client descriptors have one explicit owner; no
+// implicit stale-path deletion or response resynchronization is attempted.
+
+enum AutomationEndpointStatus {
+    Ready, Invalid, ListenFailed, AcceptTimeout, AcceptFailed, ConnectFailed,
+    RequestPending, SendFailed, ResponseTimeout, ResponseFailed,
+    ResponseMismatch, CleanupFailed, Closed
+}
+
+struct AutomationListener {
+    fd: i64,
+    path: ArrayList[u8],
+    active: i32,
+    path_bound: i32,
+    accepted_connections: t27,
+    status: AutomationEndpointStatus,
+    error_code: i64,
+    close_error: i32,
+}
+
+struct AutomationListenerAccept {
+    connection: AutomationProtocolConnection,
+    accepted: i32,
+    status: AutomationEndpointStatus,
+    error_code: i64,
+}
+
+struct AutomationRunner {
+    connection: AutomationProtocolConnection,
+    active: i32,
+    awaiting_response: i32,
+    pending_request_id: t27,
+    completed_requests: t27,
+    status: AutomationEndpointStatus,
+    error_code: i64,
+}
+
+fn automation_endpoint_copy_bytes(value: []u8) ArrayList[u8] {
+    let copy: ArrayList[u8] = make[u8](value.len);
+    let i: i32 = 0;
+    while (i < value.len) { push[u8](&copy, value[i]); i = i + 1; }
+    return copy;
+}
+
+fn automation_listener_empty() AutomationListener {
+    return AutomationListener{ .fd = 0 - 1, .path = make[u8](0),
+        .active = 0, .path_bound = 0, .accepted_connections = 0,
+        .status = AutomationEndpointStatus.Invalid, .error_code = 0,
+        .close_error = 0 };
+}
+
+fn automation_listener_accept_empty(status: AutomationEndpointStatus,
+    error_code: i64) AutomationListenerAccept {
+    return AutomationListenerAccept{
+        .connection = automation_protocol_connection(0 - 1),
+        .accepted = 0, .status = status, .error_code = error_code };
+}
+
+// Release exact-path authority only after the filesystem reports removal or
+// absence. On failure the owned bytes remain intact so close can be retried.
+fn automation_listener_release_path(listener: *AutomationListener) i32 {
+    if (listener.*.path_bound == 0) { return 1; }
+    if (listener.*.path.len == 0) {
+        listener.*.status = AutomationEndpointStatus.CleanupFailed;
+        listener.*.error_code = 0 - 22;
+        return 0;
+    }
+    let cleanup: LinuxUnixUnlinkResult = linux_unix_unlink_exact(
+        listener.*.path.data[0..listener.*.path.len]);
+    if (cleanup.removed == 0 && cleanup.missing == 0) {
+        listener.*.status = AutomationEndpointStatus.CleanupFailed;
+        listener.*.error_code = cleanup.error_code;
+        return 0;
+    }
+    listener.*.path_bound = 0;
+    if (listener.*.path.cap > 0) { free[u8](&listener.*.path); }
+    return 1;
+}
+
+// Open one owner-only pathname listener. Existing filesystem nodes are never
+// removed implicitly: an EADDRINUSE result carries no cleanup authority.
+fn automation_listener_open(path: []u8, backlog: t27) AutomationListener {
+    let listener: AutomationListener = automation_listener_empty();
+    let native: LinuxUnixListenResult = linux_unix_listen(path, backlog);
+    listener.error_code = native.error_code;
+    listener.close_error = native.close_error;
+    if (native.listening == 1 && native.fd >= 0 && native.path_bound == 1
+        && native.cloexec_applied == 1 && native.nonblocking_applied == 1
+        && native.permissions_applied == 1) {
+        listener.fd = native.fd;
+        listener.path = automation_endpoint_copy_bytes(path);
+        listener.active = 1;
+        listener.path_bound = 1;
+        listener.status = AutomationEndpointStatus.Ready;
+        listener.error_code = 0;
+        return listener;
+    }
+
+    // Defensively adopt any anomalous live result before closing it. This also
+    // covers a future runtime invariant regression without leaking authority.
+    if (native.fd >= 0) {
+        listener.fd = native.fd;
+        let close_rc: i64 = linux_close(native.fd);
+        if (close_rc < 0) {
+            listener.close_error = 1;
+            listener.error_code = close_rc;
+            listener.status = AutomationEndpointStatus.CleanupFailed;
+        } else if (listener.error_code == 0) {
+            listener.error_code = 0 - 5;
+        }
+        listener.fd = 0 - 1;
+    }
+
+    // A failure after bind transfers exact-path cleanup authority even though
+    // the runtime has already closed the failed descriptor. Adopt it before
+    // cleanup so an unlink failure remains retryable by listener_close.
+    if (native.path_bound == 1) {
+        listener.path = automation_endpoint_copy_bytes(path);
+        listener.path_bound = 1;
+        if (automation_listener_release_path(&listener) == 0) {
+            return listener;
+        }
+    }
+    if (listener.close_error != 0) {
+        listener.status = AutomationEndpointStatus.CleanupFailed;
+        return listener;
+    }
+    listener.status = AutomationEndpointStatus.ListenFailed;
+    return listener;
+}
+
+// Accepted connections are transferred to the result and are never reclaimed
+// by listener_close. A timeout leaves the listener active and reusable.
+fn automation_listener_accept(listener: *AutomationListener,
+    timeout_ms: t27) AutomationListenerAccept {
+    if (listener.*.active == 0 || listener.*.fd < 0 || timeout_ms < 0) {
+        return automation_listener_accept_empty(AutomationEndpointStatus.Invalid, 0 - 22);
+    }
+    let native: LinuxUnixAcceptResult = linux_unix_accept_timeout(
+        listener.*.fd, timeout_ms);
+    if (native.accepted == 1 && native.fd >= 0 && native.cloexec_applied == 1) {
+        let accepted: AutomationListenerAccept = AutomationListenerAccept{
+            .connection = automation_protocol_connection(native.fd),
+            .accepted = 1, .status = AutomationEndpointStatus.Ready,
+            .error_code = 0 };
+        listener.*.accepted_connections = listener.*.accepted_connections + 1;
+        return accepted;
+    }
+    // No non-adopted accepted descriptor may escape, even if a future runtime
+    // returns internally inconsistent status flags.
+    if (native.fd >= 0) {
+        let error_code: i64 = native.error_code;
+        if (error_code == 0) { error_code = 0 - 5; }
+        let close_rc: i64 = linux_close(native.fd);
+        if (close_rc < 0) { error_code = close_rc; }
+        return automation_listener_accept_empty(
+            AutomationEndpointStatus.AcceptFailed, error_code);
+    }
+    if (native.timed_out == 1) {
+        return automation_listener_accept_empty(
+            AutomationEndpointStatus.AcceptTimeout, native.error_code);
+    }
+    if (linux_fd_flags(listener.*.fd) < 0) {
+        listener.*.fd = 0 - 1;
+        listener.*.active = 0;
+    }
+    return automation_listener_accept_empty(
+        AutomationEndpointStatus.AcceptFailed, native.error_code);
+}
+
+// Close the descriptor and remove only the exact path this listener bound.
+// Calling close repeatedly is safe and preserves a prior cleanup failure.
+fn automation_listener_close(listener: *AutomationListener) i32 {
+    if (listener.*.active == 0 && listener.*.fd < 0
+        && listener.*.path_bound == 0 && listener.*.path.cap == 0) {
+        if (listener.*.status == AutomationEndpointStatus.CleanupFailed) { return 0; }
+        listener.*.status = AutomationEndpointStatus.Closed;
+        return 1;
+    }
+    let ok: i32 = 1;
+    if (listener.*.fd >= 0) {
+        if (linux_close(listener.*.fd) < 0) { listener.*.close_error = 1; ok = 0; }
+    }
+    listener.*.fd = 0 - 1;
+    listener.*.active = 0;
+    if (automation_listener_release_path(listener) == 0) { ok = 0; }
+    if (listener.*.path_bound == 0 && listener.*.path.cap > 0) {
+        free[u8](&listener.*.path);
+    }
+    if (ok == 1) {
+        listener.*.status = AutomationEndpointStatus.Closed;
+        listener.*.error_code = 0;
+    } else {
+        listener.*.status = AutomationEndpointStatus.CleanupFailed;
+    }
+    return ok;
+}
+
+fn automation_runner_empty() AutomationRunner {
+    return AutomationRunner{ .connection = automation_protocol_connection(0 - 1),
+        .active = 0, .awaiting_response = 0, .pending_request_id = 0,
+        .completed_requests = 0, .status = AutomationEndpointStatus.Invalid,
+        .error_code = 0 };
+}
+
+fn automation_runner_connect(path: []u8) AutomationRunner {
+    let runner: AutomationRunner = automation_runner_empty();
+    let native: LinuxConnectResult = linux_unix_connect(path);
+    runner.error_code = native.error_code;
+    if (native.connected == 0 || native.fd < 0) {
+        runner.status = AutomationEndpointStatus.ConnectFailed;
+        return runner;
+    }
+    runner.connection = automation_protocol_connection(native.fd);
+    if (runner.connection.active == 0) {
+        let _closed: i64 = linux_close(native.fd);
+        runner.status = AutomationEndpointStatus.ConnectFailed;
+        runner.error_code = 0 - 9;
+        return runner;
+    }
+    runner.active = 1;
+    runner.status = AutomationEndpointStatus.Ready;
+    runner.error_code = 0;
+    return runner;
+}
+
+// The first runner contract deliberately permits only one outstanding request.
+// That keeps response identity strict without speculative stream matching.
+fn automation_runner_send(runner: *AutomationRunner,
+    request: AutomationRequest) i32 {
+    if (runner.*.active == 0 || runner.*.connection.active == 0) {
+        runner.*.status = AutomationEndpointStatus.Closed; return 0;
+    }
+    if (runner.*.awaiting_response == 1) {
+        runner.*.status = AutomationEndpointStatus.RequestPending; return 0;
+    }
+    if (automation_client_send_request(&runner.*.connection, request) == 0) {
+        runner.*.active = runner.*.connection.active;
+        runner.*.status = AutomationEndpointStatus.SendFailed;
+        return 0;
+    }
+    runner.*.awaiting_response = 1;
+    runner.*.pending_request_id = request.request_id;
+    runner.*.status = AutomationEndpointStatus.Ready;
+    return 1;
+}
+
+fn automation_runner_receive(runner: *AutomationRunner,
+    timeout_ms: t27) AutomationResponse {
+    if (runner.*.active == 0 || runner.*.connection.active == 0
+        || runner.*.awaiting_response == 0 || timeout_ms < 0) {
+        runner.*.status = AutomationEndpointStatus.Invalid;
+        return automation_response_empty();
+    }
+    let response: AutomationResponse = automation_client_receive_response(
+        &runner.*.connection, timeout_ms);
+    if (response.valid == 0) {
+        runner.*.active = runner.*.connection.active;
+        if (runner.*.connection.active == 1
+            && runner.*.connection.terminal_status == AutomationTransportStatus.Ready) {
+            runner.*.status = AutomationEndpointStatus.ResponseTimeout;
+            // A no-progress timeout consumes no bytes; the same response may be
+            // awaited again without resynchronizing the stream.
+        } else {
+            runner.*.awaiting_response = 0;
+            runner.*.status = AutomationEndpointStatus.ResponseFailed;
+        }
+        return response;
+    }
+    if (response.request_id != runner.*.pending_request_id) {
+        automation_protocol_retire(&runner.*.connection,
+            AutomationTransportStatus.Malformed);
+        runner.*.active = 0;
+        runner.*.awaiting_response = 0;
+        runner.*.status = AutomationEndpointStatus.ResponseMismatch;
+        return automation_response_empty();
+    }
+    runner.*.awaiting_response = 0;
+    runner.*.pending_request_id = 0;
+    runner.*.completed_requests = runner.*.completed_requests + 1;
+    runner.*.status = AutomationEndpointStatus.Ready;
+    return response;
+}
+
+fn automation_runner_round_trip(runner: *AutomationRunner,
+    request: AutomationRequest, timeout_ms: t27) AutomationResponse {
+    if (automation_runner_send(runner, request) == 0) {
+        return automation_response_empty();
+    }
+    return automation_runner_receive(runner, timeout_ms);
+}
+
+fn automation_runner_close(runner: *AutomationRunner) void {
+    automation_protocol_close(&runner.*.connection);
+    runner.*.active = 0;
+    runner.*.awaiting_response = 0;
+    runner.*.pending_request_id = 0;
+    if (runner.*.status != AutomationEndpointStatus.ResponseMismatch
+        && runner.*.status != AutomationEndpointStatus.ResponseFailed) {
+        runner.*.status = AutomationEndpointStatus.Closed;
+    }
+}

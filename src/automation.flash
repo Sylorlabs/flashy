@@ -1,0 +1,284 @@
+// In-process strict semantic locators. Ambiguity is always an error.
+
+struct Locator {
+    node: i32,
+    matches: i32,
+}
+
+fn locate_role(ui: *Ui, role: Role, name: []u8) Locator {
+    let found: i32 = -1;
+    let matches: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[Node](ui.*.nodes)) {
+        let n: Node = get[Node](ui.*.nodes, i);
+        if (n.live == 1 && n.semantics.role == role && (name.len == 0 || @strEq(n.semantics.label, name) == 1)) {
+            found = i;
+            matches = matches + 1;
+        }
+        i = i + 1;
+    }
+    return Locator{ .node = found, .matches = matches };
+}
+
+fn locate_test_id(ui: *Ui, test_id: []u8) Locator {
+    let found: i32 = -1;
+    let matches: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[Node](ui.*.nodes)) {
+        let n: Node = get[Node](ui.*.nodes, i);
+        if (n.live == 1 && @strEq(n.semantics.test_id, test_id) == 1) { found = i; matches = matches + 1; }
+        i = i + 1;
+    }
+    return Locator{ .node = found, .matches = matches };
+}
+
+fn locate_key(ui: *Ui, key: t27) Locator {
+    let found: i32 = ui_find_key(ui, key);
+    if (found < 0) { return Locator{ .node = -1, .matches = 0 }; }
+    return Locator{ .node = found, .matches = 1 };
+}
+
+fn locate_text(ui: *Ui, text_value: []u8) Locator {
+    let found: i32 = -1; let matches: i32 = 0; let i: i32 = 0;
+    while (i < len[Node](ui.*.nodes)) {
+        let n: Node = get[Node](ui.*.nodes, i);
+        if (n.live == 1 && @strEq(n.text, text_value) == 1) { found = i; matches = matches + 1; }
+        i = i + 1;
+    }
+    return Locator{ .node = found, .matches = matches };
+}
+
+fn locate_state(ui: *Ui, value: t27) Locator {
+    let found: i32 = -1; let matches: i32 = 0; let i: i32 = 0;
+    while (i < len[Node](ui.*.nodes)) {
+        let n: Node = get[Node](ui.*.nodes, i);
+        if (n.live == 1 && n.value == value) { found = i; matches = matches + 1; }
+        i = i + 1;
+    }
+    return Locator{ .node = found, .matches = matches };
+}
+
+fn locator_click(ui: *Ui, loc: Locator) i32 {
+    if (loc.matches != 1 || loc.node < 0) { return 0; }
+    let n: Node = get[Node](ui.*.nodes, loc.node);
+    if (node_interactive(n) == 0) { return 0; }
+    let x: t27 = 0;
+    let y: t27 = 0;
+    if (rect_center_checked(n.bounds, &x, &y) == 0) { return 0; }
+    if (ui_hit_test(ui, x, y) != loc.node) { return 0; }
+    return ui_dispatch(ui, event_new(EventKind.Click, x, y));
+}
+
+fn locator_focus(ui: *Ui, loc: Locator) i32 {
+    if (loc.matches != 1 || loc.node < 0) { return 0; }
+    return ui_set_focus(ui, loc.node);
+}
+
+fn locator_blur(ui: *Ui, loc: Locator) i32 {
+    if (loc.matches != 1 || loc.node < 0 || ui.*.focused_node != loc.node) { return 0; }
+    return ui_set_focus(ui, -1);
+}
+
+fn locator_hover(ui: *Ui, loc: Locator) i32 {
+    if (loc.matches != 1 || loc.node < 0) { return 0; }
+    let node: Node = get[Node](ui.*.nodes, loc.node);
+    if (node_interactive(node) == 0) { return 0; }
+    let x: t27 = 0;
+    let y: t27 = 0;
+    if (rect_center_checked(node.bounds, &x, &y) == 0) { return 0; }
+    // Hover follows physical hit-test ordering. A semantic target hidden under
+    // another retained node must fail instead of reporting success while a
+    // different node becomes hovered.
+    if (ui_hit_test(ui, x, y) != loc.node) { return 0; }
+    if (ui_dispatch(ui, event_new(EventKind.Hover, x, y)) == 0) { return 0; }
+    if (ui.*.hovered_node != loc.node) { return 0; }
+    return 1;
+}
+
+fn locator_double_click(ui: *Ui, loc: Locator) i32 {
+    if (loc.matches != 1 || loc.node < 0) { return 0; }
+    let node: Node = get[Node](ui.*.nodes, loc.node);
+    if (node_interactive(node) == 0) { return 0; }
+    let x: t27 = 0;
+    let y: t27 = 0;
+    if (rect_center_checked(node.bounds, &x, &y) == 0) { return 0; }
+    if (ui_hit_test(ui, x, y) != loc.node) { return 0; }
+    return ui_dispatch(ui, event_new(EventKind.DoubleClick, x, y));
+}
+
+fn locator_press_target_supported(node: Node, key: Key,
+    modifiers: KeyModifiers) i32 {
+    if (node_interactive(node) == 0) { return 0; }
+    if (key == Key.Tab) {
+        if (modifiers.control == 0 && modifiers.alt == 0 && modifiers.meta == 0) { return 1; }
+        return 0;
+    }
+    if (key == Key.Enter || key == Key.Space) {
+        if (node.semantics.role != Role.TextField && modifiers.shift == 0
+            && modifiers.control == 0 && modifiers.alt == 0 && modifiers.meta == 0) { return 1; }
+        return 0;
+    }
+    if (text_node_storage_valid(&node) == 0) { return 0; }
+    if (key == Key.A) {
+        if (modifiers.alt == 0 && (modifiers.control != 0 || modifiers.meta != 0)) { return 1; }
+        return 0;
+    }
+    if (modifiers.control != 0 || modifiers.alt != 0 || modifiers.meta != 0) { return 0; }
+    if (key == Key.Backspace || key == Key.Delete || key == Key.Home
+        || key == Key.End || key == Key.ArrowLeft || key == Key.ArrowRight) { return 1; }
+    return 0;
+}
+
+fn locator_press_modified(ui: *Ui, loc: Locator, key: Key, modifiers: KeyModifiers) i32 {
+    if (loc.matches != 1 || loc.node < 0) { return 0; }
+    let node: Node = get[Node](ui.*.nodes, loc.node);
+    if (locator_press_target_supported(node, key, modifiers) == 0) { return 0; }
+    if (locator_focus(ui, loc) == 0) { return 0; }
+    let event: Event = event_new(EventKind.Press, 0, 0);
+    event.key = key; event.modifiers = modifiers;
+    let dispatched: i32 = ui_dispatch(ui, event);
+    if (dispatched == 1) { return 1; }
+    // Supported text-edit keys at a logical boundary are successful no-ops.
+    if (node.semantics.role == Role.TextField) { return 1; }
+    return 0;
+}
+
+fn locator_press(ui: *Ui, loc: Locator, key: Key) i32 {
+    return locator_press_modified(ui, loc, key, key_modifiers_none());
+}
+
+fn locator_fill(ui: *Ui, loc: Locator, value: []u8) i32 {
+    if (loc.matches != 1 || loc.node < 0 || utf8_validate(value).valid == 0) { return 0; }
+    let node: Node = get[Node](ui.*.nodes, loc.node);
+    if (editable_text_node_valid(&node) == 0) { return 0; }
+    if (ui_set_focus(ui, loc.node) == 0) { return 0; }
+    return ui_set_text_value(ui, loc.node, value);
+}
+
+fn locator_type(ui: *Ui, loc: Locator, value: []u8) i32 {
+    if (loc.matches != 1 || loc.node < 0 || utf8_validate(value).valid == 0) { return 0; }
+    let node: Node = get[Node](ui.*.nodes, loc.node);
+    if (editable_text_node_valid(&node) == 0) { return 0; }
+    // Typing no text is a successful no-op. In particular, it must not turn
+    // an existing selection into an accidental deletion or change focus.
+    if (value.len == 0) { return 1; }
+    if (ui_set_focus(ui, loc.node) == 0) { return 0; }
+    let event: Event = event_new(EventKind.Input, 0, 0); event.text = value;
+    return ui_dispatch(ui, event);
+}
+
+fn locator_set_selection(ui: *Ui, loc: Locator, anchor: t27, focus: t27) i32 {
+    if (loc.matches != 1 || loc.node < 0 || loc.node >= len[Node](ui.*.nodes)) { return 0; }
+    let node: Node = get[Node](ui.*.nodes, loc.node);
+    if (editable_text_node_valid(&node) == 0
+        || selection_valid(node.text, text_selection_start(TextSelection{ .anchor = anchor, .focus = focus }),
+            text_selection_end(TextSelection{ .anchor = anchor, .focus = focus })) == 0) { return 0; }
+    if (ui_set_focus(ui, loc.node) == 0) { return 0; }
+    return ui_set_text_selection(ui, loc.node, TextSelection{ .anchor = anchor, .focus = focus });
+}
+
+fn locator_select_text(ui: *Ui, loc: Locator, anchor: t27, focus: t27) i32 {
+    return locator_set_selection(ui, loc, anchor, focus);
+}
+
+fn locator_select_all(ui: *Ui, loc: Locator) i32 {
+    if (loc.matches != 1 || loc.node < 0) { return 0; }
+    let node: Node = get[Node](ui.*.nodes, loc.node);
+    if (editable_text_node_valid(&node) == 0) { return 0; }
+    if (ui_set_focus(ui, loc.node) == 0) { return 0; }
+    return ui_select_all_text(ui, loc.node);
+}
+
+fn locator_selection(ui: *Ui, loc: Locator) TextSelection {
+    if (loc.matches != 1 || loc.node < 0 || loc.node >= len[Node](ui.*.nodes)) {
+        return TextSelection{ .anchor = -1, .focus = -1 };
+    }
+    return ui_get_text_selection(ui, loc.node);
+}
+
+fn locator_has_selection(ui: *Ui, loc: Locator, anchor: t27, focus: t27) i32 {
+    if (loc.matches != 1 || loc.node < 0) { return 0; }
+    let node: Node = get[Node](ui.*.nodes, loc.node);
+    if (text_node_storage_valid(&node) == 0) { return 0; }
+    let actual: TextSelection = locator_selection(ui, loc);
+    if (actual.anchor == anchor && actual.focus == focus) { return 1; }
+    return 0;
+}
+
+// The caller owns the returned buffer and releases it with text_buffer_free.
+fn locator_selected_text(ui: *Ui, loc: Locator) TextBuffer {
+    if (loc.matches != 1 || loc.node < 0 || loc.node >= len[Node](ui.*.nodes)) { return text_buffer_empty(); }
+    return ui_copy_selected_text(ui, loc.node);
+}
+
+fn locator_has_selected_text(ui: *Ui, loc: Locator, value: []u8) i32 {
+    if (loc.matches != 1 || loc.node < 0 || utf8_validate(value).valid == 0) { return 0; }
+    let node: Node = get[Node](ui.*.nodes, loc.node);
+    if (text_node_storage_valid(&node) == 0) { return 0; }
+    let selected: TextBuffer = locator_selected_text(ui, loc);
+    let matches: i32 = text_buffer_equal(&selected, value);
+    text_buffer_free(&selected);
+    return matches;
+}
+
+fn locator_scroll(ui: *Ui, loc: Locator, amount: t27) i32 {
+    if (loc.matches != 1 || loc.node < 0) { return 0; }
+    return ui_scroll_node(ui, loc.node, amount);
+}
+
+fn locator_is_visible(ui: *Ui, loc: Locator) i32 {
+    if (loc.matches != 1 || loc.node < 0) { return 0; }
+    let n: Node = get[Node](ui.*.nodes, loc.node);
+    if (n.live == 1 && n.style.visible == 1 && n.bounds.w > 0 && n.bounds.h > 0) { return 1; }
+    return 0;
+}
+
+fn locator_is_enabled(ui: *Ui, loc: Locator) i32 {
+    if (loc.matches != 1 || loc.node < 0) { return 0; }
+    return get[Node](ui.*.nodes, loc.node).style.enabled;
+}
+
+fn locator_is_focused(ui: *Ui, loc: Locator) i32 {
+    if (loc.matches != 1 || loc.node < 0) { return 0; }
+    if (ui.*.focused_node == loc.node && get[Node](ui.*.nodes, loc.node).focused == 1) { return 1; }
+    return 0;
+}
+
+fn locator_has_value(ui: *Ui, loc: Locator, value: t27) i32 {
+    if (loc.matches != 1 || loc.node < 0) { return 0; }
+    return get[Node](ui.*.nodes, loc.node).value == value;
+}
+
+fn locator_has_text(ui: *Ui, loc: Locator, value: []u8) i32 {
+    if (loc.matches != 1 || loc.node < 0) { return 0; }
+    return @strEq(get[Node](ui.*.nodes, loc.node).text, value);
+}
+
+fn locator_has_geometry(ui: *Ui, loc: Locator, expected: Rect) i32 {
+    if (loc.matches != 1 || loc.node < 0) { return 0; }
+    let actual: Rect = get[Node](ui.*.nodes, loc.node).bounds;
+    if (actual.x == expected.x && actual.y == expected.y && actual.w == expected.w && actual.h == expected.h) { return 1; }
+    return 0;
+}
+
+fn ui_has_no_layout_violations(ui: *Ui, strict_layout: i32) i32 {
+    return ui_check(ui, strict_layout).errors == 0;
+}
+
+fn action_emitted(ui: *Ui, action_id: t9) i32 {
+    let i: i32 = 0;
+    while (i < len[t9](ui.*.emitted_actions)) {
+        if (get[t9](ui.*.emitted_actions, i) == action_id) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn action_emission_count(ui: *Ui, action_id: t9) t27 {
+    let count: t27 = 0; let i: i32 = 0;
+    while (i < len[t9](ui.*.emitted_actions)) {
+        if (get[t9](ui.*.emitted_actions, i) == action_id) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}

@@ -1,0 +1,503 @@
+@import("../src/core.flash")
+@import("../src/text.flash")
+@import("../src/events.flash")
+@import("../src/controls.flash")
+@import("../src/layout.flash")
+@import("../src/automation.flash")
+@import("../src/wire.flash")
+@import("../src/linux_transport.flash")
+@import("../src/automation_protocol.flash")
+
+fn automation_protocol_expect(ok: i32, message: []u8) i32 {
+    if (ok == 0) { _zag_print("FAIL "); _zag_println(message); return 1; }
+    return 0;
+}
+
+fn automation_test_set_id(ui: *Ui, node_id: i32, test_id: []u8) void {
+    let node: Node = get[Node](ui.*.nodes, node_id);
+    node.semantics.test_id = test_id;
+    set[Node](&ui.*.nodes, node_id, node);
+}
+
+fn automation_test_raw_send(fd: i64, wire: *WireBuffer) i32 {
+    let sent: LinuxWriteAllResult = linux_send_wire_all(fd, wire);
+    return sent.complete;
+}
+
+fn automation_test_send_prefix(fd: i64, frame_len: t27) i32 {
+    let prefix: WireBuffer = wire_new(4);
+    wire_push_u32_le(&prefix, frame_len);
+    let sent: i32 = automation_test_raw_send(fd, &prefix);
+    wire_free(&prefix);
+    return sent;
+}
+
+fn main() i32 {
+    let failures: i32 = 0;
+
+    // t27 semantic identities survive the byte boundary without narrowing to
+    // an incidental binary application type.
+    let high_key_request: AutomationRequest = automation_request(3812798742493,
+        AutomationCommand.AssertVisible, automation_locator_key((0 as t27) - 3812798742493),
+        "", Key.Unknown);
+    let high_key_wire: WireBuffer = automation_encode_request(high_key_request);
+    let high_key_decoded: AutomationRequest = automation_decode_request(&high_key_wire);
+    failures = failures + automation_protocol_expect(high_key_wire.error == 0
+        && high_key_decoded.request_id == 3812798742493
+        && high_key_decoded.locator.number == ((0 as t27) - 3812798742493),
+        "full balanced-ternary t27 request and locator identities round trip at the wire boundary");
+    wire_free(&high_key_wire);
+
+    let parameter_request: AutomationRequest = automation_request_parameters(27,
+        AutomationCommand.AssertGeometry, automation_locator_key(3), "", Key.Unknown,
+        (0 as t27) - 3812798742493, 3812798742493, 3812798742493, 0);
+    let parameter_wire: WireBuffer = automation_encode_request(parameter_request);
+    let parameter_decoded: AutomationRequest = automation_decode_request(&parameter_wire);
+    failures = failures + automation_protocol_expect(parameter_wire.error == 0
+        && parameter_decoded.command == AutomationCommand.AssertGeometry
+        && parameter_decoded.parameter0 == ((0 as t27) - 3812798742493)
+        && parameter_decoded.parameter1 == 3812798742493
+        && parameter_decoded.parameter2 == 3812798742493
+        && parameter_decoded.parameter3 == 0,
+        "four signed t27 command parameters round trip without text or binary application types");
+    wire_free(&parameter_wire);
+
+    let contract_request: AutomationRequest = automation_request_parameters(2,
+        AutomationCommand.AssertGeometry, automation_locator_key(3), "", Key.Unknown,
+        -1, 2, 3, 4);
+    let contract_wire: WireBuffer = automation_encode_request(contract_request);
+    failures = failures + automation_protocol_expect(automation_protocol_version() == 2
+        && automation_request_header_bytes() == 51
+        && len[u8](contract_wire.bytes) == 51
+        && wire_read_u8(&contract_wire, 0) == 2
+        && wire_read_u8(&contract_wire, 23) == 1
+        && wire_read_u8(&contract_wire, 24) == 1
+        && wire_read_u8(&contract_wire, 30) == 0
+        && wire_read_u8(&contract_wire, 31) == 2
+        && wire_read_u8(&contract_wire, 37) == 0
+        && wire_read_u8(&contract_wire, 38) == 3
+        && wire_read_u8(&contract_wire, 44) == 0
+        && wire_read_u8(&contract_wire, 45) == 4,
+        "protocol-v2 literal version, header size, and t27 parameter offsets are pinned on raw bytes");
+    wire_free(&contract_wire);
+
+    let invalid_connection: AutomationProtocolConnection = automation_protocol_connection(0 - 1);
+    automation_protocol_close(&invalid_connection);
+    failures = failures + automation_protocol_expect(invalid_connection.active == 0
+        && invalid_connection.fd == (0 - 1)
+        && invalid_connection.terminal_status == AutomationTransportStatus.IoError,
+        "invalid descriptor carriers never become owned automation connections");
+
+    let pair: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + automation_protocol_expect(pair.ok == 1,
+        "automation fake peer opens a native AF_UNIX socketpair");
+    if (pair.ok == 1) {
+        let client: AutomationProtocolConnection = automation_protocol_connection(pair.first);
+        let server: AutomationProtocolConnection = automation_protocol_connection(pair.second);
+        let oversized_direct: AutomationExactRead = automation_read_exact(&server,
+            automation_protocol_max_frame_bytes() + 1, 0);
+        let negative_direct: AutomationExactRead = automation_read_exact(&server, -1, 0);
+        failures = failures + automation_protocol_expect(
+            oversized_direct.status == AutomationTransportStatus.Oversized
+            && oversized_direct.complete == 0
+            && len[u8](oversized_direct.wire.bytes) == 0
+            && oversized_direct.wire.bytes.cap == 0
+            && negative_direct.status == AutomationTransportStatus.IoError
+            && len[u8](negative_direct.wire.bytes) == 0
+            && negative_direct.wire.bytes.cap == 0
+            && server.active == 1,
+            "public exact reads reject invalid or oversized counts before allocation or stream mutation");
+        wire_free(&oversized_direct.wire); wire_free(&negative_direct.wire);
+        let ui: Ui = ui_new(640, 480);
+        ui_begin(&ui);
+        let field: i32 = ui_text_field_control(&ui, 201, -1,
+            rect(8, 8, 220, 44), "Name", "old", 41);
+        let button: i32 = ui_button_control(&ui, 301, -1,
+            rect(8, 60, 120, 44), "Run", 51);
+        let marker: i32 = ui_text(&ui, 401, -1,
+            rect(8, 112, 120, 20), "marker");
+        let toggle: i32 = ui_toggle_control(&ui, 501, -1,
+            rect(8, 140, 140, 44), "Mode", 7, 61);
+        let duplicate_a: i32 = ui_button_control(&ui, 601, -1,
+            rect(200, 60, 120, 44), "Duplicate", 71);
+        let duplicate_b: i32 = ui_button_control(&ui, 602, -1,
+            rect(330, 60, 120, 44), "Duplicate", 72);
+        let scroll: i32 = ui_scroll_primitive(&ui, 701, -1,
+            rect(500, 60, 120, 81), "Feed");
+        automation_test_set_id(&ui, field, "name-field");
+        automation_test_set_id(&ui, button, "run-button");
+        automation_test_set_id(&ui, marker, "marker-text");
+        automation_test_set_id(&ui, toggle, "mode-toggle");
+        automation_test_set_id(&ui, scroll, "feed-scroll");
+        ui_end(&ui);
+
+        let sent_ok: i32 = 1;
+        sent_ok = sent_ok * automation_client_send_request(&client, automation_request(1,
+            AutomationCommand.Focus, automation_locator_test_id("name-field"), "", Key.Unknown));
+        sent_ok = sent_ok * automation_client_send_request(&client, automation_request(2,
+            AutomationCommand.Fill, automation_locator_test_id("name-field"), "light", Key.Unknown));
+        sent_ok = sent_ok * automation_client_send_request(&client, automation_request(3,
+            AutomationCommand.Type, automation_locator_test_id("name-field"), "!", Key.Unknown));
+        sent_ok = sent_ok * automation_client_send_request(&client, automation_request(4,
+            AutomationCommand.AssertText, automation_locator_test_id("name-field"), "light!", Key.Unknown));
+        sent_ok = sent_ok * automation_client_send_request(&client, automation_request(5,
+            AutomationCommand.AssertFocus, automation_locator_test_id("name-field"), "", Key.Unknown));
+        sent_ok = sent_ok * automation_client_send_request(&client, automation_request(6,
+            AutomationCommand.AssertVisible, automation_locator_role(Role.Button, "Run"), "", Key.Unknown));
+        sent_ok = sent_ok * automation_client_send_request(&client, automation_request(7,
+            AutomationCommand.Click, automation_locator_key(301), "", Key.Unknown));
+        sent_ok = sent_ok * automation_client_send_request(&client, automation_request(8,
+            AutomationCommand.Press, automation_locator_key(301), "", Key.Enter));
+        sent_ok = sent_ok * automation_client_send_request(&client, automation_request(9,
+            AutomationCommand.AssertVisible, automation_locator_text("marker"), "", Key.Unknown));
+        sent_ok = sent_ok * automation_client_send_request(&client, automation_request(10,
+            AutomationCommand.AssertVisible, automation_locator_state(7), "", Key.Unknown));
+        failures = failures + automation_protocol_expect(sent_ok == 1
+            && client.sent_frames == 10,
+            "ten ordered semantic requests are accepted before the server drains them");
+
+        let server_ordered: i32 = 1;
+        let expected_id: t27 = 1;
+        while (expected_id <= 10) {
+            let handled: AutomationResponse = automation_server_step(&server, &ui, 1000);
+            if (handled.valid == 0 || handled.request_id != expected_id
+                || handled.status != AutomationResponseStatus.Ok || handled.matches != 1) {
+                server_ordered = 0;
+            }
+            expected_id = expected_id + 1;
+        }
+        failures = failures + automation_protocol_expect(server_ordered == 1
+            && server.received_frames == 10 && server.sent_frames == 10,
+            "server executes complete requests in exact stream order");
+
+        let client_ordered: i32 = 1;
+        expected_id = 1;
+        while (expected_id <= 10) {
+            let response: AutomationResponse = automation_client_receive_response(&client, 1000);
+            if (response.valid == 0 || response.request_id != expected_id
+                || response.status != AutomationResponseStatus.Ok || response.matches != 1) {
+                client_ordered = 0;
+            }
+            expected_id = expected_id + 1;
+        }
+        failures = failures + automation_protocol_expect(client_ordered == 1
+            && client.received_frames == 10
+            && @strEq(get[Node](ui.nodes, field).text, "light!") == 1
+            && locator_is_focused(&ui, locate_key(&ui, 301)) == 1
+            && action_emission_count(&ui, 51) == 2,
+            "focus, fill, type, press, click, and text/focus/visibility assertions use real UI behavior");
+
+        let extended_sent: i32 = 1;
+        extended_sent = extended_sent * automation_client_send_request(&client,
+            automation_request(20, AutomationCommand.DoubleClick,
+                automation_locator_key(301), "", Key.Unknown));
+        extended_sent = extended_sent * automation_client_send_request(&client,
+            automation_request(21, AutomationCommand.Hover,
+                automation_locator_key(301), "", Key.Unknown));
+        extended_sent = extended_sent * automation_client_send_request(&client,
+            automation_request(22, AutomationCommand.Blur,
+                automation_locator_key(301), "", Key.Unknown));
+        extended_sent = extended_sent * automation_client_send_request(&client,
+            automation_request(23, AutomationCommand.Focus,
+                automation_locator_key(201), "", Key.Unknown));
+        extended_sent = extended_sent * automation_client_send_request(&client,
+            automation_request_parameters(24, AutomationCommand.Select,
+                automation_locator_key(201), "", Key.Unknown, 1, 4, 0, 0));
+        extended_sent = extended_sent * automation_client_send_request(&client,
+            automation_request_parameters(25, AutomationCommand.AssertSelection,
+                automation_locator_key(201), "", Key.Unknown, 1, 4, 0, 0));
+        extended_sent = extended_sent * automation_client_send_request(&client,
+            automation_request(26, AutomationCommand.AssertSelectedText,
+                automation_locator_key(201), "igh", Key.Unknown));
+        extended_sent = extended_sent * automation_client_send_request(&client,
+            automation_request(27, AutomationCommand.SelectAll,
+                automation_locator_key(201), "", Key.Unknown));
+        extended_sent = extended_sent * automation_client_send_request(&client,
+            automation_request_parameters(28, AutomationCommand.AssertSelection,
+                automation_locator_key(201), "", Key.Unknown, 0, 6, 0, 0));
+        extended_sent = extended_sent * automation_client_send_request(&client,
+            automation_request_parameters(29, AutomationCommand.Scroll,
+                automation_locator_key(701), "", Key.Unknown, 27, 0, 0, 0));
+        extended_sent = extended_sent * automation_client_send_request(&client,
+            automation_request(30, AutomationCommand.AssertEnabled,
+                automation_locator_key(301), "", Key.Unknown));
+        extended_sent = extended_sent * automation_client_send_request(&client,
+            automation_request_parameters(31, AutomationCommand.AssertValue,
+                automation_locator_key(501), "", Key.Unknown, 7, 0, 0, 0));
+        extended_sent = extended_sent * automation_client_send_request(&client,
+            automation_request_parameters(32, AutomationCommand.AssertGeometry,
+                automation_locator_key(301), "", Key.Unknown, 8, 60, 120, 44));
+        extended_sent = extended_sent * automation_client_send_request(&client,
+            automation_request_parameters(33, AutomationCommand.AssertNoLayoutViolations,
+                automation_locator_key(301), "", Key.Unknown, 0, 0, 0, 0));
+        extended_sent = extended_sent * automation_client_send_request(&client,
+            automation_request_parameters(34, AutomationCommand.AssertAction,
+                automation_locator_key(301), "", Key.Unknown, 51, 0, 0, 0));
+        extended_sent = extended_sent * automation_client_send_request(&client,
+            automation_request(35, AutomationCommand.AssertSelectedText,
+                automation_locator_key(201), "light!", Key.Unknown));
+        failures = failures + automation_protocol_expect(extended_sent == 1,
+            "extended semantic actions and assertions encode as ordered protocol-v2 requests");
+
+        let extended_server_ok: i32 = 1;
+        expected_id = 20;
+        while (expected_id <= 35) {
+            let handled: AutomationResponse = automation_server_step(&server, &ui, 1000);
+            if (handled.valid == 0 || handled.request_id != expected_id
+                || handled.status != AutomationResponseStatus.Ok || handled.matches != 1) {
+                extended_server_ok = 0;
+            }
+            expected_id = expected_id + 1;
+        }
+        let extended_client_ok: i32 = 1;
+        expected_id = 20;
+        while (expected_id <= 35) {
+            let response: AutomationResponse = automation_client_receive_response(&client, 1000);
+            if (response.valid == 0 || response.request_id != expected_id
+                || response.status != AutomationResponseStatus.Ok || response.matches != 1) {
+                extended_client_ok = 0;
+            }
+            expected_id = expected_id + 1;
+        }
+        failures = failures + automation_protocol_expect(extended_server_ok == 1
+            && extended_client_ok == 1
+            && ui.hovered_node == button && ui.focused_node == field
+            && locator_has_selection(&ui, locate_key(&ui, 201), 0, 6) == 1
+            && get[Node](ui.nodes, scroll).scroll_y == 27
+            && action_emission_count(&ui, 51) == 4,
+            "double-click, hover, blur, scroll, selection, enabled, value, geometry, layout, and action checks execute deterministically");
+
+        let focus_before_rejection: i32 = ui.focused_node;
+        let action_count_before_rejection: t27 = action_emission_count(&ui, 51);
+        let ambiguous_sent: i32 = automation_client_send_request(&client, automation_request(11,
+            AutomationCommand.Click, automation_locator_role(Role.Button, "Duplicate"), "", Key.Unknown));
+        let missing_sent: i32 = automation_client_send_request(&client, automation_request(12,
+            AutomationCommand.Focus, automation_locator_test_id("missing-node"), "", Key.Unknown));
+        let assertion_sent: i32 = automation_client_send_request(&client, automation_request(13,
+            AutomationCommand.AssertText, automation_locator_test_id("name-field"), "wrong", Key.Unknown));
+        let ambiguous_server: AutomationResponse = automation_server_step(&server, &ui, 1000);
+        let missing_server: AutomationResponse = automation_server_step(&server, &ui, 1000);
+        let assertion_server: AutomationResponse = automation_server_step(&server, &ui, 1000);
+        let ambiguous_client: AutomationResponse = automation_client_receive_response(&client, 1000);
+        let missing_client: AutomationResponse = automation_client_receive_response(&client, 1000);
+        let assertion_client: AutomationResponse = automation_client_receive_response(&client, 1000);
+        failures = failures + automation_protocol_expect(ambiguous_sent == 1 && missing_sent == 1
+            && assertion_sent == 1
+            && ambiguous_server.status == AutomationResponseStatus.Ambiguous
+            && ambiguous_server.matches == 2
+            && missing_server.status == AutomationResponseStatus.Missing
+            && missing_server.matches == 0
+            && assertion_server.status == AutomationResponseStatus.AssertionFailed
+            && ambiguous_client.status == AutomationResponseStatus.Ambiguous
+            && missing_client.status == AutomationResponseStatus.Missing
+            && assertion_client.status == AutomationResponseStatus.AssertionFailed
+            && ui.focused_node == focus_before_rejection
+            && action_emission_count(&ui, 51) == action_count_before_rejection
+            && action_emission_count(&ui, 71) == 0 && action_emission_count(&ui, 72) == 0
+            && @strEq(get[Node](ui.nodes, field).text, "light!") == 1,
+            "ambiguous and missing locators plus failed assertions return typed failures without UI mutation");
+
+        let oversized_field: ArrayList[u8] = make[u8](automation_protocol_max_field_bytes() + 1);
+        let field_i: i32 = 0;
+        while (field_i < automation_protocol_max_field_bytes() + 1) {
+            push[u8](&oversized_field, 97 as u8); field_i = field_i + 1;
+        }
+        let sent_before_invalid: t27 = client.sent_frames;
+        let oversized_request: AutomationRequest = automation_request(14,
+            AutomationCommand.Fill, automation_locator_test_id("name-field"),
+            oversized_field.data[0..oversized_field.len], Key.Unknown);
+        let bounded_rejection: WireBuffer = automation_encode_request(oversized_request);
+        let invalid_local: i32 = automation_client_send_request(&client, oversized_request);
+        let invalid_action: i32 = automation_client_send_request(&client,
+            automation_request_parameters(15, AutomationCommand.AssertAction,
+                automation_locator_key(301), "", Key.Unknown, 9842, 0, 0, 0));
+        let invalid_selection: i32 = automation_client_send_request(&client,
+            automation_request_parameters(16, AutomationCommand.Select,
+                automation_locator_key(201), "", Key.Unknown, -1, 0, 0, 0));
+        let unsupported_press: i32 = automation_client_send_request(&client,
+            automation_request(18, AutomationCommand.Press,
+                automation_locator_key(301), "", Key.A));
+        let unused_parameter: i32 = automation_client_send_request(&client,
+            automation_request_parameters(17, AutomationCommand.Click,
+                automation_locator_key(301), "", Key.Unknown, 1, 0, 0, 0));
+        failures = failures + automation_protocol_expect(invalid_local == 0
+            && invalid_action == 0 && invalid_selection == 0
+            && unsupported_press == 0 && unused_parameter == 0
+            && bounded_rejection.error != 0
+            && len[u8](bounded_rejection.bytes) == 0
+            && bounded_rejection.bytes.cap == 0
+            && client.active == 1 && client.sent_frames == sent_before_invalid
+            && @strEq(get[Node](ui.nodes, field).text, "light!") == 1,
+            "oversized fields and invalid or unused parameters fail before transmission or UI mutation");
+        wire_free(&bounded_rejection); free[u8](&oversized_field);
+
+        automation_protocol_close(&client);
+        automation_protocol_close(&server);
+        failures = failures + automation_protocol_expect(client.active == 0 && client.fd == (0 - 1)
+            && server.active == 0 && server.fd == (0 - 1),
+            "ordered fake-peer descriptors are closed and ownership state is cleared");
+        automation_protocol_close(&client); automation_protocol_close(&server);
+        ui_free(&ui);
+    }
+
+    let malformed_pair: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + automation_protocol_expect(malformed_pair.ok == 1,
+        "malformed-schema fixture opens a native socketpair");
+    if (malformed_pair.ok == 1) {
+        let malformed_client: AutomationProtocolConnection = automation_protocol_connection(malformed_pair.first);
+        let malformed_server: AutomationProtocolConnection = automation_protocol_connection(malformed_pair.second);
+        let empty_ui: Ui = ui_new(64, 64);
+        let malformed_wire: WireBuffer = automation_encode_request(automation_request(77,
+            AutomationCommand.AssertVisible, automation_locator_text("a"), "", Key.Unknown));
+        // Advertise and supply an exact 1025-byte valid UTF-8 text locator. The
+        // total frame length remains self-consistent, so only the field bound
+        // can reject it before locator resolution.
+        set[u8](&malformed_wire.bytes, 19, 1 as u8);
+        set[u8](&malformed_wire.bytes, 20, 4 as u8);
+        let malformed_fill_i: i32 = 0;
+        while (malformed_fill_i < 1024) {
+            wire_push_u8(&malformed_wire, 97); malformed_fill_i = malformed_fill_i + 1;
+        }
+        let raw_sent: i32 = automation_send_payload(&malformed_client, &malformed_wire);
+        wire_free(&malformed_wire);
+        let rejected: AutomationResponse = automation_server_step(&malformed_server, &empty_ui, 1000);
+        let rejection_on_wire: AutomationResponse = automation_client_receive_response(&malformed_client, 1000);
+        failures = failures + automation_protocol_expect(raw_sent == 1
+            && rejected.valid == 1 && rejected.request_id == 77
+            && rejected.status == AutomationResponseStatus.InvalidRequest
+            && rejection_on_wire.valid == 1 && rejection_on_wire.request_id == 77
+            && rejection_on_wire.status == AutomationResponseStatus.InvalidRequest
+            && malformed_server.active == 0 && malformed_server.fd == (0 - 1)
+            && malformed_server.terminal_status == AutomationTransportStatus.Malformed,
+            "malformed inbound field lengths receive one typed rejection and terminally retire the server stream");
+        automation_protocol_close(&malformed_client);
+        automation_protocol_close(&malformed_server);
+        ui_free(&empty_ui);
+    }
+
+    let inbound_parameter_pair: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + automation_protocol_expect(inbound_parameter_pair.ok == 1,
+        "inbound command-parameter validation fixture opens a native socketpair");
+    if (inbound_parameter_pair.ok == 1) {
+        let inbound_client: AutomationProtocolConnection = automation_protocol_connection(
+            inbound_parameter_pair.first);
+        let inbound_server: AutomationProtocolConnection = automation_protocol_connection(
+            inbound_parameter_pair.second);
+        let inbound_ui: Ui = ui_new(81, 81);
+        ui_begin(&inbound_ui);
+        let inbound_button: i32 = ui_button_control(&inbound_ui, 1, -1,
+            rect(3, 3, 54, 54), "Inbound", 81);
+        ui_end(&inbound_ui);
+        let inbound_wire: WireBuffer = automation_encode_request(automation_request(78,
+            AutomationCommand.Click, automation_locator_key(1), "", Key.Unknown));
+        // Click requires all four parameters to be zero. Inject +1 directly at
+        // the pinned parameter0 magnitude offset so only inbound semantic
+        // validation prevents the action.
+        set[u8](&inbound_wire.bytes, 24, 1 as u8);
+        let inbound_sent: i32 = automation_send_payload(&inbound_client, &inbound_wire);
+        wire_free(&inbound_wire);
+        let inbound_rejected: AutomationResponse = automation_server_step(
+            &inbound_server, &inbound_ui, 1000);
+        let inbound_response: AutomationResponse = automation_client_receive_response(
+            &inbound_client, 1000);
+        failures = failures + automation_protocol_expect(inbound_button >= 0
+            && inbound_sent == 1
+            && inbound_rejected.valid == 1
+            && inbound_rejected.request_id == 78
+            && inbound_rejected.status == AutomationResponseStatus.InvalidRequest
+            && inbound_response.valid == 1
+            && inbound_response.status == AutomationResponseStatus.InvalidRequest
+            && action_emission_count(&inbound_ui, 81) == 0
+            && inbound_server.active == 0
+            && inbound_server.terminal_status == AutomationTransportStatus.Malformed,
+            "server-side validation rejects wire-injected unused parameters before UI mutation");
+        automation_protocol_close(&inbound_client);
+        automation_protocol_close(&inbound_server);
+        ui_free(&inbound_ui);
+    }
+
+    let truncated_pair: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + automation_protocol_expect(truncated_pair.ok == 1,
+        "truncated-frame fixture opens a native socketpair");
+    if (truncated_pair.ok == 1) {
+        let truncated_server: AutomationProtocolConnection = automation_protocol_connection(truncated_pair.second);
+        let short_frame: WireBuffer = wire_new(7);
+        wire_push_u32_le(&short_frame, automation_request_header_bytes() as t27);
+        wire_push_u8(&short_frame, automation_protocol_version());
+        wire_push_u8(&short_frame, automation_message_request());
+        wire_push_u8(&short_frame, 1);
+        let short_sent: i32 = automation_test_raw_send(truncated_pair.first, &short_frame);
+        wire_free(&short_frame);
+        let _closed_truncated_peer: i64 = linux_close(truncated_pair.first);
+        let empty_ui: Ui = ui_new(64, 64);
+        let truncated_response: AutomationResponse = automation_server_step(&truncated_server, &empty_ui, 1000);
+        failures = failures + automation_protocol_expect(short_sent == 1
+            && truncated_response.valid == 0 && truncated_server.active == 0
+            && truncated_server.fd == (0 - 1)
+            && truncated_server.terminal_status == AutomationTransportStatus.Truncated,
+            "a partial length-prefixed request is never reinterpreted as a later frame");
+        automation_protocol_close(&truncated_server);
+        ui_free(&empty_ui);
+    }
+
+    let stalled_pair: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + automation_protocol_expect(stalled_pair.ok == 1,
+        "prefix-only timeout fixture opens a native socketpair");
+    if (stalled_pair.ok == 1) {
+        let stalled_server: AutomationProtocolConnection = automation_protocol_connection(stalled_pair.second);
+        let prefix_sent: i32 = automation_test_send_prefix(stalled_pair.first,
+            automation_request_header_bytes() as t27);
+        let empty_ui: Ui = ui_new(64, 64);
+        let stalled_response: AutomationResponse = automation_server_step(&stalled_server, &empty_ui, 20);
+        let late_payload: WireBuffer = wire_new(4);
+        wire_push_u32_le(&late_payload, 1);
+        let late_send: i32 = automation_test_raw_send(stalled_pair.first, &late_payload);
+        wire_free(&late_payload);
+        failures = failures + automation_protocol_expect(prefix_sent == 1
+            && stalled_response.valid == 0 && stalled_server.active == 0
+            && stalled_server.fd == (0 - 1)
+            && stalled_server.terminal_status == AutomationTransportStatus.Truncated
+            && late_send == 0,
+            "a prefix-only deadline terminally rejects the partial frame so late payload cannot become a new prefix");
+        let _closed_stalled_peer: i64 = linux_close(stalled_pair.first);
+        automation_protocol_close(&stalled_server);
+        ui_free(&empty_ui);
+    }
+
+    let oversized_pair: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + automation_protocol_expect(oversized_pair.ok == 1,
+        "oversized-frame fixture opens a native socketpair");
+    if (oversized_pair.ok == 1) {
+        let oversized_server: AutomationProtocolConnection = automation_protocol_connection(oversized_pair.second);
+        let prefix_sent: i32 = automation_test_send_prefix(oversized_pair.first,
+            (automation_protocol_max_frame_bytes() as t27) + 1);
+        let empty_ui: Ui = ui_new(64, 64);
+        let oversized_response: AutomationResponse = automation_server_step(&oversized_server, &empty_ui, 1000);
+        failures = failures + automation_protocol_expect(prefix_sent == 1
+            && oversized_response.valid == 0 && oversized_server.active == 0
+            && oversized_server.fd == (0 - 1)
+            && oversized_server.terminal_status == AutomationTransportStatus.Oversized,
+            "an oversized prefix is rejected before payload allocation and terminally retires the stream");
+        let _closed_oversized_peer: i64 = linux_close(oversized_pair.first);
+        automation_protocol_close(&oversized_server);
+        ui_free(&empty_ui);
+    }
+
+    let write_pair: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + automation_protocol_expect(write_pair.ok == 1,
+        "terminal-write fixture opens a native socketpair");
+    if (write_pair.ok == 1) {
+        let write_client: AutomationProtocolConnection = automation_protocol_connection(write_pair.first);
+        let _closed_write_peer: i64 = linux_close(write_pair.second);
+        let send_after_close: i32 = automation_client_send_request(&write_client, automation_request(90,
+            AutomationCommand.Click, automation_locator_key(1), "", Key.Unknown));
+        failures = failures + automation_protocol_expect(send_after_close == 0
+            && write_client.active == 0 && write_client.fd == (0 - 1)
+            && write_client.terminal_status == AutomationTransportStatus.WriteFailed,
+            "an incomplete socket write is SIGPIPE-safe and terminally clears connection ownership");
+        automation_protocol_close(&write_client);
+    }
+
+    if (failures == 0) { _zag_println("automation_protocol_test: ok"); }
+    return failures;
+}

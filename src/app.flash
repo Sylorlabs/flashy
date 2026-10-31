@@ -1,0 +1,1308 @@
+// Public application/window ownership over deterministic headless, Wayland, and X11 backends.
+
+pub struct Window {
+    key: t27,
+    title: []u8,
+    width: t27,
+    height: t27,
+    backend: BackendKind,
+    native: X11NativeWindow,
+    wayland_native: WaylandNativeWindow,
+    surface: Surface,
+    ui: Ui,
+    open: i32,
+    needs_present: i32,
+}
+
+pub struct App {
+    backend: BackendSelection,
+    x11: X11NativeConnection,
+    wayland: WaylandNativeConnection,
+    wayland_keyboard_map: KeyboardMap,
+    headless_clipboard: ClipboardOwnedText,
+    headless_primary: ClipboardOwnedText,
+    windows: ArrayList[Window],
+    running: i32,
+    error: []u8,
+}
+
+struct AppKeyboardModifiers {
+    value: KeyModifiers,
+    valid: i32,
+}
+
+fn app_empty_keyboard_map() KeyboardMap {
+    return keyboard_map_parse_xkb_subset("", 256);
+}
+
+fn app_failed(requested: BackendKind, reason: []u8) App {
+    return App{ .backend = BackendSelection{ .requested = requested, .active = requested,
+        .configured = 0, .connected = 0, .deterministic = 0, .reason = reason },
+        .x11 = x11_empty_connection(), .wayland = wayland_empty_connection(),
+        .wayland_keyboard_map = app_empty_keyboard_map(),
+        .headless_clipboard = clipboard_empty_owned_text(),
+        .headless_primary = clipboard_empty_owned_text(),
+        .windows = make[Window](4), .running = 0, .error = reason };
+}
+
+pub fn app_new(requested: BackendKind) App {
+    if (requested == BackendKind.Headless) {
+        return App{ .backend = backend_select(BackendKind.Headless), .x11 = x11_empty_connection(),
+            .wayland = wayland_empty_connection(), .wayland_keyboard_map = app_empty_keyboard_map(),
+            .headless_clipboard = clipboard_empty_owned_text(),
+            .headless_primary = clipboard_empty_owned_text(),
+            .windows = make[Window](4), .running = 1, .error = "" };
+    }
+    if (requested == BackendKind.Wayland || requested == BackendKind.Auto) {
+        let wayland: WaylandNativeConnection = wayland_connect_local();
+        if (wayland.registry_ready == 1 && wayland_bind_shell(&wayland) == 1) {
+            let selected: BackendSelection = BackendSelection{ .requested = requested, .active = BackendKind.Wayland,
+                .configured = 1, .connected = 1, .deterministic = 0, .reason = "Wayland registry and xdg-shell connected" };
+            return App{ .backend = selected, .x11 = x11_empty_connection(), .wayland = wayland,
+                .wayland_keyboard_map = app_empty_keyboard_map(),
+                .headless_clipboard = clipboard_empty_owned_text(),
+                .headless_primary = clipboard_empty_owned_text(),
+                .windows = make[Window](4), .running = 1, .error = "" };
+        }
+        wayland_disconnect(&wayland);
+        if (requested == BackendKind.Wayland) { return app_failed(requested, "Wayland registry or required shell globals unavailable"); }
+    }
+    if (requested == BackendKind.X11 || requested == BackendKind.Auto) {
+        let connection: X11NativeConnection = x11_connect_local();
+        if (connection.authenticated == 1) {
+            let selected: BackendSelection = BackendSelection{ .requested = requested, .active = BackendKind.X11,
+                .configured = 1, .connected = 1, .deterministic = 0, .reason = "authenticated X11 connection" };
+            return App{ .backend = selected, .x11 = connection, .windows = make[Window](4),
+                .wayland = wayland_empty_connection(), .wayland_keyboard_map = app_empty_keyboard_map(),
+                .headless_clipboard = clipboard_empty_owned_text(),
+                .headless_primary = clipboard_empty_owned_text(),
+                .running = 1, .error = "" };
+        }
+        let connection_error: []u8 = connection.error;
+        x11_disconnect(&connection);
+        return app_failed(requested, connection_error);
+    }
+    return app_failed(requested, "unsupported backend request");
+}
+
+pub fn app_graphics_capabilities(app: *App) GraphicsCapabilities {
+    return graphics_capabilities_for_selection(app.*.backend);
+}
+
+fn app_empty_native_window() X11NativeWindow {
+    return X11NativeWindow{ .window_id = 0, .gc_id = 0, .width = 0, .height = 0, .live = 0, .mapped = 0 };
+}
+
+fn app_empty_wayland_window() WaylandNativeWindow {
+    return WaylandNativeWindow{ .surface_id = 0, .xdg_surface_id = 0, .toplevel_id = 0,
+        .width = 0, .height = 0, .live = 0, .configured = 0, .close_requested = 0,
+        .buffer_id = 0, .buffer_width = 0, .buffer_height = 0,
+        .memory = LinuxSharedMemory{ .fd = 0 - 1, .address = 0, .len = 0, .valid = 0 },
+        .buffer_busy = 0 };
+}
+
+pub fn app_open_window(app: *App, key: t27, title: []u8, width: t27, height: t27) i32 {
+    if (app.*.running == 0 || width < 1 || height < 1
+        || app_surface_dimensions_valid(width, height) == 0) {
+        app.*.error = "window size exceeds the bounded CPU surface";
+        return -1;
+    }
+    // Window keys are retained public identities. Two live windows may never
+    // share one key, otherwise state restoration and strict automation routing
+    // would silently select whichever matching slot was encountered first.
+    let key_i: i32 = 0;
+    while (key_i < len[Window](app.*.windows)) {
+        if (app.*.windows.data[key_i].open == 1
+            && app.*.windows.data[key_i].key == key) {
+            app.*.error = "window key is already open";
+            return -1;
+        }
+        key_i = key_i + 1;
+    }
+    let window: Window = Window{ .key = key, .title = title, .width = width, .height = height,
+        .backend = app.*.backend.active, .native = app_empty_native_window(), .surface = surface_new(width, height),
+        .wayland_native = app_empty_wayland_window(), .ui = ui_new(width, height), .open = 0, .needs_present = 1 };
+    if (app.*.backend.active == BackendKind.X11) {
+        window.native = x11_open_window(&app.*.x11, width, height);
+        if (window.native.live == 0 || x11_wait_window_ready(&app.*.x11, &window.native, 2000) == 0) {
+            if (window.native.live == 1) { x11_close_window(&app.*.x11, &window.native); }
+            surface_free(&window.surface); ui_free(&window.ui); return -1;
+        }
+        if (x11_set_window_metadata(&app.*.x11, &window.native, title) == 0) {
+            x11_close_window(&app.*.x11, &window.native);
+            surface_free(&window.surface); ui_free(&window.ui); return -1;
+        }
+    } else if (app.*.backend.active == BackendKind.Wayland) {
+        window.wayland_native = wayland_open_window(&app.*.wayland, title, width, height);
+        if (window.wayland_native.live == 0
+            || wayland_wait_window_configure(&app.*.wayland, &window.wayland_native, 2000) == 0) {
+            let native_error: []u8 = app.*.wayland.error;
+            if (window.wayland_native.live == 1) { wayland_close_window(&app.*.wayland, &window.wayland_native); }
+            surface_free(&window.surface); ui_free(&window.ui);
+            if (app.*.wayland.connected == 0) {
+                app_clear_wayland_keyboard_map(app);
+                app.*.backend.connected = 0; app.*.running = 0;
+                app.*.error = native_error;
+            }
+            return -1;
+        }
+        if (surface_dimensions_valid(window.wayland_native.width,
+            window.wayland_native.height) == 0) {
+            let _invalid_native_closed: i32 = wayland_close_window(
+                &app.*.wayland, &window.wayland_native);
+            surface_free(&window.surface); ui_free(&window.ui);
+            app.*.error = "Wayland negotiated dimensions exceed the bounded CPU surface";
+            return -1;
+        }
+        let _pending_keymap_installed: i32 = app_take_pending_wayland_keyboard_map(app);
+        if (window.wayland_native.width != width || window.wayland_native.height != height) {
+            surface_resize(&window.surface, window.wayland_native.width,
+                window.wayland_native.height);
+            if (window.surface.width != window.wayland_native.width
+                || window.surface.height != window.wayland_native.height) {
+                let _failed_resize_closed: i32 = wayland_close_window(
+                    &app.*.wayland, &window.wayland_native);
+                surface_free(&window.surface); ui_free(&window.ui);
+                app.*.error = "Wayland negotiated surface resize was rejected";
+                return -1;
+            }
+            window.width = window.wayland_native.width;
+            window.height = window.wayland_native.height;
+            window.ui.width = window.width; window.ui.height = window.height;
+        }
+    }
+    window.open = 1;
+    push[Window](&app.*.windows, window);
+    return len[Window](app.*.windows) - 1;
+}
+
+pub fn app_window(app: *App, index: i32) *Window {
+    if (index < 0 || index >= len[Window](app.*.windows)) { return null as *Window; }
+    return &app.*.windows.data[index];
+}
+
+fn app_find_native_window(app: *App, window_id: t27) i32 {
+    let i: i32 = 0;
+    while (i < len[Window](app.*.windows)) {
+        let window: Window = get[Window](app.*.windows, i);
+        if (window.open == 1 && window.native.window_id == window_id) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn app_find_wayland_window(app: *App, surface_id: t27) i32 {
+    let i: i32 = 0;
+    while (i < len[Window](app.*.windows)) {
+        let window: Window = get[Window](app.*.windows, i);
+        if (window.open == 1 && window.wayland_native.surface_id == surface_id) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn app_clipboard_window_identity(app: *App, index: i32) *Window {
+    let window: *Window = app_window(app, index);
+    if (window == null as *Window || window.*.open == 0
+        || window.*.backend != app.*.backend.active) {
+        return null as *Window;
+    }
+    return window;
+}
+
+fn app_headless_clipboard_slot(app: *App,
+    kind: ClipboardKind) *ClipboardOwnedText {
+    if (kind == ClipboardKind.Primary) { return &app.*.headless_primary; }
+    return &app.*.headless_clipboard;
+}
+
+fn app_x11_clipboard_kind(kind: ClipboardKind) X11SelectionKind {
+    if (kind == ClipboardKind.Primary) { return X11SelectionKind.Primary; }
+    return X11SelectionKind.Clipboard;
+}
+
+fn app_x11_clipboard_service_timeout() t27 { return 250; }
+
+fn app_clipboard_status_from_x11(status: X11ClipboardStatus) ClipboardStatus {
+    if (status == X11ClipboardStatus.Ok) { return ClipboardStatus.Ok; }
+    if (status == X11ClipboardStatus.InvalidArgument) { return ClipboardStatus.InvalidArgument; }
+    if (status == X11ClipboardStatus.AtomUnavailable) { return ClipboardStatus.AtomUnavailable; }
+    if (status == X11ClipboardStatus.InvalidUtf8) { return ClipboardStatus.InvalidUtf8; }
+    if (status == X11ClipboardStatus.TooLarge) { return ClipboardStatus.TooLarge; }
+    if (status == X11ClipboardStatus.TransportFailed) { return ClipboardStatus.TransportFailed; }
+    if (status == X11ClipboardStatus.OwnershipRejected) { return ClipboardStatus.OwnershipRejected; }
+    if (status == X11ClipboardStatus.NotOwner) { return ClipboardStatus.NotOwner; }
+    if (status == X11ClipboardStatus.UnsupportedTarget) { return ClipboardStatus.UnsupportedTarget; }
+    if (status == X11ClipboardStatus.ConversionRejected) { return ClipboardStatus.ConversionRejected; }
+    if (status == X11ClipboardStatus.NoSelection) { return ClipboardStatus.NoSelection; }
+    if (status == X11ClipboardStatus.PropertyMissing) { return ClipboardStatus.PropertyMissing; }
+    if (status == X11ClipboardStatus.PropertyTypeMismatch) {
+        return ClipboardStatus.PropertyTypeMismatch;
+    }
+    if (status == X11ClipboardStatus.PropertyFormatMismatch) {
+        return ClipboardStatus.PropertyFormatMismatch;
+    }
+    if (status == X11ClipboardStatus.PropertyTruncated) {
+        return ClipboardStatus.PropertyTruncated;
+    }
+    if (status == X11ClipboardStatus.MalformedReply) { return ClipboardStatus.MalformedReply; }
+    if (status == X11ClipboardStatus.Timeout) { return ClipboardStatus.Timeout; }
+    return ClipboardStatus.TransportFailed;
+}
+
+fn app_clipboard_finish_x11_status(app: *App,
+    status: X11ClipboardStatus) ClipboardStatus {
+    let mapped: ClipboardStatus = app_clipboard_status_from_x11(status);
+    if (app.*.x11.authenticated == 0) {
+        app.*.backend.connected = 0;
+        app.*.running = 0;
+        app.*.error = app.*.x11.error;
+    }
+    return mapped;
+}
+
+fn app_clipboard_status_from_wayland(
+    status: WaylandNativeClipboardStatus) ClipboardStatus {
+    if (status == WaylandNativeClipboardStatus.Ok) { return ClipboardStatus.Ok; }
+    if (status == WaylandNativeClipboardStatus.Unsupported) {
+        return ClipboardStatus.Unsupported;
+    }
+    if (status == WaylandNativeClipboardStatus.InvalidArgument) {
+        return ClipboardStatus.InvalidArgument;
+    }
+    if (status == WaylandNativeClipboardStatus.InvalidUtf8) {
+        return ClipboardStatus.InvalidUtf8;
+    }
+    if (status == WaylandNativeClipboardStatus.TooLarge) {
+        return ClipboardStatus.TooLarge;
+    }
+    if (status == WaylandNativeClipboardStatus.ResourceLimit) {
+        return ClipboardStatus.ResourceLimit;
+    }
+    if (status == WaylandNativeClipboardStatus.OwnershipRejected) {
+        return ClipboardStatus.OwnershipRejected;
+    }
+    if (status == WaylandNativeClipboardStatus.NotOwner) {
+        return ClipboardStatus.NotOwner;
+    }
+    if (status == WaylandNativeClipboardStatus.UnsupportedTarget) {
+        return ClipboardStatus.UnsupportedTarget;
+    }
+    if (status == WaylandNativeClipboardStatus.Timeout) {
+        return ClipboardStatus.Timeout;
+    }
+    if (status == WaylandNativeClipboardStatus.NoSelection) {
+        return ClipboardStatus.NoSelection;
+    }
+    if (status == WaylandNativeClipboardStatus.MalformedReply) {
+        return ClipboardStatus.MalformedReply;
+    }
+    return ClipboardStatus.TransportFailed;
+}
+
+fn app_clipboard_finish_wayland_status(app: *App,
+    status: WaylandNativeClipboardStatus) ClipboardStatus {
+    let mapped: ClipboardStatus = app_clipboard_status_from_wayland(status);
+    if (app.*.wayland.connected == 0) {
+        app_clear_wayland_keyboard_map(app);
+        app.*.backend.connected = 0;
+        app.*.running = 0;
+        app.*.error = app.*.wayland.error;
+    }
+    return mapped;
+}
+
+fn app_clipboard_forget_window(app: *App, window_index: i32,
+    window: *Window) void {
+    if (window.*.backend == BackendKind.Headless) {
+        if (app.*.headless_clipboard.valid != 0
+            && app.*.headless_clipboard.owner_window_index == window_index) {
+            clipboard_owned_text_free(&app.*.headless_clipboard);
+        }
+        if (app.*.headless_primary.valid != 0
+            && app.*.headless_primary.owner_window_index == window_index) {
+            clipboard_owned_text_free(&app.*.headless_primary);
+        }
+        return;
+    }
+    if (window.*.backend == BackendKind.Wayland) {
+        let status: WaylandNativeClipboardStatus =
+            wayland_native_clipboard_close_surface_until(&app.*.wayland,
+                window.*.wayland_native.surface_id, linux_monotonic_ms()
+                    + wayland_native_clipboard_service_timeout() as i64);
+        let _mapped: ClipboardStatus =
+            app_clipboard_finish_wayland_status(app, status);
+        return;
+    }
+    if (window.*.backend != BackendKind.X11) { return; }
+    x11_clipboard_forget_window_identity(&app.*.x11,
+        window.*.native.window_id);
+}
+
+pub fn app_clipboard_copy(app: *App, window_index: i32,
+    kind: ClipboardKind, value: []u8, timestamp: t27,
+    timeout_ms: t27) ClipboardStatus {
+    let window: *Window = app_clipboard_window_identity(app, window_index);
+    if (window == null as *Window) { return ClipboardStatus.InvalidWindow; }
+    if (timestamp < 0 || timestamp > 4294967295 || timeout_ms < 0) {
+        return ClipboardStatus.InvalidArgument;
+    }
+    if (window.*.backend == BackendKind.X11
+        && (app.*.x11.authenticated == 0 || app.*.backend.connected == 0)) {
+        return ClipboardStatus.TransportFailed;
+    }
+    if (value.len as t27 > clipboard_max_bytes()) { return ClipboardStatus.TooLarge; }
+    if (utf8_validate(value).valid == 0) { return ClipboardStatus.InvalidUtf8; }
+    if (window.*.backend == BackendKind.Headless) {
+        clipboard_owned_text_store(app_headless_clipboard_slot(app, kind),
+            window_index, value);
+        return ClipboardStatus.Ok;
+    }
+    if (window.*.backend == BackendKind.Wayland) {
+        if (kind == ClipboardKind.Primary) { return ClipboardStatus.Unsupported; }
+        // timestamp is deliberately not a Wayland serial. Native publication
+        // uses only the latest compositor-issued serial tied to this seat and
+        // focused surface; numeric zero remains a valid serial value.
+        let native: WaylandNativeClipboardStatus =
+            wayland_native_clipboard_copy(&app.*.wayland,
+                window.*.wayland_native.surface_id, value, timeout_ms);
+        return app_clipboard_finish_wayland_status(app, native);
+    }
+    if (window.*.backend != BackendKind.X11) { return ClipboardStatus.Unsupported; }
+    let status: X11ClipboardStatus = x11_clipboard_copy(&app.*.x11,
+        window.*.native.window_id, app_x11_clipboard_kind(kind),
+        value, timestamp, timeout_ms);
+    return app_clipboard_finish_x11_status(app, status);
+}
+
+pub fn app_clipboard_read(app: *App, window_index: i32,
+    kind: ClipboardKind, timestamp: t27, timeout_ms: t27,
+    maximum_bytes: t27) ClipboardReadResult {
+    let window: *Window = app_clipboard_window_identity(app, window_index);
+    if (window == null as *Window) { return clipboard_bad_read(ClipboardStatus.InvalidWindow); }
+    if (timestamp < 0 || timestamp > 4294967295
+        || timeout_ms < 0 || maximum_bytes < 1
+        || maximum_bytes > clipboard_max_bytes()) {
+        return clipboard_bad_read(ClipboardStatus.InvalidArgument);
+    }
+    if (window.*.backend == BackendKind.X11
+        && (app.*.x11.authenticated == 0 || app.*.backend.connected == 0)) {
+        return clipboard_bad_read(ClipboardStatus.TransportFailed);
+    }
+    if (window.*.backend == BackendKind.Headless) {
+        let owned: *ClipboardOwnedText = app_headless_clipboard_slot(app, kind);
+        if (owned.*.valid == 0) { return clipboard_bad_read(ClipboardStatus.NoSelection); }
+        let value: []u8 = text_buffer_view(&owned.*.text);
+        if (value.len as t27 > maximum_bytes) {
+            return clipboard_bad_read(ClipboardStatus.TooLarge);
+        }
+        return ClipboardReadResult{ .status = ClipboardStatus.Ok,
+            .text = text_buffer_copy(value), .valid = 1 };
+    }
+    if (window.*.backend == BackendKind.Wayland) {
+        if (kind == ClipboardKind.Primary) {
+            return clipboard_bad_read(ClipboardStatus.Unsupported);
+        }
+        let native: WaylandNativeClipboardReadResult =
+            wayland_native_clipboard_read(&app.*.wayland,
+                window.*.wayland_native.surface_id,
+                timeout_ms, maximum_bytes);
+        let status: ClipboardStatus = app_clipboard_finish_wayland_status(
+            app, native.status);
+        if (native.valid == 0 || status != ClipboardStatus.Ok) {
+            let native_was_valid: i32 = native.valid;
+            wayland_native_clipboard_read_result_free(&native);
+            if (status == ClipboardStatus.Ok || native_was_valid != 0) {
+                return clipboard_bad_read(ClipboardStatus.MalformedReply);
+            }
+            return clipboard_bad_read(status);
+        }
+        let result: ClipboardReadResult = ClipboardReadResult{
+            .status = ClipboardStatus.Ok,
+            .text = text_buffer_take(&native.bytes), .valid = 1 };
+        wayland_native_clipboard_read_result_free(&native);
+        return result;
+    }
+    if (window.*.backend != BackendKind.X11) {
+        return clipboard_bad_read(ClipboardStatus.Unsupported);
+    }
+    let native: X11ClipboardReadResult = x11_clipboard_read(&app.*.x11,
+        window.*.native.window_id, app_x11_clipboard_kind(kind),
+        timestamp, timeout_ms, maximum_bytes);
+    let status: ClipboardStatus = app_clipboard_finish_x11_status(app, native.status);
+    if (native.valid == 0 || status != ClipboardStatus.Ok) {
+        let native_was_valid: i32 = native.valid;
+        x11_clipboard_read_result_free(&native);
+        if (status == ClipboardStatus.Ok) {
+            return clipboard_bad_read(ClipboardStatus.MalformedReply);
+        }
+        if (native_was_valid != 0) {
+            return clipboard_bad_read(ClipboardStatus.MalformedReply);
+        }
+        return clipboard_bad_read(status);
+    }
+    let result: ClipboardReadResult = ClipboardReadResult{
+        .status = status, .text = native.text, .valid = 1 };
+    native.text = text_buffer_empty();
+    x11_clipboard_read_result_free(&native);
+    return result;
+}
+
+pub fn app_clipboard_release(app: *App, window_index: i32,
+    kind: ClipboardKind, timestamp: t27, timeout_ms: t27) ClipboardStatus {
+    let window: *Window = app_clipboard_window_identity(app, window_index);
+    if (window == null as *Window) { return ClipboardStatus.InvalidWindow; }
+    if (timestamp < 0 || timestamp > 4294967295 || timeout_ms < 0) {
+        return ClipboardStatus.InvalidArgument;
+    }
+    if (window.*.backend == BackendKind.X11
+        && (app.*.x11.authenticated == 0 || app.*.backend.connected == 0)) {
+        return ClipboardStatus.TransportFailed;
+    }
+    if (window.*.backend == BackendKind.Headless) {
+        let owned: *ClipboardOwnedText = app_headless_clipboard_slot(app, kind);
+        if (owned.*.valid == 0 || owned.*.owner_window_index != window_index) {
+            return ClipboardStatus.NotOwner;
+        }
+        clipboard_owned_text_free(owned);
+        return ClipboardStatus.Ok;
+    }
+    if (window.*.backend == BackendKind.Wayland) {
+        if (kind == ClipboardKind.Primary) { return ClipboardStatus.Unsupported; }
+        let native: WaylandNativeClipboardStatus =
+            wayland_native_clipboard_release(&app.*.wayland,
+                window.*.wayland_native.surface_id, timeout_ms);
+        return app_clipboard_finish_wayland_status(app, native);
+    }
+    if (window.*.backend != BackendKind.X11) { return ClipboardStatus.Unsupported; }
+    let owned: *X11OwnedSelection = &app.*.x11.clipboard_selection;
+    if (kind == ClipboardKind.Primary) { owned = &app.*.x11.primary_selection; }
+    if (owned.*.valid == 0
+        || owned.*.owner_window != window.*.native.window_id) {
+        return ClipboardStatus.NotOwner;
+    }
+    let status: X11ClipboardStatus = x11_clipboard_release(&app.*.x11,
+        app_x11_clipboard_kind(kind), timestamp, timeout_ms);
+    return app_clipboard_finish_x11_status(app, status);
+}
+
+pub fn app_clipboard_copy_selection(app: *App, window_index: i32,
+    kind: ClipboardKind, timestamp: t27, timeout_ms: t27) ClipboardStatus {
+    let window: *Window = app_clipboard_window_identity(app, window_index);
+    if (window == null as *Window) { return ClipboardStatus.InvalidWindow; }
+    if (timestamp < 0 || timestamp > 4294967295 || timeout_ms < 0) {
+        return ClipboardStatus.InvalidArgument;
+    }
+    if (window.*.backend == BackendKind.Wayland
+        && kind == ClipboardKind.Primary) { return ClipboardStatus.Unsupported; }
+    if (window.*.backend == BackendKind.X11
+        && (app.*.x11.authenticated == 0 || app.*.backend.connected == 0)) {
+        return ClipboardStatus.TransportFailed;
+    }
+    if (window.*.backend != BackendKind.Headless
+        && window.*.backend != BackendKind.X11
+        && window.*.backend != BackendKind.Wayland) {
+        return ClipboardStatus.Unsupported;
+    }
+    let node_id: i32 = window.*.ui.focused_node;
+    if (node_id < 0 || node_id >= len[Node](window.*.ui.nodes)) {
+        return ClipboardStatus.NoFocusedTextField;
+    }
+    let node: Node = get[Node](window.*.ui.nodes, node_id);
+    if (node.live == 0 || node.kind != NodeKind.TextField
+        || node.semantics.role != Role.TextField
+        || node.style.enabled == 0) {
+        return ClipboardStatus.NoFocusedTextField;
+    }
+    if (text_node_storage_valid(&node) == 0) {
+        return ClipboardStatus.EditRejected;
+    }
+    let start_byte: t27 = 0;
+    let end_byte: t27 = 0;
+    if (ui_selected_text_byte_range(&window.*.ui, node_id,
+        &start_byte, &end_byte) == 0 || end_byte < start_byte) {
+        return ClipboardStatus.EditRejected;
+    }
+    if (start_byte == end_byte) {
+        return ClipboardStatus.NoSelection;
+    }
+    if (end_byte - start_byte > clipboard_max_bytes()) {
+        return ClipboardStatus.TooLarge;
+    }
+    let selected: TextBuffer = ui_copy_selected_text(&window.*.ui, node_id);
+    let status: ClipboardStatus = app_clipboard_copy(app, window_index, kind,
+        text_buffer_view(&selected), timestamp, timeout_ms);
+    text_buffer_free(&selected);
+    return status;
+}
+
+pub fn app_clipboard_paste_focused_text_field(app: *App,
+    window_index: i32, kind: ClipboardKind, timestamp: t27,
+    timeout_ms: t27) ClipboardStatus {
+    let window: *Window = app_clipboard_window_identity(app, window_index);
+    if (window == null as *Window) { return ClipboardStatus.InvalidWindow; }
+    if (timestamp < 0 || timestamp > 4294967295 || timeout_ms < 0) {
+        return ClipboardStatus.InvalidArgument;
+    }
+    if (window.*.backend == BackendKind.Wayland
+        && kind == ClipboardKind.Primary) { return ClipboardStatus.Unsupported; }
+    if (window.*.backend == BackendKind.X11
+        && (app.*.x11.authenticated == 0 || app.*.backend.connected == 0)) {
+        return ClipboardStatus.TransportFailed;
+    }
+    if (window.*.backend != BackendKind.Headless
+        && window.*.backend != BackendKind.X11
+        && window.*.backend != BackendKind.Wayland) {
+        return ClipboardStatus.Unsupported;
+    }
+    let node_id: i32 = window.*.ui.focused_node;
+    if (node_id < 0 || node_id >= len[Node](window.*.ui.nodes)) {
+        return ClipboardStatus.NoFocusedTextField;
+    }
+    let node: Node = get[Node](window.*.ui.nodes, node_id);
+    if (node.live == 0 || node.kind != NodeKind.TextField
+        || node.semantics.role != Role.TextField
+        || node.style.enabled == 0) {
+        return ClipboardStatus.NoFocusedTextField;
+    }
+    if (text_node_storage_valid(&node) == 0) {
+        return ClipboardStatus.EditRejected;
+    }
+    let result: ClipboardReadResult = app_clipboard_read(app, window_index,
+        kind, timestamp, timeout_ms, clipboard_max_bytes());
+    if (result.valid == 0) {
+        let status: ClipboardStatus = result.status;
+        clipboard_read_result_free(&result);
+        return status;
+    }
+    let edited: i32 = ui_replace_text_selection(&window.*.ui,
+        node_id, text_buffer_view(&result.text));
+    clipboard_read_result_free(&result);
+    if (edited == 0) { return ClipboardStatus.EditRejected; }
+    window.*.needs_present = 1;
+    return ClipboardStatus.Ok;
+}
+
+fn app_dispatch_wayland_pointer(app: *App, pointer: WaylandPointerEvent) i32 {
+    if (pointer.valid == 0) { return 0; }
+    let index: i32 = app_find_wayland_window(app, pointer.surface_id);
+    if (index < 0) { return 0; }
+    let window: *Window = app_window(app, index);
+    let event: Event = Event{ .kind = EventKind.Hover, .x = pointer.x, .y = pointer.y,
+        .key = Key.Unknown, .modifiers = key_modifiers_none(), .detail = 0, .text = "" };
+    if (pointer.kind == WaylandPointerEventKind.Leave) {
+        event.x = 0 - 1; event.y = 0 - 1;
+        // A leave while dragging must cancel the retained pressed node without
+        // synthesizing a click at the old surface position.
+        let cancel: Event = Event{ .kind = EventKind.PointerUp, .x = event.x,
+            .y = event.y, .key = Key.Unknown, .modifiers = key_modifiers_none(),
+            .detail = 272, .text = "" };
+        let _cancelled: i32 = ui_dispatch(&window.*.ui, cancel);
+    } else if (pointer.kind == WaylandPointerEventKind.Button) {
+        // Linux BTN_LEFT is the only wl_pointer button promoted to the
+        // toolkit's primary activation gesture in this v1 input slice.
+        if (pointer.button != 272) { return 1; }
+        if (pointer.button_state == 1) { event.kind = EventKind.PointerDown; }
+        else { event.kind = EventKind.PointerUp; }
+        event.detail = pointer.button;
+    } else if (pointer.kind == WaylandPointerEventKind.Axis) {
+        // wl_pointer axis 0 is vertical scroll. Horizontal and later-version
+        // source/discrete events remain protocol-level no-ops for now.
+        if (pointer.axis != 0) { return 1; }
+        event.kind = EventKind.Scroll; event.detail = pointer.axis_value;
+    } else if (pointer.kind != WaylandPointerEventKind.Enter
+        && pointer.kind != WaylandPointerEventKind.Motion) { return 0; }
+    let _dispatched: i32 = ui_dispatch(&window.*.ui, event);
+    window.*.needs_present = 1;
+    return 1;
+}
+
+fn app_clear_wayland_keyboard_map(app: *App) void {
+    keyboard_map_free(&app.*.wayland_keyboard_map);
+    app.*.wayland_keyboard_map = app_empty_keyboard_map();
+}
+
+// Takes and frees request through the native exact-write path. Any incomplete
+// stream request is terminal because continuing would append after a prefix.
+fn app_send_wayland_request(app: *App, request: *WireBuffer) i32 {
+    let sent: i32 = wayland_native_send_request(&app.*.wayland, request, 1);
+    if (sent == 0) {
+        app_clear_wayland_keyboard_map(app);
+        app.*.backend.connected = 0;
+        app.*.error = app.*.wayland.error;
+        app.*.running = 0;
+    }
+    return sent;
+}
+
+// Consumes translation.text. A semantic Press is always offered to the
+// retained UI before its separately owned printable Input payload.
+fn app_dispatch_keyboard_translation(window: *Window,
+    translation: *KeyboardTranslation) i32 {
+    if (translation.*.valid == 0) {
+        keyboard_translation_free(translation);
+        return 0;
+    }
+    let press: Event = event_new(EventKind.Press, 0, 0);
+    press.key = translation.*.symbol.key;
+    press.modifiers = translation.*.modifiers;
+    press.detail = translation.*.raw.code;
+    let press_handled: i32 = ui_dispatch(&window.*.ui, press);
+    let input_handled: i32 = 0;
+    if (translation.*.text.bytes.len > 0) {
+        let input: Event = event_new(EventKind.Input, 0, 0);
+        input.key = translation.*.symbol.key;
+        input.modifiers = translation.*.modifiers;
+        input.detail = translation.*.raw.code;
+        input.text = text_buffer_view(&translation.*.text);
+        input_handled = ui_dispatch(&window.*.ui, input);
+    }
+    if (press_handled == 1 || input_handled == 1) { window.*.needs_present = 1; }
+    keyboard_translation_free(translation);
+    return 1;
+}
+
+fn app_x11_modifiers(state: t27) AppKeyboardModifiers {
+    let result: AppKeyboardModifiers = AppKeyboardModifiers{
+        .value = key_modifiers_none(), .valid = 0 };
+    if (state < 0 || state > 65535) { return result; }
+    // Lock and Mod1-Mod5 do not carry semantic roles in the core protocol.
+    // Button masks are orthogonal and may remain present in the same field.
+    if (((state / 2) % 2) != 0 || ((state / 8) % 2) != 0
+        || ((state / 16) % 2) != 0 || ((state / 32) % 2) != 0
+        || ((state / 64) % 2) != 0 || ((state / 128) % 2) != 0) { return result; }
+    result.value.shift = x11_state_shift(state);
+    result.value.control = x11_state_control(state);
+    result.valid = 1;
+    return result;
+}
+
+fn app_dispatch_x11_keyboard(app: *App, window: *Window,
+    native_event: X11Event) i32 {
+    if (native_event.kind == X11EventKind.KeyUp) { return 1; }
+    if (native_event.kind != X11EventKind.KeyDown) { return 0; }
+    let modifiers: AppKeyboardModifiers = app_x11_modifiers(native_event.state);
+    if (modifiers.valid == 0) { return 1; }
+    let column: t27 = modifiers.value.shift as t27;
+    let lookup: X11KeysymLookup = x11_connection_keysym(&app.*.x11,
+        native_event.detail, column);
+    if (lookup.valid == 0 || lookup.generation != app.*.x11.keyboard_mapping.generation) { return 0; }
+    let symbol: KeyboardSymbol = keyboard_symbol_from_x11(lookup.keysym);
+    if (symbol.valid == 0) { return 0; }
+    let raw: KeyboardRawKey = KeyboardRawKey{ .code = native_event.detail, .state = 1,
+        .serial = native_event.sequence, .time = native_event.time };
+    let translation: KeyboardTranslation = keyboard_translate_symbol(raw, symbol, modifiers.value);
+    return app_dispatch_keyboard_translation(window, &translation);
+}
+
+// X11 core buttons are wire identities, not toolkit gestures. Only Button1
+// becomes the primary retained press. Core wheel buttons are discrete vertical
+// detents on press; releases and every other button remain protocol no-ops.
+fn app_dispatch_x11_pointer(window: *Window, native_event: X11Event) i32 {
+    let event: Event = event_new(EventKind.Hover, native_event.x, native_event.y);
+    event.detail = native_event.detail;
+    if (native_event.kind == X11EventKind.Leave) {
+        // X11's implicit grab can be interrupted by a leave or destroyed
+        // routing context. Clear retained capture outside all node bounds so a
+        // later release can never synthesize an activation at the old point.
+        if (window.*.ui.pressed_node >= 0) {
+            let cancel: Event = event_new(EventKind.PointerUp, 0 - 1, 0 - 1);
+            cancel.detail = 1;
+            let _cancelled: i32 = ui_dispatch(&window.*.ui, cancel);
+        }
+        event.x = 0 - 1; event.y = 0 - 1;
+    } else if (native_event.kind == X11EventKind.PointerDown) {
+        if (native_event.detail == 1) {
+            event.kind = EventKind.PointerDown;
+        } else if (native_event.detail == 4 || native_event.detail == 5) {
+            event.kind = EventKind.Scroll;
+            if (native_event.detail == 4) { event.detail = 0 - 9; }
+            else { event.detail = 9; }
+        } else { return 1; }
+    } else if (native_event.kind == X11EventKind.PointerUp) {
+        if (native_event.detail != 1) { return 1; }
+        event.kind = EventKind.PointerUp;
+    } else if (native_event.kind != X11EventKind.Enter
+        && native_event.kind != X11EventKind.PointerMove) { return 0; }
+    let _dispatched: i32 = ui_dispatch(&window.*.ui, event);
+    window.*.needs_present = 1;
+    return 1;
+}
+
+fn app_install_wayland_keyboard_map(app: *App, event: *WaylandKeyboardEvent) i32 {
+    let input_len: i32 = len[u8](event.*.keymap_bytes);
+    if (event.*.keymap_format == 0 && event.*.keymap_size == 0 && input_len == 0) {
+        // wl_keyboard format 0 explicitly withdraws keymap authority. Flashy
+        // does not guess a layout or interpret raw evdev codes as text.
+        app_clear_wayland_keyboard_map(app);
+        app.*.error = "";
+        return 1;
+    }
+    if (event.*.keymap_format != wayland_keyboard_keymap_format_xkb_v1()
+        || event.*.keymap_size != input_len as t27) {
+        app_clear_wayland_keyboard_map(app);
+        app.*.error = "Wayland keymap metadata does not match owned bytes";
+        return 0;
+    }
+    if (input_len < 1 || event.*.keymap_bytes.data[input_len - 1] as t27 != 0) {
+        app_clear_wayland_keyboard_map(app);
+        app.*.error = "Wayland XKB-v1 keymap is missing its terminal NUL";
+        return 0;
+    }
+    // Strip exactly one required terminator. Embedded or repeated NUL bytes
+    // remain parser-visible and therefore fail the bounded grammar.
+    let parse_len: i32 = input_len - 1;
+    let parsed: KeyboardMap = keyboard_map_parse_xkb_subset(
+        event.*.keymap_bytes.data[0..parse_len], 256);
+    keyboard_map_free(&app.*.wayland_keyboard_map);
+    app.*.wayland_keyboard_map = parsed;
+    if (parsed.valid == 0) {
+        app.*.error = "Wayland keymap is outside the bounded XKB subset";
+        return 0;
+    }
+    app.*.error = "";
+    return 1;
+}
+
+fn app_apply_wayland_keyboard_authority(app: *App,
+    authority: *WaylandKeyboardAuthorityUpdate) i32 {
+    if (authority.*.valid == 0) { return 1; }
+    let handled: i32 = 0;
+    if (authority.*.kind == WaylandKeyboardAuthorityKind.Map) {
+        let pending: WaylandKeyboardEvent = wayland_empty_keyboard_event();
+        pending.kind = WaylandKeyboardEventKind.Keymap;
+        pending.keymap_format = authority.*.keymap_format;
+        pending.keymap_size = authority.*.keymap_size;
+        pending.keymap_bytes = authority.*.keymap_bytes;
+        pending.valid = 1;
+        authority.*.keymap_bytes = ArrayList[u8]{
+            .data = null as *u8, .len = 0, .cap = 0 };
+        handled = app_install_wayland_keyboard_map(app, &pending);
+        wayland_keyboard_event_free(&pending);
+    } else if (authority.*.kind == WaylandKeyboardAuthorityKind.Withdrawn) {
+        app_clear_wayland_keyboard_map(app);
+        app.*.error = "";
+        handled = 1;
+    } else if (authority.*.kind == WaylandKeyboardAuthorityKind.Rejected) {
+        app_clear_wayland_keyboard_map(app);
+        app.*.error = "Wayland keymap authority was rejected";
+    }
+    return handled;
+}
+
+fn app_take_pending_wayland_keyboard_map(app: *App) i32 {
+    let authority: WaylandKeyboardAuthorityUpdate =
+        wayland_connection_take_keyboard_authority(&app.*.wayland);
+    if (authority.valid == 0) { return 1; }
+    let handled: i32 = app_apply_wayland_keyboard_authority(app, &authority);
+    wayland_keyboard_authority_update_free(&authority);
+    return handled;
+}
+
+fn app_wayland_xkb_code(raw_code: t27) t27 {
+    // wl_keyboard uses evdev codes. XKB keycode declarations use the protocol-
+    // specified evdev + 8 domain; reject overflow instead of wrapping.
+    if (raw_code < 0 || raw_code > 65527) { return -1; }
+    return raw_code + 8;
+}
+
+fn app_surface_dimensions_valid(width: t27, height: t27) i32 {
+    return surface_dimensions_valid(width, height);
+}
+
+fn app_clear_wayland_surface_focus(app: *App, surface_id: t27) void {
+    if (surface_id == 0) { return; }
+    if (app.*.wayland.pointer_focus_surface == surface_id) {
+        app.*.wayland.pointer_focus_surface = 0;
+        app.*.wayland.pointer_x = 0; app.*.wayland.pointer_y = 0;
+    }
+    if (app.*.wayland.keyboard_focus_surface == surface_id) {
+        app.*.wayland.keyboard_focus_surface = 0;
+        app.*.wayland.keyboard_serial = 0; app.*.wayland.keyboard_time = 0;
+        app.*.wayland.keyboard_key = 0; app.*.wayland.keyboard_key_state = 0;
+        app.*.wayland.keyboard_mods_depressed = 0;
+        app.*.wayland.keyboard_mods_latched = 0;
+        app.*.wayland.keyboard_mods_locked = 0; app.*.wayland.keyboard_group = 0;
+        app.*.wayland.keyboard_pressed_keys.len = 0;
+    }
+}
+
+fn app_wayland_modifiers(app: *App) AppKeyboardModifiers {
+    let result: AppKeyboardModifiers = AppKeyboardModifiers{
+        .value = key_modifiers_none(), .valid = 0 };
+    if (app.*.wayland_keyboard_map.valid == 0 || app.*.wayland.keyboard_group != 0
+        || app.*.wayland.keyboard_mods_latched != 0
+        || app.*.wayland.keyboard_mods_locked != 0) { return result; }
+    let modifier_count: t27 = 0;
+    let i: i32 = 0;
+    while (i < len[t27](app.*.wayland.keyboard_pressed_keys)) {
+        let xkb_code: t27 = app_wayland_xkb_code(
+            get[t27](app.*.wayland.keyboard_pressed_keys, i));
+        if (xkb_code < 0) { return result; }
+        let binding: KeyboardBinding = keyboard_map_lookup(&app.*.wayland_keyboard_map, xkb_code);
+        if (binding.base.valid == 0) { return result; }
+        if (binding.modifier == KeyboardModifier.Shift) {
+            result.value.shift = 1; modifier_count = modifier_count + 1;
+        } else if (binding.modifier == KeyboardModifier.Control) {
+            result.value.control = 1; modifier_count = modifier_count + 1;
+        } else if (binding.modifier == KeyboardModifier.Alt) {
+            result.value.alt = 1; modifier_count = modifier_count + 1;
+        } else if (binding.modifier == KeyboardModifier.Meta) {
+            result.value.meta = 1; modifier_count = modifier_count + 1;
+        } else if (binding.modifier == KeyboardModifier.CapsLock
+            || binding.modifier == KeyboardModifier.NumLock) { return result; }
+        i = i + 1;
+    }
+    // A compositor modifier mask with no matching pressed semantic modifier is
+    // not enough authority to name a role in this bounded parser slice.
+    if (app.*.wayland.keyboard_mods_depressed != 0 && modifier_count == 0) { return result; }
+    result.valid = 1;
+    return result;
+}
+
+fn app_dispatch_wayland_keyboard(app: *App, event: *WaylandKeyboardEvent) i32 {
+    if (event.*.valid == 0) { return 0; }
+    if (event.*.kind == WaylandKeyboardEventKind.Keymap) {
+        return app_install_wayland_keyboard_map(app, event);
+    }
+    if (event.*.kind == WaylandKeyboardEventKind.Enter) {
+        if (event.*.surface_id == 0
+            || app_find_wayland_window(app, event.*.surface_id) < 0) { return 0; }
+        return 1;
+    }
+    if (event.*.kind == WaylandKeyboardEventKind.Leave
+        || event.*.kind == WaylandKeyboardEventKind.Modifiers) { return 1; }
+    if (event.*.kind != WaylandKeyboardEventKind.Key) { return 0; }
+    if (event.*.key_state == 0) { return 1; }
+    if (event.*.key_state != 1 || event.*.surface_id == 0) { return 0; }
+    let index: i32 = app_find_wayland_window(app, event.*.surface_id);
+    if (index < 0) { return 0; }
+    let modifiers: AppKeyboardModifiers = app_wayland_modifiers(app);
+    if (modifiers.valid == 0) { return 0; }
+    let xkb_code: t27 = app_wayland_xkb_code(event.*.key);
+    if (xkb_code < 0) { return 0; }
+    let binding: KeyboardBinding = keyboard_map_lookup(&app.*.wayland_keyboard_map, xkb_code);
+    if (binding.base.valid == 0) { return 0; }
+    let symbol: KeyboardSymbol = binding.base;
+    if (modifiers.value.shift != 0) { symbol = binding.shifted; }
+    let raw: KeyboardRawKey = KeyboardRawKey{ .code = event.*.key, .state = 1,
+        .serial = event.*.serial, .time = event.*.time };
+    let translation: KeyboardTranslation = keyboard_translate_symbol(raw, symbol, modifiers.value);
+    let window: *Window = app_window(app, index);
+    return app_dispatch_keyboard_translation(window, &translation);
+}
+
+pub fn app_present_window(app: *App, index: i32, full: i32) i32 {
+    let window: *Window = app_window(app, index);
+    if (window == null as *Window || window.*.open == 0) { return 0; }
+    let painted: t27 = ui_render(&window.*.ui, &window.*.surface, full);
+    if (painted == 0 && full == 0 && window.*.needs_present == 0) { return 0; }
+    if (window.*.backend == BackendKind.X11) {
+        let result: X11PresentResult = x11_present_surface(&app.*.x11, &window.*.native, &window.*.surface);
+        if (result.ok == 0) { app.*.error = result.error; return 0; }
+    } else if (window.*.backend == BackendKind.Wayland) {
+        // Buffer releases and input share the Wayland display stream. They are
+        // consumed by app_poll so presentation never steals a pointer frame.
+        if (window.*.wayland_native.buffer_busy == 1) { return 0; }
+        let result: WaylandPresentResult = wayland_present_surface(&app.*.wayland,
+            &window.*.wayland_native, &window.*.surface);
+        if (result.ok == 0) {
+            if (app.*.wayland.connected == 0) {
+                app_clear_wayland_keyboard_map(app);
+                app.*.backend.connected = 0;
+                app.*.running = 0;
+            }
+            app.*.error = result.error;
+            return 0;
+        }
+    }
+    window.*.needs_present = 0;
+    return 1;
+}
+
+pub fn app_poll(app: *App, timeout_ms: t27) i32 {
+    if (app.*.running == 0) { return 0; }
+    if (app.*.backend.active == BackendKind.Wayland) {
+        // Synchronous configure/buffer waits retain every deferred frame and
+        // keyboard-authority transition in one owned FIFO. Consume it before
+        // the socket so native waits cannot reorder a keymap around key input.
+        let pending_event: WaylandNativePendingEvent =
+            wayland_connection_take_pending_event(&app.*.wayland);
+        if (pending_event.valid == 1
+            && pending_event.kind == WaylandNativePendingKind.KeyboardAuthority) {
+            let handled_authority: i32 = app_apply_wayland_keyboard_authority(
+                app, &pending_event.authority);
+            wayland_native_pending_event_free(&pending_event);
+            return handled_authority;
+        }
+        if (pending_event.valid == 1
+            && pending_event.kind == WaylandNativePendingKind.Clipboard) {
+            let applied_clipboard: i32 =
+                wayland_native_clipboard_apply_transition(
+                    &app.*.wayland, &pending_event.clipboard);
+            wayland_native_pending_event_free(&pending_event);
+            return applied_clipboard;
+        }
+        let received: WaylandNativeFrameReceive = WaylandNativeFrameReceive{
+            .input = wire_new(1), .received_fd = 0 - 1, .has_fd = 0,
+            .fd_count = 0, .closed_fd_count = 0, .last_closed_fd = 0 - 1,
+            .cloexec_applied = 0, .ancillary_valid = 1,
+            .keyboard_authority_cleared = 0, .stream_terminal = 0,
+            .stream_close_error = 0, .valid = 0 };
+        if (pending_event.valid == 1
+            && pending_event.kind == WaylandNativePendingKind.Frame) {
+            wire_free(&received.input);
+            received.input = pending_event.input;
+            pending_event.input.bytes = ArrayList[u8]{
+                .data = null as *u8, .len = 0, .cap = 0 };
+            pending_event.input.error = 0;
+            received.valid = 1;
+            wayland_native_pending_event_free(&pending_event);
+        } else {
+            wayland_native_pending_event_free(&pending_event);
+            if (app_take_pending_wayland_keyboard_map(app) == 0) {
+                wayland_native_frame_free(&received); return 0;
+            }
+            if (wayland_native_clipboard_service_pending_destroy(
+                &app.*.wayland) == 0) {
+                if (app.*.wayland.connected == 0) {
+                    app_clear_wayland_keyboard_map(app);
+                    app.*.backend.connected = 0; app.*.running = 0;
+                    app.*.error = app.*.wayland.error;
+                }
+                wayland_native_frame_free(&received); return 0;
+            }
+            wayland_native_frame_free(&received);
+            received = wayland_connection_receive_frame(
+                &app.*.wayland, timeout_ms);
+        }
+        // A partial or malformed declared frame is terminal. Accepting the
+        // result closes and synchronizes connection state before any return so
+        // descriptor-number reuse cannot target an unrelated resource.
+        if (wayland_connection_accept_frame_receive(&app.*.wayland, &received) == 0) {
+            app_clear_wayland_keyboard_map(app);
+            app.*.backend.connected = 0;
+            app.*.error = app.*.wayland.error;
+            app.*.running = 0;
+            wayland_native_frame_free(&received);
+            return 0;
+        }
+        let input: *WireBuffer = &received.input;
+        let frame: WaylandFrame = wayland_decode(input, 0);
+        let clipboard_routed: i32 =
+            wayland_native_clipboard_route_received(
+                &app.*.wayland, input, &received);
+        if (clipboard_routed >= 0) {
+            wayland_native_frame_free(&received);
+            if (clipboard_routed == 0 || app.*.wayland.connected == 0) {
+                app_clear_wayland_keyboard_map(app);
+                app.*.backend.connected = 0; app.*.running = 0;
+                app.*.error = app.*.wayland.error;
+                return 0;
+            }
+            return 1;
+        }
+        // Fully consumed frames with invalid ancillary data remain inspectable.
+        // A recognizable keymap replacement still revokes the previous map.
+        if (received.ancillary_valid == 0) {
+            if (frame.valid == 1 && app.*.wayland.keyboard_id != 0
+                && frame.object_id == app.*.wayland.keyboard_id && frame.opcode == 0) {
+                app_clear_wayland_keyboard_map(app);
+                let _rejection_consumed: i32 = app_take_pending_wayland_keyboard_map(app);
+                app.*.error = "Wayland keymap ancillary descriptor was rejected";
+            }
+            wayland_native_frame_free(&received);
+            return 0;
+        }
+        if (received.valid == 0 || input.*.error != 0) {
+            wayland_native_frame_free(&received); return 0;
+        }
+        if (frame.valid == 0) { wayland_native_frame_free(&received); return 0; }
+        if (received.received_fd >= 0
+            && (app.*.wayland.keyboard_id == 0 || frame.object_id != app.*.wayland.keyboard_id)) {
+            wayland_native_frame_free(&received); return 0;
+        }
+        if (frame.object_id == app.*.wayland.wm_base_id && frame.opcode == 0 && frame.size == 12) {
+            let serial: t27 = wire_read_u32_le(input, frame.payload_offset);
+            let pong: WireBuffer = wayland_u32_request(app.*.wayland.wm_base_id, 3, serial);
+            let sent: i32 = app_send_wayland_request(app, &pong);
+            wayland_native_frame_free(&received); return sent;
+        }
+        if (app.*.wayland.seat_id != 0 && frame.object_id == app.*.wayland.seat_id) {
+            let prior_surface: t27 = app.*.wayland.pointer_focus_surface;
+            let prior_x: t27 = app.*.wayland.pointer_x;
+            let prior_y: t27 = app.*.wayland.pointer_y;
+            let had_pointer: i32 = app.*.wayland.seat_has_pointer;
+            let had_keyboard: i32 = app.*.wayland.seat_has_keyboard;
+            let handled: i32 = wayland_process_seat_frame(&app.*.wayland, input, frame);
+            wayland_native_frame_free(&received);
+            if (app.*.wayland.connected == 0) {
+                app_clear_wayland_keyboard_map(app);
+                app.*.backend.connected = 0;
+                app.*.error = app.*.wayland.error;
+                app.*.running = 0;
+                return 0;
+            }
+            if (handled == 1 && had_pointer == 1 && app.*.wayland.seat_has_pointer == 0
+                && prior_surface != 0) {
+                let lost: WaylandPointerEvent = wayland_empty_pointer_event();
+                lost.kind = WaylandPointerEventKind.Leave; lost.surface_id = prior_surface;
+                lost.x = prior_x; lost.y = prior_y; lost.valid = 1;
+                let _cleared: i32 = app_dispatch_wayland_pointer(app, lost);
+            }
+            if (handled == 1 && had_keyboard == 1 && app.*.wayland.seat_has_keyboard == 0) {
+                app_clear_wayland_keyboard_map(app);
+                let _withdrawal_consumed: i32 = app_take_pending_wayland_keyboard_map(app);
+            }
+            return handled;
+        }
+        if (app.*.wayland.pointer_id != 0 && frame.object_id == app.*.wayland.pointer_id) {
+            if (frame.opcode == 0) {
+                let preview: WaylandPointerEvent = wayland_decode_pointer_event(
+                    input, frame, app.*.wayland.pointer_id);
+                if (preview.valid == 0 || app_find_wayland_window(app, preview.surface_id) < 0) {
+                    wayland_native_frame_free(&received);
+                    return 0;
+                }
+            }
+            let pointer: WaylandPointerEvent = wayland_process_pointer_frame(&app.*.wayland, input, frame);
+            wayland_native_frame_free(&received); return app_dispatch_wayland_pointer(app, pointer);
+        }
+        if (app.*.wayland.keyboard_id != 0 && frame.object_id == app.*.wayland.keyboard_id) {
+            if (frame.opcode == 1) {
+                let preview: WaylandKeyboardEvent = wayland_decode_keyboard_event(
+                    input, frame, app.*.wayland.keyboard_id);
+                let owned_surface: i32 = preview.valid == 1
+                    && app_find_wayland_window(app, preview.surface_id) >= 0;
+                wayland_keyboard_event_free(&preview);
+                if (owned_surface == 0) {
+                    wayland_native_frame_free(&received);
+                    return 0;
+                }
+            }
+            let transferred_fd: i64 = received.received_fd;
+            received.received_fd = 0 - 1; received.has_fd = 0;
+            let keyboard: WaylandKeyboardEvent = wayland_process_keyboard_frame(
+                &app.*.wayland, input, frame, transferred_fd);
+            let clipboard_observed: i32 =
+                wayland_native_clipboard_observe_keyboard_event(
+                    &app.*.wayland, &keyboard);
+            if (clipboard_observed == 0 && app.*.wayland.connected == 0) {
+                app_clear_wayland_keyboard_map(app);
+                app.*.backend.connected = 0; app.*.running = 0;
+                app.*.error = app.*.wayland.error;
+                wayland_keyboard_event_free(&keyboard);
+                wayland_native_frame_free(&received);
+                return 0;
+            }
+            let handled: i32 = app_dispatch_wayland_keyboard(app, &keyboard);
+            if (keyboard.valid == 0 && frame.opcode == 0) {
+                app_clear_wayland_keyboard_map(app);
+                let _rejection_consumed: i32 = app_take_pending_wayland_keyboard_map(app);
+                app.*.error = "Wayland keymap frame was rejected";
+            }
+            wayland_keyboard_event_free(&keyboard);
+            wayland_native_frame_free(&received);
+            return handled;
+        }
+        let wayland_i: i32 = 0;
+        while (wayland_i < len[Window](app.*.windows)) {
+            let window: *Window = app_window(app, wayland_i);
+            if (window.*.open == 1 && frame.object_id == window.*.wayland_native.buffer_id
+                && frame.opcode == 0 && frame.size == 8) {
+                window.*.wayland_native.buffer_busy = 0; wayland_native_frame_free(&received); return 1;
+            }
+            if (window.*.open == 1 && frame.object_id == window.*.wayland_native.xdg_surface_id
+                && frame.opcode == 0 && frame.size == 12) {
+                let serial: t27 = wire_read_u32_le(input, frame.payload_offset);
+                let ack: WireBuffer = wayland_u32_request(window.*.wayland_native.xdg_surface_id, 4, serial);
+                let sent: i32 = app_send_wayland_request(app, &ack);
+                if (sent == 1) { window.*.wayland_native.configured = 1; }
+                wayland_native_frame_free(&received); return sent;
+            }
+            if (window.*.open == 1 && frame.object_id == window.*.wayland_native.toplevel_id
+                && wayland_native_toplevel_configure_valid(input, frame,
+                    window.*.wayland_native.toplevel_id,
+                    window.*.width, window.*.height) == 1) {
+                let proposed_width: t27 = wire_read_i32_le(input, frame.payload_offset);
+                let proposed_height: t27 = wire_read_i32_le(input, frame.payload_offset + 4);
+                let configured_width: t27 = wayland_native_resolve_configure_axis(
+                    proposed_width, window.*.width);
+                let configured_height: t27 = wayland_native_resolve_configure_axis(
+                    proposed_height, window.*.height);
+                if (input.*.error != 0 || surface_dimensions_valid(
+                    configured_width, configured_height) == 0) {
+                    app.*.error = "Wayland configure dimensions exceed the bounded CPU surface";
+                    wayland_native_frame_free(&received);
+                    return 0;
+                }
+                if (configured_width != window.*.width
+                    || configured_height != window.*.height) {
+                    surface_resize(&window.*.surface, configured_width, configured_height);
+                    if (window.*.surface.width != configured_width
+                        || window.*.surface.height != configured_height) {
+                        app.*.error = "Wayland retained surface resize was rejected";
+                        wayland_native_frame_free(&received);
+                        return 0;
+                    }
+                    window.*.width = configured_width; window.*.height = configured_height;
+                    window.*.wayland_native.width = configured_width;
+                    window.*.wayland_native.height = configured_height;
+                    window.*.ui.width = configured_width; window.*.ui.height = configured_height;
+                    window.*.needs_present = 1;
+                }
+                wayland_native_frame_free(&received); return 1;
+            }
+            if (window.*.open == 1 && frame.object_id == window.*.wayland_native.toplevel_id
+                && frame.opcode == 1 && frame.size == 8) {
+                window.*.wayland_native.close_requested = 1;
+                wayland_native_frame_free(&received); app_close_window(app, wayland_i);
+                let remaining: i32 = 0; let open_i: i32 = 0;
+                while (open_i < len[Window](app.*.windows)) {
+                    if (app.*.windows.data[open_i].open == 1) { remaining = 1; }
+                    open_i = open_i + 1;
+                }
+                if (remaining == 0) { app.*.running = 0; }
+                return 1;
+            }
+            wayland_i = wayland_i + 1;
+        }
+        wayland_native_frame_free(&received); return 0;
+    }
+    if (app.*.backend.active != BackendKind.X11) { return 0; }
+    let native_event: X11Event = x11_next_event(&app.*.x11, timeout_ms);
+    if (native_event.valid == 0) {
+        if (app.*.x11.authenticated == 0) {
+            app.*.backend.connected = 0; app.*.running = 0;
+            app.*.error = app.*.x11.error;
+        }
+        return 0;
+    }
+    if (native_event.kind == X11EventKind.MappingNotify) {
+        if (native_event.mapping_request == 0 || native_event.mapping_request == 1) {
+            if (app.*.x11.keyboard_mapping.valid == 1) {
+                x11_keyboard_mapping_invalidate(&app.*.x11.keyboard_mapping);
+            }
+            if (app.*.x11.modifier_mapping.valid == 1) {
+                x11_modifier_mapping_invalidate(&app.*.x11.modifier_mapping);
+            }
+            let refresh_timeout: t27 = timeout_ms;
+            if (refresh_timeout < 1) { refresh_timeout = 1; }
+            if (refresh_timeout > 250) { refresh_timeout = 250; }
+            if (x11_refresh_keyboard_state(&app.*.x11, refresh_timeout) == 0) {
+                if (app.*.x11.authenticated == 0) {
+                    app.*.backend.connected = 0; app.*.running = 0;
+                    app.*.error = app.*.x11.error;
+                } else {
+                    app.*.error = "X11 keyboard mapping refresh failed";
+                }
+                return 0;
+            }
+            app.*.error = "";
+        }
+        return 1;
+    }
+    if (native_event.kind == X11EventKind.SelectionClear) {
+        // Native dequeue already applied this generation-tagged FIFO transition.
+        return 1;
+    }
+    if (native_event.kind == X11EventKind.SelectionRequest) {
+        // A stale native owner identity must never retain bytes after its App
+        // window disappears. Reject the request explicitly through X11's
+        // SelectionNotify(None) path while preserving every later FIFO event.
+        let response: X11ClipboardStatus = x11_clipboard_respond(
+            &app.*.x11, native_event, app_x11_clipboard_service_timeout());
+        let _mapped: ClipboardStatus = app_clipboard_finish_x11_status(app, response);
+        if (app.*.x11.authenticated == 0) { return 0; }
+        return 1;
+    }
+    let index: i32 = app_find_native_window(app, native_event.window);
+    if (index < 0) { return 0; }
+    let window: *Window = app_window(app, index);
+    if (native_event.kind == X11EventKind.ClientMessage
+        && native_event.message_type == app.*.x11.wm_protocols_atom
+        && native_event.data0 == app.*.x11.wm_delete_window_atom) {
+        app_close_window(app, index);
+        let any_open: i32 = 0;
+        let open_i: i32 = 0;
+        while (open_i < len[Window](app.*.windows)) {
+            if (app.*.windows.data[open_i].open == 1) { any_open = 1; }
+            open_i = open_i + 1;
+        }
+        if (any_open == 0) { app.*.running = 0; }
+        return 1;
+    }
+    if (native_event.kind == X11EventKind.Expose) { window.*.needs_present = 1; return 1; }
+    if (native_event.kind == X11EventKind.Configure) {
+        if (native_event.width < 1 || native_event.height < 1
+            || app_surface_dimensions_valid(native_event.width, native_event.height) == 0) {
+            app.*.error = "X11 configure dimensions exceed the bounded CPU surface";
+            return 0;
+        }
+        if (window.*.width != native_event.width || window.*.height != native_event.height) {
+            window.*.width = native_event.width; window.*.height = native_event.height;
+            window.*.ui.width = native_event.width; window.*.ui.height = native_event.height;
+            surface_resize(&window.*.surface, native_event.width, native_event.height);
+            window.*.needs_present = 1;
+        }
+        return 1;
+    }
+    if (native_event.kind == X11EventKind.KeyDown || native_event.kind == X11EventKind.KeyUp) {
+        if (app.*.x11.keyboard_mapping.valid == 0 || app.*.x11.modifier_mapping.valid == 0) {
+            app.*.error = "X11 keyboard mapping is not authoritative";
+            return 0;
+        }
+        return app_dispatch_x11_keyboard(app, window, native_event);
+    }
+    if (native_event.kind == X11EventKind.PointerDown
+        || native_event.kind == X11EventKind.PointerUp
+        || native_event.kind == X11EventKind.PointerMove
+        || native_event.kind == X11EventKind.Enter
+        || native_event.kind == X11EventKind.Leave) {
+        return app_dispatch_x11_pointer(window, native_event);
+    }
+    if (native_event.kind == X11EventKind.FocusIn
+        || native_event.kind == X11EventKind.FocusOut) {
+        let focus: Event = event_new(EventKind.Focus, native_event.x, native_event.y);
+        if (native_event.kind == X11EventKind.FocusOut) { focus.kind = EventKind.Blur; }
+        let _focus_dispatched: i32 = ui_dispatch(&window.*.ui, focus);
+        return 1;
+    }
+    return 0;
+}
+
+pub fn app_close_window(app: *App, index: i32) i32 {
+    let window: *Window = app_window(app, index);
+    if (window == null as *Window || window.*.open == 0) { return 0; }
+    // Revoke public authority before native window teardown. Headless/X11 can
+    // reclaim their owner state here; Wayland deliberately retains each source
+    // generation's bytes until its cancellation/destroy callback barrier.
+    app_clipboard_forget_window(app, index, window);
+    let backend_closed: i32 = 1;
+    if (window.*.backend == BackendKind.X11 && window.*.native.live == 1) {
+        backend_closed = x11_close_window(&app.*.x11, &window.*.native);
+    } else if (window.*.backend == BackendKind.Wayland && window.*.wayland_native.live == 1) {
+        app_clear_wayland_surface_focus(app, window.*.wayland_native.surface_id);
+        backend_closed = wayland_close_window(&app.*.wayland, &window.*.wayland_native);
+    } else if (window.*.backend == BackendKind.Wayland) {
+        app_clear_wayland_surface_focus(app, window.*.wayland_native.surface_id);
+    }
+    // Local retained UI/surface ownership is unconditional. Wayland clipboard
+    // generations are separately bounded and reclaimed by barrier or disconnect.
+    surface_free(&window.*.surface); ui_free(&window.*.ui); window.*.open = 0;
+    return backend_closed;
+}
+
+pub fn app_shutdown(app: *App) void {
+    let i: i32 = 0;
+    while (i < len[Window](app.*.windows)) {
+        if (app.*.windows.data[i].open == 1) { app_close_window(app, i); }
+        i = i + 1;
+    }
+    keyboard_map_free(&app.*.wayland_keyboard_map);
+    clipboard_owned_text_free(&app.*.headless_clipboard);
+    clipboard_owned_text_free(&app.*.headless_primary);
+    x11_disconnect(&app.*.x11);
+    wayland_disconnect(&app.*.wayland);
+    free[Window](&app.*.windows); app.*.running = 0;
+}

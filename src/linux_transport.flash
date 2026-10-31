@@ -1,0 +1,139 @@
+// Flashy Linux transport adapter: converts logical protocol bytes to the
+// packed kernel ABI buffer defined by Flash's pure-Flash runtime.
+@import("../../flash/flash/runtime/linux.flash")
+
+fn linux_pack_wire(input: *WireBuffer) LinuxByteBuffer {
+    let packed: LinuxByteBuffer = linux_buffer_new(len[u8](input.*.bytes));
+    let i: i32 = 0;
+    while (i < len[u8](input.*.bytes)) {
+        linux_buffer_set_byte(&packed, i, get[u8](input.*.bytes, i) as t9);
+        i = i + 1;
+    }
+    return packed;
+}
+
+fn linux_send_wire(fd: i64, input: *WireBuffer) i64 {
+    let packed: LinuxByteBuffer = linux_pack_wire(input);
+    let result: LinuxWriteAllResult = linux_send_buffer_all(fd, &packed);
+    linux_buffer_free(&packed);
+    if (result.complete != 0) { return result.written; }
+    return result.error_code;
+}
+
+fn linux_send_wire_all(fd: i64, input: *WireBuffer) LinuxWriteAllResult {
+    let packed: LinuxByteBuffer = linux_pack_wire(input);
+    let result: LinuxWriteAllResult = linux_send_buffer_all(fd, &packed);
+    linux_buffer_free(&packed);
+    return result;
+}
+
+fn linux_send_wire_all_until(fd: i64, input: *WireBuffer,
+    deadline: i64) LinuxWriteAllResult {
+    let packed: LinuxByteBuffer = linux_pack_wire(input);
+    let result: LinuxWriteAllResult = linux_send_address_all_until_chunked(
+        fd, packed.words.data as i64, packed.len as i64, 0, deadline, 1);
+    linux_buffer_free(&packed);
+    return result;
+}
+
+fn linux_send_wire_all_strict_until(fd: i64, input: *WireBuffer,
+    deadline: i64) LinuxWriteAllResult {
+    if (linux_fd_value_valid(fd) == 0 || input.*.error != 0
+        || len[u8](input.*.bytes) < 1) {
+        return LinuxWriteAllResult{ .written = 0,
+            .error_code = 0 - 22, .complete = 0 };
+    }
+    if (linux_monotonic_ms() >= deadline) {
+        return LinuxWriteAllResult{ .written = 0,
+            .error_code = 0 - 110, .complete = 0 };
+    }
+    let packed: LinuxByteBuffer = linux_pack_wire(input);
+    let result: LinuxWriteAllResult = linux_send_address_all_until_chunked(
+        fd, packed.words.data as i64, packed.len as i64, 0, deadline, 0);
+    linux_buffer_free(&packed);
+    return result;
+}
+
+fn linux_send_wire_fd(fd: i64, input: *WireBuffer, passed_fd: i64) i64 {
+    let packed: LinuxByteBuffer = linux_pack_wire(input);
+    let result: LinuxWriteAllResult = linux_send_buffer_fd_all(fd, &packed, passed_fd);
+    linux_buffer_free(&packed);
+    if (result.complete != 0) { return result.written; }
+    return result.error_code;
+}
+
+fn linux_send_wire_fd_all(fd: i64, input: *WireBuffer,
+    passed_fd: i64) LinuxWriteAllResult {
+    let packed: LinuxByteBuffer = linux_pack_wire(input);
+    let result: LinuxWriteAllResult = linux_send_buffer_fd_all(fd, &packed, passed_fd);
+    linux_buffer_free(&packed);
+    return result;
+}
+
+// Strict SCM_RIGHTS adapter for deadline-sharing protocols. Validate the
+// logical wire and descriptors before testing expiry, then avoid even the
+// temporary ABI packing allocation when the absolute deadline has elapsed.
+// passed_fd and input remain caller-owned.
+fn linux_send_wire_fd_all_until(fd: i64, input: *WireBuffer,
+    passed_fd: i64, deadline: i64) LinuxWriteAllResult {
+    if (linux_fd_value_valid(fd) == 0 || linux_fd_value_valid(passed_fd) == 0
+        || input.*.error != 0 || len[u8](input.*.bytes) < 1) {
+        return LinuxWriteAllResult{ .written = 0,
+            .error_code = 0 - 22, .complete = 0 };
+    }
+    if (linux_monotonic_ms() >= deadline) {
+        return LinuxWriteAllResult{ .written = 0,
+            .error_code = 0 - 110, .complete = 0 };
+    }
+    let packed: LinuxByteBuffer = linux_pack_wire(input);
+    let result: LinuxWriteAllResult = linux_send_buffer_fd_all_until(
+        fd, &packed, passed_fd, deadline);
+    linux_buffer_free(&packed);
+    return result;
+}
+
+struct LinuxWireFdReceive {
+    wire: WireBuffer,
+    received_fd: i64,
+    ok: i32,
+}
+
+fn linux_receive_wire_fd(fd: i64, capacity: i32) LinuxWireFdReceive {
+    let native: LinuxReceiveFdResult = linux_receive_buffer_fd(fd, capacity);
+    let wire: WireBuffer = wire_new(capacity);
+    let i: i32 = 0;
+    while (i < native.data.len) { wire_push_u8(&wire, linux_buffer_byte(&native.data, i) as t27); i = i + 1; }
+    linux_buffer_free(&native.data);
+    return LinuxWireFdReceive{ .wire = wire, .received_fd = native.received_fd, .ok = native.ok };
+}
+
+fn linux_receive_wire(fd: i64, capacity: i32) WireBuffer {
+    let packed: LinuxByteBuffer = linux_buffer_new(capacity);
+    let got: i64 = linux_read_into(fd, &packed);
+    let out: WireBuffer = wire_new(capacity);
+    if (got < 0) { out.error = 1; linux_buffer_free(&packed); return out; }
+    let i: i32 = 0;
+    while (i < packed.len) { wire_push_u8(&out, linux_buffer_byte(&packed, i) as t27); i = i + 1; }
+    linux_buffer_free(&packed);
+    return out;
+}
+
+fn linux_receive_exact(fd: i64, byte_count: i32, timeout_ms: t27) WireBuffer {
+    let out: WireBuffer = wire_new(byte_count);
+    if (fd < 0 || byte_count < 0) { out.error = 1; return out; }
+    let deadline: i64 = linux_monotonic_ms() + timeout_ms as i64;
+    while (len[u8](out.bytes) < byte_count && linux_monotonic_ms() <= deadline) {
+        if (linux_poll_readable(fd, 20) == 1) {
+            let remaining: i32 = byte_count - len[u8](out.bytes);
+            let packed: LinuxByteBuffer = linux_buffer_new(remaining);
+            packed.capacity_bytes = remaining;
+            let got: i64 = linux_read_into(fd, &packed);
+            if (got <= 0) { linux_buffer_free(&packed); out.error = 1; return out; }
+            let i: i32 = 0;
+            while (i < packed.len) { wire_push_u8(&out, linux_buffer_byte(&packed, i) as t27); i = i + 1; }
+            linux_buffer_free(&packed);
+        }
+    }
+    if (len[u8](out.bytes) != byte_count) { out.error = 1; }
+    return out;
+}

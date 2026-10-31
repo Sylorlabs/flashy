@@ -1,0 +1,1525 @@
+// Bounded pure-Flash PNG and zlib/DEFLATE support.
+// PNG bytes and DEFLATE bits are protocol-boundary data. All image geometry,
+// limits, checksums, and renderer-facing values remain balanced-ternary t27.
+
+enum PngError { None, Empty, TooLarge, BadSignature, Truncated, BadChunk, BadCrc, MissingHeader,
+    UnsupportedFormat, UnsupportedInterlace, MissingData, Inflate, Filter, InvalidDimensions,
+    NotAnimated, BadAnimation, Io }
+
+struct PngResult {
+    surface: Surface,
+    valid: i32,
+    error: PngError,
+    error_offset: t27,
+    width: t27,
+    height: t27,
+}
+
+struct PngEncodeResult {
+    bytes: ArrayList[u8],
+    valid: i32,
+    error: PngError,
+}
+
+struct PngFrameControl {
+    sequence: t27,
+    width: t27,
+    height: t27,
+    x: t27,
+    y: t27,
+    delay_numerator: t27,
+    delay_denominator: t27,
+    dispose: t9,
+    blend: t9,
+}
+
+struct PngAnimationFrame {
+    surface: Surface,
+    delay_numerator: t27,
+    delay_denominator: t27,
+    delay_ms: t27,
+    dispose: t9,
+    blend: t9,
+}
+
+struct PngAnimationResult {
+    frames: ArrayList[PngAnimationFrame],
+    valid: i32,
+    error: PngError,
+    error_offset: t27,
+    width: t27,
+    height: t27,
+    play_count: t27,
+}
+
+struct PngAnimationSourceFrame {
+    // Caller-owned premultiplied RGBA8 surface for this frame rectangle.
+    surface: Surface,
+    x: t27,
+    y: t27,
+    delay_numerator: t27,
+    delay_denominator: t27,
+    dispose: t9,
+    blend: t9,
+}
+
+struct PngAnimationEncodeSpec {
+    width: t27,
+    height: t27,
+    play_count: t27,
+    frames: ArrayList[PngAnimationSourceFrame],
+}
+
+struct PngBitReader {
+    data: []u8,
+    byte_offset: i32,
+    bit_offset: t9,
+    failed: i32,
+}
+
+struct PngHuffmanEntry {
+    code: t27,
+    bits: t9,
+    symbol: t27,
+}
+
+struct PngHuffmanTree {
+    entries: ArrayList[PngHuffmanEntry],
+    valid: i32,
+}
+
+struct PngInflateResult {
+    bytes: ArrayList[u8],
+    valid: i32,
+    error_offset: t27,
+}
+
+struct PngColorState {
+    color_type: t27,
+    bit_depth: t27,
+    channels: t27,
+    palette_entries: t27,
+    transparent_gray: t27,
+    transparent_red: t27,
+    transparent_green: t27,
+    transparent_blue: t27,
+}
+
+fn png_empty_result(error: PngError, offset: t27) PngResult {
+    return PngResult{ .surface = surface_new(0, 0), .valid = 0, .error = error,
+        .error_offset = offset, .width = 0, .height = 0 };
+}
+
+fn png_free(result: *PngResult) void {
+    surface_free(&result.*.surface);
+    result.*.valid = 0;
+    result.*.width = 0;
+    result.*.height = 0;
+}
+
+fn png_encode_free(result: *PngEncodeResult) void {
+    free[u8](&result.*.bytes);
+    result.*.valid = 0;
+}
+
+fn png_animation_empty(error: PngError, offset: t27) PngAnimationResult {
+    return PngAnimationResult{ .frames = make[PngAnimationFrame](4), .valid = 0, .error = error,
+        .error_offset = offset, .width = 0, .height = 0, .play_count = 0 };
+}
+
+fn png_animation_free(result: *PngAnimationResult) void {
+    let i: i32 = 0;
+    while (i < len[PngAnimationFrame](result.*.frames)) {
+        let frame: PngAnimationFrame = result.*.frames.data[i];
+        surface_free(&frame.surface);
+        i = i + 1;
+    }
+    free[PngAnimationFrame](&result.*.frames);
+    result.*.valid = 0;
+    result.*.width = 0;
+    result.*.height = 0;
+}
+
+fn png_pow2(exponent: t27) t27 {
+    let value: t27 = 1;
+    let i: t27 = 0;
+    while (i < exponent) { value = value * 2; i = i + 1; }
+    return value;
+}
+
+fn png_xor32(left: t27, right: t27) t27 {
+    let result: t27 = 0;
+    let factor: t27 = 1;
+    let a: t27 = left;
+    let b: t27 = right;
+    let i: t27 = 0;
+    while (i < 32) {
+        let abit: t27 = a % 2;
+        let bbit: t27 = b % 2;
+        if (abit != bbit) { result = result + factor; }
+        a = a / 2;
+        b = b / 2;
+        factor = factor * 2;
+        i = i + 1;
+    }
+    return result;
+}
+
+fn png_crc_update(crc_value: t27, byte_value: t27) t27 {
+    let crc: t27 = png_xor32(crc_value, byte_value);
+    let bit: t27 = 0;
+    while (bit < 8) {
+        if ((crc % 2) == 1) { crc = png_xor32(crc / 2, 3988292384); }
+        else { crc = crc / 2; }
+        bit = bit + 1;
+    }
+    return crc;
+}
+
+fn png_crc_chunk(input: []u8, type_offset: i32, data_offset: i32, data_length: i32) t27 {
+    let crc: t27 = 4294967295;
+    let i: i32 = 0;
+    while (i < 4) { crc = png_crc_update(crc, input[type_offset + i] as t27); i = i + 1; }
+    i = 0;
+    while (i < data_length) { crc = png_crc_update(crc, input[data_offset + i] as t27); i = i + 1; }
+    return png_xor32(crc, 4294967295);
+}
+
+fn png_read_u32_be(input: []u8, offset: i32) t27 {
+    if (offset < 0 || offset + 4 > input.len) { return -1; }
+    return (input[offset] as t27) * 16777216 + (input[offset + 1] as t27) * 65536
+        + (input[offset + 2] as t27) * 256 + input[offset + 3] as t27;
+}
+
+fn png_push_u32_be(out: *ArrayList[u8], value: t27) void {
+    push[u8](out, ((value / 16777216) % 256) as u8);
+    push[u8](out, ((value / 65536) % 256) as u8);
+    push[u8](out, ((value / 256) % 256) as u8);
+    push[u8](out, (value % 256) as u8);
+}
+
+fn png_chunk_is(input: []u8, type_offset: i32, name: []u8) i32 {
+    if (name.len != 4 || type_offset < 0 || type_offset + 4 > input.len) { return 0; }
+    let i: i32 = 0;
+    while (i < 4) {
+        if (input[type_offset + i] != name[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn png_reader_new(data: []u8) PngBitReader {
+    return PngBitReader{ .data = data, .byte_offset = 0, .bit_offset = 0, .failed = 0 };
+}
+
+fn png_read_bits(reader: *PngBitReader, count: t27) t27 {
+    let result: t27 = 0;
+    let factor: t27 = 1;
+    let i: t27 = 0;
+    while (i < count) {
+        if (reader.*.byte_offset >= reader.*.data.len) {
+            reader.*.failed = 1;
+            return 0;
+        }
+        let byte_value: t27 = reader.*.data[reader.*.byte_offset] as t27;
+        let bit_value: t27 = (byte_value / png_pow2(reader.*.bit_offset as t27)) % 2;
+        result = result + bit_value * factor;
+        factor = factor * 2;
+        reader.*.bit_offset = reader.*.bit_offset + 1;
+        if (reader.*.bit_offset == 8) {
+            reader.*.bit_offset = 0;
+            reader.*.byte_offset = reader.*.byte_offset + 1;
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+fn png_reader_align(reader: *PngBitReader) void {
+    if (reader.*.bit_offset != 0) {
+        reader.*.bit_offset = 0;
+        reader.*.byte_offset = reader.*.byte_offset + 1;
+    }
+}
+
+fn png_reverse_bits(value: t27, count: t27) t27 {
+    let source: t27 = value;
+    let reversed: t27 = 0;
+    let i: t27 = 0;
+    while (i < count) {
+        reversed = reversed * 2 + (source % 2);
+        source = source / 2;
+        i = i + 1;
+    }
+    return reversed;
+}
+
+fn png_huffman_empty() PngHuffmanTree {
+    return PngHuffmanTree{ .entries = make[PngHuffmanEntry](16), .valid = 0 };
+}
+
+fn png_huffman_free(tree: *PngHuffmanTree) void {
+    free[PngHuffmanEntry](&tree.*.entries);
+    tree.*.valid = 0;
+}
+
+fn png_huffman_build(lengths: *ArrayList[t27], symbol_count: i32) PngHuffmanTree {
+    let tree: PngHuffmanTree = png_huffman_empty();
+    if (symbol_count < 1 || symbol_count > len[t27](lengths.*)) { return tree; }
+    let counts: ArrayList[t27] = make[t27](16);
+    let next_codes: ArrayList[t27] = make[t27](16);
+    let i: i32 = 0;
+    while (i < 16) { push[t27](&counts, 0); push[t27](&next_codes, 0); i = i + 1; }
+    i = 0;
+    while (i < symbol_count) {
+        let length: t27 = lengths.*.data[i];
+        if (length < 0 || length > 15) {
+            free[t27](&counts); free[t27](&next_codes); return tree;
+        }
+        if (length > 0) { counts.data[length as i32] = counts.data[length as i32] + 1; }
+        i = i + 1;
+    }
+    let code: t27 = 0;
+    let bits: i32 = 1;
+    while (bits <= 15) {
+        code = (code + counts.data[bits - 1]) * 2;
+        next_codes.data[bits] = code;
+        bits = bits + 1;
+    }
+    if (code + counts.data[15] > 32768) {
+        free[t27](&counts); free[t27](&next_codes); return tree;
+    }
+    i = 0;
+    while (i < symbol_count) {
+        let length: t27 = lengths.*.data[i];
+        if (length > 0) {
+            let canonical: t27 = next_codes.data[length as i32];
+            next_codes.data[length as i32] = canonical + 1;
+            push[PngHuffmanEntry](&tree.entries, PngHuffmanEntry{
+                .code = png_reverse_bits(canonical, length), .bits = length as t9, .symbol = i as t27 });
+        }
+        i = i + 1;
+    }
+    tree.valid = 0;
+    if (len[PngHuffmanEntry](tree.entries) > 0) { tree.valid = 1; }
+    free[t27](&counts);
+    free[t27](&next_codes);
+    return tree;
+}
+
+fn png_huffman_decode(reader: *PngBitReader, tree: *PngHuffmanTree) t27 {
+    if (tree.*.valid == 0) { reader.*.failed = 1; return -1; }
+    let code: t27 = 0;
+    let factor: t27 = 1;
+    let bits: t27 = 1;
+    while (bits <= 15) {
+        code = code + png_read_bits(reader, 1) * factor;
+        if (reader.*.failed == 1) { return -1; }
+        let i: i32 = 0;
+        while (i < len[PngHuffmanEntry](tree.*.entries)) {
+            let entry: PngHuffmanEntry = tree.*.entries.data[i];
+            if ((entry.bits as t27) == bits && entry.code == code) { return entry.symbol; }
+            i = i + 1;
+        }
+        factor = factor * 2;
+        bits = bits + 1;
+    }
+    reader.*.failed = 1;
+    return -1;
+}
+
+fn png_fixed_literal_tree() PngHuffmanTree {
+    let lengths: ArrayList[t27] = make[t27](288);
+    let i: i32 = 0;
+    while (i < 288) {
+        let bits: t27 = 8;
+        if (i <= 143) { bits = 8; }
+        else if (i <= 255) { bits = 9; }
+        else if (i <= 279) { bits = 7; }
+        else { bits = 8; }
+        push[t27](&lengths, bits);
+        i = i + 1;
+    }
+    let tree: PngHuffmanTree = png_huffman_build(&lengths, 288);
+    free[t27](&lengths);
+    return tree;
+}
+
+fn png_fixed_distance_tree() PngHuffmanTree {
+    let lengths: ArrayList[t27] = make[t27](32);
+    let i: i32 = 0;
+    while (i < 32) { push[t27](&lengths, 5); i = i + 1; }
+    let tree: PngHuffmanTree = png_huffman_build(&lengths, 32);
+    free[t27](&lengths);
+    return tree;
+}
+
+fn png_length_extra(symbol: t27) t27 {
+    if (symbol >= 257 && symbol <= 264) { return 0; }
+    if (symbol >= 265 && symbol <= 284) { return ((symbol - 265) / 4) + 1; }
+    return 0;
+}
+
+fn png_length_base(symbol: t27) t27 {
+    if (symbol >= 257 && symbol <= 264) { return symbol - 254; }
+    if (symbol >= 265 && symbol <= 284) {
+        let extra: t27 = png_length_extra(symbol);
+        let first_symbol: t27 = 261 + extra * 4;
+        return 3 + png_pow2(extra + 2) + (symbol - first_symbol) * png_pow2(extra);
+    }
+    if (symbol == 285) { return 258; }
+    return -1;
+}
+
+fn png_distance_extra(symbol: t27) t27 {
+    if (symbol >= 0 && symbol <= 3) { return 0; }
+    if (symbol >= 4 && symbol <= 29) { return (symbol / 2) - 1; }
+    return -1;
+}
+
+fn png_distance_base(symbol: t27) t27 {
+    if (symbol >= 0 && symbol <= 3) { return symbol + 1; }
+    let extra: t27 = png_distance_extra(symbol);
+    if (extra < 0) { return -1; }
+    return 1 + png_pow2(extra + 1) + (symbol % 2) * png_pow2(extra);
+}
+
+fn png_inflate_codes(reader: *PngBitReader, literal_tree: *PngHuffmanTree,
+    distance_tree: *PngHuffmanTree, out: *ArrayList[u8], output_limit: t27) i32 {
+    let running: i32 = 1;
+    while (running == 1) {
+        let symbol: t27 = png_huffman_decode(reader, literal_tree);
+        if (reader.*.failed == 1) { return 0; }
+        if (symbol < 256) {
+            if ((len[u8](out.*) as t27) >= output_limit) { return 0; }
+            push[u8](out, symbol as u8);
+        } else if (symbol == 256) {
+            running = 0;
+        } else if (symbol >= 257 && symbol <= 285) {
+            let extra_length: t27 = png_length_extra(symbol);
+            let copy_length: t27 = png_length_base(symbol) + png_read_bits(reader, extra_length);
+            let distance_symbol: t27 = png_huffman_decode(reader, distance_tree);
+            let extra_distance: t27 = png_distance_extra(distance_symbol);
+            if (reader.*.failed == 1 || extra_distance < 0) { return 0; }
+            let distance: t27 = png_distance_base(distance_symbol) + png_read_bits(reader, extra_distance);
+            if (reader.*.failed == 1 || distance < 1 || distance > (len[u8](out.*) as t27)
+                || (len[u8](out.*) as t27) + copy_length > output_limit) { return 0; }
+            let copied: t27 = 0;
+            while (copied < copy_length) {
+                let source: i32 = len[u8](out.*) - (distance as i32);
+                push[u8](out, out.*.data[source]);
+                copied = copied + 1;
+            }
+        } else {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+fn png_code_length_order(index: i32) i32 {
+    if (index == 0) { return 16; } if (index == 1) { return 17; } if (index == 2) { return 18; }
+    if (index == 3) { return 0; } if (index == 4) { return 8; } if (index == 5) { return 7; }
+    if (index == 6) { return 9; } if (index == 7) { return 6; } if (index == 8) { return 10; }
+    if (index == 9) { return 5; } if (index == 10) { return 11; } if (index == 11) { return 4; }
+    if (index == 12) { return 12; } if (index == 13) { return 3; } if (index == 14) { return 13; }
+    if (index == 15) { return 2; } if (index == 16) { return 14; } if (index == 17) { return 1; }
+    return 15;
+}
+
+fn png_dynamic_trees(reader: *PngBitReader, literal_tree: *PngHuffmanTree,
+    distance_tree: *PngHuffmanTree) i32 {
+    let literal_count: i32 = (png_read_bits(reader, 5) + 257) as i32;
+    let distance_count: i32 = (png_read_bits(reader, 5) + 1) as i32;
+    let code_count: i32 = (png_read_bits(reader, 4) + 4) as i32;
+    if (reader.*.failed == 1 || literal_count > 286 || distance_count > 32 || code_count > 19) { return 0; }
+    let code_lengths: ArrayList[t27] = make[t27](19);
+    let i: i32 = 0;
+    while (i < 19) { push[t27](&code_lengths, 0); i = i + 1; }
+    i = 0;
+    while (i < code_count) {
+        code_lengths.data[png_code_length_order(i)] = png_read_bits(reader, 3);
+        i = i + 1;
+    }
+    let code_tree: PngHuffmanTree = png_huffman_build(&code_lengths, 19);
+    free[t27](&code_lengths);
+    if (code_tree.valid == 0 || reader.*.failed == 1) { png_huffman_free(&code_tree); return 0; }
+
+    let all_lengths: ArrayList[t27] = make[t27](literal_count + distance_count);
+    let total: i32 = literal_count + distance_count;
+    while (len[t27](all_lengths) < total) {
+        let symbol: t27 = png_huffman_decode(reader, &code_tree);
+        if (reader.*.failed == 1) { png_huffman_free(&code_tree); free[t27](&all_lengths); return 0; }
+        if (symbol <= 15) {
+            push[t27](&all_lengths, symbol);
+        } else if (symbol == 16) {
+            if (len[t27](all_lengths) == 0) { png_huffman_free(&code_tree); free[t27](&all_lengths); return 0; }
+            let repeat: t27 = png_read_bits(reader, 2) + 3;
+            let previous: t27 = all_lengths.data[len[t27](all_lengths) - 1];
+            let j: t27 = 0;
+            while (j < repeat) {
+                if (len[t27](all_lengths) >= total) { png_huffman_free(&code_tree); free[t27](&all_lengths); return 0; }
+                push[t27](&all_lengths, previous); j = j + 1;
+            }
+        } else if (symbol == 17 || symbol == 18) {
+            let repeat: t27 = 0;
+            if (symbol == 17) { repeat = png_read_bits(reader, 3) + 3; }
+            else { repeat = png_read_bits(reader, 7) + 11; }
+            let j: t27 = 0;
+            while (j < repeat) {
+                if (len[t27](all_lengths) >= total) { png_huffman_free(&code_tree); free[t27](&all_lengths); return 0; }
+                push[t27](&all_lengths, 0); j = j + 1;
+            }
+        } else {
+            png_huffman_free(&code_tree); free[t27](&all_lengths); return 0;
+        }
+    }
+    png_huffman_free(&code_tree);
+    if (reader.*.failed == 1 || all_lengths.data[256] == 0) { free[t27](&all_lengths); return 0; }
+    let literal_lengths: ArrayList[t27] = make[t27](literal_count);
+    let distance_lengths: ArrayList[t27] = make[t27](distance_count);
+    i = 0;
+    while (i < literal_count) { push[t27](&literal_lengths, all_lengths.data[i]); i = i + 1; }
+    i = 0;
+    while (i < distance_count) { push[t27](&distance_lengths, all_lengths.data[literal_count + i]); i = i + 1; }
+    literal_tree.* = png_huffman_build(&literal_lengths, literal_count);
+    distance_tree.* = png_huffman_build(&distance_lengths, distance_count);
+    free[t27](&literal_lengths); free[t27](&distance_lengths); free[t27](&all_lengths);
+    if (literal_tree.*.valid == 0) { return 0; }
+    return 1;
+}
+
+fn png_adler32(bytes: *ArrayList[u8]) t27 {
+    let first: t27 = 1;
+    let second: t27 = 0;
+    let i: i32 = 0;
+    while (i < len[u8](bytes.*)) {
+        first = (first + bytes.*.data[i] as t27) % 65521;
+        second = (second + first) % 65521;
+        i = i + 1;
+    }
+    return second * 65536 + first;
+}
+
+fn png_inflate_empty() PngInflateResult {
+    return PngInflateResult{ .bytes = make[u8](16), .valid = 0, .error_offset = 0 };
+}
+
+fn png_zlib_inflate(input: []u8, output_limit: t27) PngInflateResult {
+    let result: PngInflateResult = png_inflate_empty();
+    if (input.len < 6 || output_limit < 0 || output_limit > 67108864) { return result; }
+    let cmf: t27 = input[0] as t27;
+    let flags: t27 = input[1] as t27;
+    if ((cmf % 16) != 8 || (cmf / 16) > 7 || ((cmf * 256 + flags) % 31) != 0 || ((flags / 32) % 2) != 0) {
+        return result;
+    }
+    let reader: PngBitReader = png_reader_new(input[2..input.len - 4]);
+    let final_block: i32 = 0;
+    while (final_block == 0) {
+        final_block = png_read_bits(&reader, 1) as i32;
+        let block_type: t27 = png_read_bits(&reader, 2);
+        if (reader.failed == 1) { result.error_offset = reader.byte_offset as t27; return result; }
+        if (block_type == 0) {
+            png_reader_align(&reader);
+            if (reader.byte_offset + 4 > reader.data.len) { result.error_offset = reader.byte_offset as t27; return result; }
+            let count: t27 = (reader.data[reader.byte_offset] as t27)
+                + (reader.data[reader.byte_offset + 1] as t27) * 256;
+            let complement: t27 = (reader.data[reader.byte_offset + 2] as t27)
+                + (reader.data[reader.byte_offset + 3] as t27) * 256;
+            reader.byte_offset = reader.byte_offset + 4;
+            if (count + complement != 65535 || reader.byte_offset + (count as i32) > reader.data.len
+                || (len[u8](result.bytes) as t27) + count > output_limit) {
+                result.error_offset = reader.byte_offset as t27; return result;
+            }
+            let i: t27 = 0;
+            while (i < count) {
+                push[u8](&result.bytes, reader.data[reader.byte_offset]);
+                reader.byte_offset = reader.byte_offset + 1;
+                i = i + 1;
+            }
+        } else if (block_type == 1 || block_type == 2) {
+            let literal_tree: PngHuffmanTree = png_huffman_empty();
+            let distance_tree: PngHuffmanTree = png_huffman_empty();
+            if (block_type == 1) {
+                png_huffman_free(&literal_tree); png_huffman_free(&distance_tree);
+                literal_tree = png_fixed_literal_tree(); distance_tree = png_fixed_distance_tree();
+            } else if (png_dynamic_trees(&reader, &literal_tree, &distance_tree) == 0) {
+                png_huffman_free(&literal_tree); png_huffman_free(&distance_tree);
+                result.error_offset = reader.byte_offset as t27; return result;
+            }
+            let decoded: i32 = png_inflate_codes(&reader, &literal_tree, &distance_tree, &result.bytes, output_limit);
+            png_huffman_free(&literal_tree); png_huffman_free(&distance_tree);
+            if (decoded == 0) { result.error_offset = reader.byte_offset as t27; return result; }
+        } else {
+            result.error_offset = reader.byte_offset as t27;
+            return result;
+        }
+    }
+    if ((len[u8](result.bytes) as t27) != output_limit) { return result; }
+    let expected_adler: t27 = png_read_u32_be(input, input.len - 4);
+    if (expected_adler != png_adler32(&result.bytes)) { return result; }
+    result.valid = 1;
+    return result;
+}
+
+fn png_paeth(left: t27, up: t27, upper_left: t27) t27 {
+    let estimate: t27 = left + up - upper_left;
+    let left_distance: t27 = estimate - left; if (left_distance < 0) { left_distance = 0 - left_distance; }
+    let up_distance: t27 = estimate - up; if (up_distance < 0) { up_distance = 0 - up_distance; }
+    let diagonal_distance: t27 = estimate - upper_left; if (diagonal_distance < 0) { diagonal_distance = 0 - diagonal_distance; }
+    if (left_distance <= up_distance && left_distance <= diagonal_distance) { return left; }
+    if (up_distance <= diagonal_distance) { return up; }
+    return upper_left;
+}
+
+fn png_channels(color_type: t27) t27 {
+    if (color_type == 0) { return 1; }
+    if (color_type == 2) { return 3; }
+    if (color_type == 3) { return 1; }
+    if (color_type == 4) { return 2; }
+    if (color_type == 6) { return 4; }
+    return 0;
+}
+
+fn png_valid_bit_depth(color_type: t27, bit_depth: t27) i32 {
+    if (color_type == 0 && (bit_depth == 1 || bit_depth == 2 || bit_depth == 4
+        || bit_depth == 8 || bit_depth == 16)) { return 1; }
+    if (color_type == 3 && (bit_depth == 1 || bit_depth == 2 || bit_depth == 4 || bit_depth == 8)) { return 1; }
+    if ((color_type == 2 || color_type == 4 || color_type == 6) && (bit_depth == 8 || bit_depth == 16)) { return 1; }
+    return 0;
+}
+
+fn png_row_bytes(width: t27, color_type: t27, bit_depth: t27) t27 {
+    let bits: t27 = width * png_channels(color_type) * bit_depth;
+    return (bits + 7) / 8;
+}
+
+fn png_filter_bytes_per_pixel(color_type: t27, bit_depth: t27) t27 {
+    let bytes: t27 = (png_channels(color_type) * bit_depth + 7) / 8;
+    if (bytes < 1) { return 1; }
+    return bytes;
+}
+
+fn png_sample_at(pixels: *ArrayList[u8], row_start: i32, sample_index: t27, bit_depth: t27) t27 {
+    if (bit_depth == 8) { return pixels.*.data[row_start + (sample_index as i32)] as t27; }
+    if (bit_depth == 16) {
+        let offset: i32 = row_start + (sample_index * 2) as i32;
+        return (pixels.*.data[offset] as t27) * 256 + pixels.*.data[offset + 1] as t27;
+    }
+    let bit_offset: t27 = sample_index * bit_depth;
+    let byte_offset: i32 = row_start + (bit_offset / 8) as i32;
+    let shift: t27 = 8 - bit_depth - (bit_offset % 8);
+    return ((pixels.*.data[byte_offset] as t27) / png_pow2(shift)) % png_pow2(bit_depth);
+}
+
+fn png_sample_to_u8(sample: t27, bit_depth: t27) t27 {
+    let maximum: t27 = png_pow2(bit_depth) - 1;
+    if (maximum <= 0) { return 0; }
+    return (sample * 255 + maximum / 2) / maximum;
+}
+
+fn png_read_u16_be(input: *ArrayList[u8], offset: i32) t27 {
+    if (offset < 0 || offset + 2 > len[u8](input.*)) { return -1; }
+    return (input.*.data[offset] as t27) * 256 + input.*.data[offset + 1] as t27;
+}
+
+fn png_adam7_start_x(pass: i32) t27 {
+    if (pass == 1) { return 4; }
+    if (pass == 3) { return 2; }
+    if (pass == 5) { return 1; }
+    return 0;
+}
+
+fn png_adam7_start_y(pass: i32) t27 {
+    if (pass == 2) { return 4; }
+    if (pass == 4) { return 2; }
+    if (pass == 6) { return 1; }
+    return 0;
+}
+
+fn png_adam7_step_x(pass: i32) t27 {
+    if (pass <= 1) { return 8; }
+    if (pass <= 3) { return 4; }
+    if (pass <= 5) { return 2; }
+    return 1;
+}
+
+fn png_adam7_step_y(pass: i32) t27 {
+    if (pass <= 2) { return 8; }
+    if (pass <= 4) { return 4; }
+    return 2;
+}
+
+fn png_adam7_extent(full: t27, start: t27, step: t27) t27 {
+    if (full <= start) { return 0; }
+    return (full - start + step - 1) / step;
+}
+
+fn png_adam7_inflated_size(width: t27, height: t27, color_type: t27, bit_depth: t27) t27 {
+    let total: t27 = 0;
+    let pass: i32 = 0;
+    while (pass < 7) {
+        let pass_width: t27 = png_adam7_extent(width, png_adam7_start_x(pass), png_adam7_step_x(pass));
+        let pass_height: t27 = png_adam7_extent(height, png_adam7_start_y(pass), png_adam7_step_y(pass));
+        if (pass_width > 0 && pass_height > 0) {
+            total = total + (png_row_bytes(pass_width, color_type, bit_depth) + 1) * pass_height;
+        }
+        pass = pass + 1;
+    }
+    return total;
+}
+
+fn png_write_decoded_pixel(surface: *Surface, target_x: t27, target_y: t27,
+    pixels: *ArrayList[u8], row_start: i32, sample_index: t27, state: *PngColorState,
+    palette: *ArrayList[u8], transparency: *ArrayList[u8]) i32 {
+    let red: t27 = 0; let green: t27 = 0; let blue: t27 = 0; let alpha: t27 = 255;
+    if (state.*.color_type == 0) {
+        let gray_sample: t27 = png_sample_at(pixels, row_start, sample_index, state.*.bit_depth);
+        red = png_sample_to_u8(gray_sample, state.*.bit_depth); green = red; blue = red;
+        if (state.*.transparent_gray >= 0 && gray_sample == state.*.transparent_gray) { alpha = 0; }
+    } else if (state.*.color_type == 2) {
+        let red_sample: t27 = png_sample_at(pixels, row_start, sample_index, state.*.bit_depth);
+        let green_sample: t27 = png_sample_at(pixels, row_start, sample_index + 1, state.*.bit_depth);
+        let blue_sample: t27 = png_sample_at(pixels, row_start, sample_index + 2, state.*.bit_depth);
+        red = png_sample_to_u8(red_sample, state.*.bit_depth);
+        green = png_sample_to_u8(green_sample, state.*.bit_depth);
+        blue = png_sample_to_u8(blue_sample, state.*.bit_depth);
+        if (red_sample == state.*.transparent_red && green_sample == state.*.transparent_green
+            && blue_sample == state.*.transparent_blue) { alpha = 0; }
+    } else if (state.*.color_type == 3) {
+        let palette_index: t27 = png_sample_at(pixels, row_start, sample_index, state.*.bit_depth);
+        if (palette_index < 0 || palette_index >= state.*.palette_entries) { return 0; }
+        let palette_offset: i32 = (palette_index * 3) as i32;
+        red = palette.*.data[palette_offset] as t27;
+        green = palette.*.data[palette_offset + 1] as t27;
+        blue = palette.*.data[palette_offset + 2] as t27;
+        if (palette_index < (len[u8](transparency.*) as t27)) {
+            alpha = transparency.*.data[palette_index as i32] as t27;
+        }
+    } else if (state.*.color_type == 4) {
+        red = png_sample_to_u8(png_sample_at(pixels, row_start, sample_index, state.*.bit_depth), state.*.bit_depth);
+        green = red; blue = red;
+        alpha = png_sample_to_u8(png_sample_at(pixels, row_start, sample_index + 1,
+            state.*.bit_depth), state.*.bit_depth);
+    } else {
+        red = png_sample_to_u8(png_sample_at(pixels, row_start, sample_index, state.*.bit_depth), state.*.bit_depth);
+        green = png_sample_to_u8(png_sample_at(pixels, row_start, sample_index + 1,
+            state.*.bit_depth), state.*.bit_depth);
+        blue = png_sample_to_u8(png_sample_at(pixels, row_start, sample_index + 2,
+            state.*.bit_depth), state.*.bit_depth);
+        alpha = png_sample_to_u8(png_sample_at(pixels, row_start, sample_index + 3,
+            state.*.bit_depth), state.*.bit_depth);
+    }
+    let target: i32 = ((target_y * surface.*.width + target_x) * 4) as i32;
+    surface.*.pixels.data[target] = ((red * alpha) / 255) as u8;
+    surface.*.pixels.data[target + 1] = ((green * alpha) / 255) as u8;
+    surface.*.pixels.data[target + 2] = ((blue * alpha) / 255) as u8;
+    surface.*.pixels.data[target + 3] = alpha as u8;
+    return 1;
+}
+
+fn png_free_decode_buffers(compressed: *ArrayList[u8], palette: *ArrayList[u8],
+    transparency: *ArrayList[u8]) void {
+    free[u8](compressed); free[u8](palette); free[u8](transparency);
+}
+
+fn png_unfilter_at(inflated: *ArrayList[u8], source_offset: i32, row_bytes: t27,
+    height: t27, bytes_per_pixel: t27,
+    ok: *i32) ArrayList[u8] {
+    let reconstructed: ArrayList[u8] = make[u8]((row_bytes * height) as i32);
+    let i: t27 = 0;
+    while (i < row_bytes * height) { push[u8](&reconstructed, 0 as u8); i = i + 1; }
+    ok.* = 0;
+    let y: t27 = 0;
+    while (y < height) {
+        let source_row: i32 = source_offset + (y * (row_bytes + 1)) as i32;
+        let filter: t27 = inflated.*.data[source_row] as t27;
+        if (filter > 4) { free[u8](&reconstructed); return make[u8](0); }
+        let x: t27 = 0;
+        while (x < row_bytes) {
+            let raw: t27 = inflated.*.data[source_row + 1 + (x as i32)] as t27;
+            let target: i32 = (y * row_bytes + x) as i32;
+            let left: t27 = 0; let up: t27 = 0; let upper_left: t27 = 0;
+            if (x >= bytes_per_pixel) { left = reconstructed.data[target - (bytes_per_pixel as i32)] as t27; }
+            if (y > 0) { up = reconstructed.data[target - (row_bytes as i32)] as t27; }
+            if (y > 0 && x >= bytes_per_pixel) {
+                upper_left = reconstructed.data[target - (row_bytes as i32) - (bytes_per_pixel as i32)] as t27;
+            }
+            let predictor: t27 = 0;
+            if (filter == 1) { predictor = left; }
+            else if (filter == 2) { predictor = up; }
+            else if (filter == 3) { predictor = (left + up) / 2; }
+            else if (filter == 4) { predictor = png_paeth(left, up, upper_left); }
+            reconstructed.data[target] = ((raw + predictor) % 256) as u8;
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    ok.* = 1;
+    return reconstructed;
+}
+
+fn png_unfilter(inflated: *ArrayList[u8], row_bytes: t27, height: t27, bytes_per_pixel: t27,
+    ok: *i32) ArrayList[u8] {
+    return png_unfilter_at(inflated, 0, row_bytes, height, bytes_per_pixel, ok);
+}
+
+fn png_decode(input: []u8) PngResult {
+    if (input.len == 0) { return png_empty_result(PngError.Empty, 0); }
+    if (input.len > 67108864) { return png_empty_result(PngError.TooLarge, 0); }
+    if (input.len < 8 || input[0] != 137 || input[1] != 80 || input[2] != 78 || input[3] != 71
+        || input[4] != 13 || input[5] != 10 || input[6] != 26 || input[7] != 10) {
+        return png_empty_result(PngError.BadSignature, 0);
+    }
+    let width: t27 = 0; let height: t27 = 0; let bit_depth: t27 = 0; let color_type: t27 = 0;
+    let interlace: t27 = 0; let seen_header: i32 = 0; let seen_data: i32 = 0; let data_closed: i32 = 0;
+    let seen_end: i32 = 0; let seen_palette: i32 = 0; let seen_transparency: i32 = 0;
+    let chunk_count: t27 = 0;
+    let compressed: ArrayList[u8] = make[u8](1024);
+    let palette: ArrayList[u8] = make[u8](768);
+    let transparency: ArrayList[u8] = make[u8](256);
+    let offset: i32 = 8;
+    while (offset < input.len && seen_end == 0) {
+        if (offset + 12 > input.len) {
+            png_free_decode_buffers(&compressed, &palette, &transparency);
+            return png_empty_result(PngError.Truncated, offset as t27);
+        }
+        let length_value: t27 = png_read_u32_be(input, offset);
+        if (length_value < 0 || length_value > 67108864) {
+            png_free_decode_buffers(&compressed, &palette, &transparency);
+            return png_empty_result(PngError.TooLarge, offset as t27);
+        }
+        let length: i32 = length_value as i32;
+        let type_offset: i32 = offset + 4;
+        let data_offset: i32 = offset + 8;
+        let crc_offset: i32 = data_offset + length;
+        if (crc_offset + 4 > input.len) {
+            png_free_decode_buffers(&compressed, &palette, &transparency);
+            return png_empty_result(PngError.Truncated, offset as t27);
+        }
+        let expected_crc: t27 = png_read_u32_be(input, crc_offset);
+        if (png_crc_chunk(input, type_offset, data_offset, length) != expected_crc) {
+            png_free_decode_buffers(&compressed, &palette, &transparency);
+            return png_empty_result(PngError.BadCrc, crc_offset as t27);
+        }
+        if (png_chunk_is(input, type_offset, "IHDR") == 1) {
+            if (seen_header == 1 || chunk_count != 0 || length != 13) {
+                png_free_decode_buffers(&compressed, &palette, &transparency);
+                return png_empty_result(PngError.BadChunk, offset as t27);
+            }
+            width = png_read_u32_be(input, data_offset); height = png_read_u32_be(input, data_offset + 4);
+            bit_depth = input[data_offset + 8] as t27; color_type = input[data_offset + 9] as t27;
+            if (input[data_offset + 10] != 0 || input[data_offset + 11] != 0) {
+                png_free_decode_buffers(&compressed, &palette, &transparency);
+                return png_empty_result(PngError.UnsupportedFormat, data_offset as t27);
+            }
+            interlace = input[data_offset + 12] as t27;
+            seen_header = 1;
+        } else if (png_chunk_is(input, type_offset, "PLTE") == 1) {
+            if (seen_header == 0 || seen_data == 1 || seen_palette == 1 || length < 3
+                || length > 768 || (length % 3) != 0) {
+                png_free_decode_buffers(&compressed, &palette, &transparency);
+                return png_empty_result(PngError.BadChunk, offset as t27);
+            }
+            let i: i32 = 0;
+            while (i < length) { push[u8](&palette, input[data_offset + i]); i = i + 1; }
+            seen_palette = 1;
+        } else if (png_chunk_is(input, type_offset, "tRNS") == 1) {
+            if (seen_header == 0 || seen_data == 1 || seen_transparency == 1 || length > 256
+                || (color_type == 3 && seen_palette == 0)) {
+                png_free_decode_buffers(&compressed, &palette, &transparency);
+                return png_empty_result(PngError.BadChunk, offset as t27);
+            }
+            let i: i32 = 0;
+            while (i < length) { push[u8](&transparency, input[data_offset + i]); i = i + 1; }
+            seen_transparency = 1;
+        } else if (png_chunk_is(input, type_offset, "IDAT") == 1) {
+            if (seen_header == 0 || data_closed == 1) {
+                png_free_decode_buffers(&compressed, &palette, &transparency);
+                return png_empty_result(PngError.BadChunk, offset as t27);
+            }
+            if ((len[u8](compressed) as t27) + length_value > 33554432) {
+                png_free_decode_buffers(&compressed, &palette, &transparency);
+                return png_empty_result(PngError.TooLarge, offset as t27);
+            }
+            let i: i32 = 0;
+            while (i < length) { push[u8](&compressed, input[data_offset + i]); i = i + 1; }
+            seen_data = 1;
+        } else if (png_chunk_is(input, type_offset, "IEND") == 1) {
+            if (seen_header == 0 || seen_data == 0 || length != 0) {
+                png_free_decode_buffers(&compressed, &palette, &transparency);
+                return png_empty_result(PngError.BadChunk, offset as t27);
+            }
+            seen_end = 1;
+        } else {
+            if (seen_data == 1) { data_closed = 1; }
+            let first_type: t27 = input[type_offset] as t27;
+            if (first_type >= 65 && first_type <= 90) {
+                png_free_decode_buffers(&compressed, &palette, &transparency);
+                return png_empty_result(PngError.UnsupportedFormat, type_offset as t27);
+            }
+        }
+        offset = crc_offset + 4;
+        chunk_count = chunk_count + 1;
+        if (chunk_count > 4096) {
+            png_free_decode_buffers(&compressed, &palette, &transparency);
+            return png_empty_result(PngError.TooLarge, offset as t27);
+        }
+    }
+    if (seen_header == 0) {
+        png_free_decode_buffers(&compressed, &palette, &transparency);
+        return png_empty_result(PngError.MissingHeader, 8);
+    }
+    if (seen_data == 0 || seen_end == 0) {
+        png_free_decode_buffers(&compressed, &palette, &transparency);
+        return png_empty_result(PngError.MissingData, offset as t27);
+    }
+    if (offset != input.len) {
+        png_free_decode_buffers(&compressed, &palette, &transparency);
+        return png_empty_result(PngError.BadChunk, offset as t27);
+    }
+    if (width < 1 || height < 1 || width > 4096 || height > 4096 || width * height * 4 > 67108864) {
+        png_free_decode_buffers(&compressed, &palette, &transparency);
+        return png_empty_result(PngError.InvalidDimensions, 8);
+    }
+    if (interlace < 0 || interlace > 1) {
+        png_free_decode_buffers(&compressed, &palette, &transparency);
+        return png_empty_result(PngError.UnsupportedInterlace, 8);
+    }
+    let channels: t27 = png_channels(color_type);
+    if (channels == 0 || png_valid_bit_depth(color_type, bit_depth) == 0) {
+        png_free_decode_buffers(&compressed, &palette, &transparency);
+        return png_empty_result(PngError.UnsupportedFormat, 8);
+    }
+    let palette_entries: t27 = (len[u8](palette) / 3) as t27;
+    if (seen_palette == 1 && (color_type == 0 || color_type == 4)) {
+        png_free_decode_buffers(&compressed, &palette, &transparency);
+        return png_empty_result(PngError.BadChunk, 8);
+    }
+    if (color_type == 3 && (seen_palette == 0 || palette_entries < 1
+        || palette_entries > png_pow2(bit_depth))) {
+        png_free_decode_buffers(&compressed, &palette, &transparency);
+        return png_empty_result(PngError.BadChunk, 8);
+    }
+    if ((seen_transparency == 1 && color_type == 0 && len[u8](transparency) != 2)
+        || (seen_transparency == 1 && color_type == 2 && len[u8](transparency) != 6)
+        || (seen_transparency == 1 && color_type == 3
+            && (len[u8](transparency) < 1 || len[u8](transparency) > (palette_entries as i32)))
+        || (seen_transparency == 1 && (color_type == 4 || color_type == 6))) {
+        png_free_decode_buffers(&compressed, &palette, &transparency);
+        return png_empty_result(PngError.BadChunk, 8);
+    }
+    let filter_bytes: t27 = png_filter_bytes_per_pixel(color_type, bit_depth);
+    let inflated_size: t27 = 0;
+    if (interlace == 0) {
+        inflated_size = (png_row_bytes(width, color_type, bit_depth) + 1) * height;
+    } else {
+        inflated_size = png_adam7_inflated_size(width, height, color_type, bit_depth);
+    }
+    let inflated: PngInflateResult = png_zlib_inflate(compressed.data[0..compressed.len], inflated_size);
+    free[u8](&compressed);
+    if (inflated.valid == 0) {
+        free[u8](&inflated.bytes); free[u8](&palette); free[u8](&transparency);
+        return png_empty_result(PngError.Inflate, inflated.error_offset);
+    }
+    let surface: Surface = surface_new(width, height);
+    let transparent_gray: t27 = -1; let transparent_red: t27 = -1;
+    let transparent_green: t27 = -1; let transparent_blue: t27 = -1;
+    if (color_type == 0 && len[u8](transparency) == 2) {
+        transparent_gray = png_read_u16_be(&transparency, 0);
+    } else if (color_type == 2 && len[u8](transparency) == 6) {
+        transparent_red = png_read_u16_be(&transparency, 0);
+        transparent_green = png_read_u16_be(&transparency, 2);
+        transparent_blue = png_read_u16_be(&transparency, 4);
+    }
+    let state: PngColorState = PngColorState{ .color_type = color_type, .bit_depth = bit_depth,
+        .channels = channels, .palette_entries = palette_entries, .transparent_gray = transparent_gray,
+        .transparent_red = transparent_red, .transparent_green = transparent_green,
+        .transparent_blue = transparent_blue };
+    let decode_error: PngError = PngError.None;
+    if (interlace == 0) {
+        let row_bytes: t27 = png_row_bytes(width, color_type, bit_depth);
+        let filter_ok: i32 = 0;
+        let pixels: ArrayList[u8] = png_unfilter(&inflated.bytes, row_bytes, height, filter_bytes, &filter_ok);
+        if (filter_ok == 0) {
+            decode_error = PngError.Filter;
+        } else {
+            let y: t27 = 0;
+            while (y < height && decode_error == PngError.None) {
+                let x: t27 = 0;
+                while (x < width && decode_error == PngError.None) {
+                    if (png_write_decoded_pixel(&surface, x, y, &pixels, (y * row_bytes) as i32,
+                        x * channels, &state, &palette, &transparency) == 0) {
+                        decode_error = PngError.BadChunk;
+                    }
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+        }
+        free[u8](&pixels);
+    } else {
+        let source_offset: i32 = 0;
+        let pass: i32 = 0;
+        while (pass < 7 && decode_error == PngError.None) {
+            let start_x: t27 = png_adam7_start_x(pass); let start_y: t27 = png_adam7_start_y(pass);
+            let step_x: t27 = png_adam7_step_x(pass); let step_y: t27 = png_adam7_step_y(pass);
+            let pass_width: t27 = png_adam7_extent(width, start_x, step_x);
+            let pass_height: t27 = png_adam7_extent(height, start_y, step_y);
+            if (pass_width > 0 && pass_height > 0) {
+                let pass_row_bytes: t27 = png_row_bytes(pass_width, color_type, bit_depth);
+                let filter_ok: i32 = 0;
+                let pass_pixels: ArrayList[u8] = png_unfilter_at(&inflated.bytes, source_offset,
+                    pass_row_bytes, pass_height, filter_bytes, &filter_ok);
+                if (filter_ok == 0) {
+                    decode_error = PngError.Filter;
+                } else {
+                    let pass_y: t27 = 0;
+                    while (pass_y < pass_height && decode_error == PngError.None) {
+                        let pass_x: t27 = 0;
+                        while (pass_x < pass_width && decode_error == PngError.None) {
+                            if (png_write_decoded_pixel(&surface, start_x + pass_x * step_x,
+                                start_y + pass_y * step_y, &pass_pixels,
+                                (pass_y * pass_row_bytes) as i32, pass_x * channels,
+                                &state, &palette, &transparency) == 0) {
+                                decode_error = PngError.BadChunk;
+                            }
+                            pass_x = pass_x + 1;
+                        }
+                        pass_y = pass_y + 1;
+                    }
+                }
+                free[u8](&pass_pixels);
+                source_offset = source_offset + ((pass_row_bytes + 1) * pass_height) as i32;
+            }
+            pass = pass + 1;
+        }
+        if (source_offset != len[u8](inflated.bytes) && decode_error == PngError.None) {
+            decode_error = PngError.Inflate;
+        }
+    }
+    free[u8](&inflated.bytes); free[u8](&palette); free[u8](&transparency);
+    if (decode_error != PngError.None) {
+        surface_free(&surface);
+        return png_empty_result(decode_error, 0);
+    }
+    return PngResult{ .surface = surface, .valid = 1, .error = PngError.None,
+        .error_offset = 0, .width = width, .height = height };
+}
+
+fn png_load_file(path: []u8) PngResult {
+    if (_zag_file_exists(path) == 0) { return png_empty_result(PngError.Io, 0); }
+    return png_decode(_zag_read_file(path));
+}
+
+fn png_append_chunk(out: *ArrayList[u8], name: []u8, data: *ArrayList[u8]) void {
+    png_push_u32_be(out, len[u8](data.*) as t27);
+    let crc: t27 = 4294967295;
+    let i: i32 = 0;
+    while (i < 4) { push[u8](out, name[i]); crc = png_crc_update(crc, name[i] as t27); i = i + 1; }
+    i = 0;
+    while (i < len[u8](data.*)) {
+        push[u8](out, data.*.data[i]); crc = png_crc_update(crc, data.*.data[i] as t27); i = i + 1;
+    }
+    png_push_u32_be(out, png_xor32(crc, 4294967295));
+}
+
+fn png_unpremultiply(channel: t27, alpha: t27) t27 {
+    if (alpha <= 0) { return 0; }
+    let value: t27 = (channel * 255 + alpha / 2) / alpha;
+    if (value > 255) { return 255; }
+    return value;
+}
+
+fn png_zlib_store(raw: *ArrayList[u8]) ArrayList[u8] {
+    let encoded: ArrayList[u8] = make[u8](len[u8](raw.*) + 32);
+    push[u8](&encoded, 120 as u8); push[u8](&encoded, 1 as u8);
+    let offset: i32 = 0;
+    if (len[u8](raw.*) == 0) {
+        push[u8](&encoded, 1 as u8); push[u8](&encoded, 0 as u8); push[u8](&encoded, 0 as u8);
+        push[u8](&encoded, 255 as u8); push[u8](&encoded, 255 as u8);
+    }
+    while (offset < len[u8](raw.*)) {
+        let count: i32 = len[u8](raw.*) - offset;
+        if (count > 65535) { count = 65535; }
+        let final_block: i32 = 0;
+        if (offset + count == len[u8](raw.*)) { final_block = 1; }
+        push[u8](&encoded, final_block as u8);
+        push[u8](&encoded, (count % 256) as u8); push[u8](&encoded, (count / 256) as u8);
+        let complement: i32 = 65535 - count;
+        push[u8](&encoded, (complement % 256) as u8); push[u8](&encoded, (complement / 256) as u8);
+        let i: i32 = 0;
+        while (i < count) { push[u8](&encoded, raw.*.data[offset + i]); i = i + 1; }
+        offset = offset + count;
+    }
+    png_push_u32_be(&encoded, png_adler32(raw));
+    return encoded;
+}
+
+fn png_rgba8_scanlines(surface: *Surface) ArrayList[u8] {
+    let raw: ArrayList[u8] = make[u8](((surface.*.width * 4 + 1) * surface.*.height) as i32);
+    let y: t27 = 0;
+    while (y < surface.*.height) {
+        push[u8](&raw, 0 as u8);
+        let x: t27 = 0;
+        while (x < surface.*.width) {
+            let offset: i32 = ((y * surface.*.width + x) * 4) as i32;
+            let alpha: t27 = surface.*.pixels.data[offset + 3] as t27;
+            push[u8](&raw, png_unpremultiply(surface.*.pixels.data[offset] as t27, alpha) as u8);
+            push[u8](&raw, png_unpremultiply(surface.*.pixels.data[offset + 1] as t27, alpha) as u8);
+            push[u8](&raw, png_unpremultiply(surface.*.pixels.data[offset + 2] as t27, alpha) as u8);
+            push[u8](&raw, alpha as u8);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return raw;
+}
+
+fn png_encode_surface(surface: *Surface) PngEncodeResult {
+    let result: PngEncodeResult = PngEncodeResult{ .bytes = make[u8](128), .valid = 0, .error = PngError.None };
+    if (surface.*.width < 1 || surface.*.height < 1 || surface.*.width > 4096 || surface.*.height > 4096
+        || surface.*.width * surface.*.height * 4 > 67108864) {
+        result.error = PngError.InvalidDimensions; return result;
+    }
+    push[u8](&result.bytes, 137 as u8); push[u8](&result.bytes, 80 as u8); push[u8](&result.bytes, 78 as u8);
+    push[u8](&result.bytes, 71 as u8); push[u8](&result.bytes, 13 as u8); push[u8](&result.bytes, 10 as u8);
+    push[u8](&result.bytes, 26 as u8); push[u8](&result.bytes, 10 as u8);
+    let header: ArrayList[u8] = make[u8](13);
+    png_push_u32_be(&header, surface.*.width); png_push_u32_be(&header, surface.*.height);
+    push[u8](&header, 8 as u8); push[u8](&header, 6 as u8); push[u8](&header, 0 as u8);
+    push[u8](&header, 0 as u8); push[u8](&header, 0 as u8);
+    png_append_chunk(&result.bytes, "IHDR", &header);
+    let raw: ArrayList[u8] = png_rgba8_scanlines(surface);
+    let compressed: ArrayList[u8] = png_zlib_store(&raw);
+    png_append_chunk(&result.bytes, "IDAT", &compressed);
+    let end_data: ArrayList[u8] = make[u8](0);
+    png_append_chunk(&result.bytes, "IEND", &end_data);
+    free[u8](&header); free[u8](&raw); free[u8](&compressed); free[u8](&end_data);
+    result.valid = 1;
+    return result;
+}
+
+fn png_read_u16_be_slice(input: []u8, offset: i32) t27 {
+    if (offset < 0 || offset + 2 > input.len) { return -1; }
+    return (input[offset] as t27) * 256 + input[offset + 1] as t27;
+}
+
+fn png_parse_frame_control(input: []u8, offset: i32) PngFrameControl {
+    return PngFrameControl{ .sequence = png_read_u32_be(input, offset),
+        .width = png_read_u32_be(input, offset + 4), .height = png_read_u32_be(input, offset + 8),
+        .x = png_read_u32_be(input, offset + 12), .y = png_read_u32_be(input, offset + 16),
+        .delay_numerator = png_read_u16_be_slice(input, offset + 20),
+        .delay_denominator = png_read_u16_be_slice(input, offset + 22),
+        .dispose = input[offset + 24] as t9, .blend = input[offset + 25] as t9 };
+}
+
+fn png_animation_frame_png(control: *PngFrameControl, bit_depth: t27, color_type: t27,
+    interlace: t27, palette: *ArrayList[u8], transparency: *ArrayList[u8],
+    compressed: *ArrayList[u8]) ArrayList[u8] {
+    let bytes: ArrayList[u8] = make[u8](len[u8](compressed.*) + 96);
+    push[u8](&bytes, 137 as u8); push[u8](&bytes, 80 as u8); push[u8](&bytes, 78 as u8);
+    push[u8](&bytes, 71 as u8); push[u8](&bytes, 13 as u8); push[u8](&bytes, 10 as u8);
+    push[u8](&bytes, 26 as u8); push[u8](&bytes, 10 as u8);
+    let header: ArrayList[u8] = make[u8](13);
+    png_push_u32_be(&header, control.*.width); png_push_u32_be(&header, control.*.height);
+    push[u8](&header, bit_depth as u8); push[u8](&header, color_type as u8);
+    push[u8](&header, 0 as u8); push[u8](&header, 0 as u8); push[u8](&header, interlace as u8);
+    png_append_chunk(&bytes, "IHDR", &header);
+    if (len[u8](palette.*) > 0) { png_append_chunk(&bytes, "PLTE", palette); }
+    if (len[u8](transparency.*) > 0) { png_append_chunk(&bytes, "tRNS", transparency); }
+    png_append_chunk(&bytes, "IDAT", compressed);
+    let empty: ArrayList[u8] = make[u8](0);
+    png_append_chunk(&bytes, "IEND", &empty);
+    free[u8](&header); free[u8](&empty);
+    return bytes;
+}
+
+fn png_animation_blend(canvas: *Surface, frame: *Surface, control: *PngFrameControl) i32 {
+    if (control.*.x + control.*.width > canvas.*.width || control.*.y + control.*.height > canvas.*.height
+        || frame.*.width != control.*.width || frame.*.height != control.*.height) { return 0; }
+    let y: t27 = 0;
+    while (y < frame.*.height) {
+        let x: t27 = 0;
+        while (x < frame.*.width) {
+            let source: i32 = ((y * frame.*.width + x) * 4) as i32;
+            let target: i32 = (((control.*.y + y) * canvas.*.width + control.*.x + x) * 4) as i32;
+            if (control.*.blend == 0) {
+                canvas.*.pixels.data[target] = frame.*.pixels.data[source];
+                canvas.*.pixels.data[target + 1] = frame.*.pixels.data[source + 1];
+                canvas.*.pixels.data[target + 2] = frame.*.pixels.data[source + 2];
+                canvas.*.pixels.data[target + 3] = frame.*.pixels.data[source + 3];
+            } else {
+                let source_alpha: t27 = frame.*.pixels.data[source + 3] as t27;
+                let inverse: t27 = 255 - source_alpha;
+                canvas.*.pixels.data[target] = clamp8((frame.*.pixels.data[source] as t27)
+                    + (canvas.*.pixels.data[target] as t27) * inverse / 255) as u8;
+                canvas.*.pixels.data[target + 1] = clamp8((frame.*.pixels.data[source + 1] as t27)
+                    + (canvas.*.pixels.data[target + 1] as t27) * inverse / 255) as u8;
+                canvas.*.pixels.data[target + 2] = clamp8((frame.*.pixels.data[source + 2] as t27)
+                    + (canvas.*.pixels.data[target + 2] as t27) * inverse / 255) as u8;
+                canvas.*.pixels.data[target + 3] = clamp8(source_alpha
+                    + (canvas.*.pixels.data[target + 3] as t27) * inverse / 255) as u8;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 1;
+}
+
+fn png_animation_clear_rect(canvas: *Surface, control: *PngFrameControl) void {
+    let y: t27 = 0;
+    while (y < control.*.height) {
+        let x: t27 = 0;
+        while (x < control.*.width) {
+            let offset: i32 = (((control.*.y + y) * canvas.*.width + control.*.x + x) * 4) as i32;
+            canvas.*.pixels.data[offset] = 0 as u8; canvas.*.pixels.data[offset + 1] = 0 as u8;
+            canvas.*.pixels.data[offset + 2] = 0 as u8; canvas.*.pixels.data[offset + 3] = 0 as u8;
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+fn png_animation_commit(result: *PngAnimationResult, canvas: *Surface, control: *PngFrameControl,
+    bit_depth: t27, color_type: t27, interlace: t27, palette: *ArrayList[u8],
+    transparency: *ArrayList[u8], compressed: *ArrayList[u8]) PngError {
+    if (len[u8](compressed.*) == 0) { return PngError.MissingData; }
+    let frame_png: ArrayList[u8] = png_animation_frame_png(control, bit_depth, color_type,
+        interlace, palette, transparency, compressed);
+    let decoded: PngResult = png_decode(frame_png.data[0..frame_png.len]);
+    free[u8](&frame_png);
+    if (decoded.valid == 0) {
+        let error: PngError = decoded.error; png_free(&decoded); return error;
+    }
+    let previous: Surface = surface_new(0, 0);
+    if (control.*.dispose == 2) { previous = surface_copy(canvas); }
+    if (png_animation_blend(canvas, &decoded.surface, control) == 0) {
+        surface_free(&previous); png_free(&decoded); return PngError.BadAnimation;
+    }
+    let denominator: t27 = control.*.delay_denominator;
+    if (denominator == 0) { denominator = 100; }
+    let delay_ms: t27 = (control.*.delay_numerator * 1000 + denominator / 2) / denominator;
+    push[PngAnimationFrame](&result.*.frames, PngAnimationFrame{ .surface = surface_copy(canvas),
+        .delay_numerator = control.*.delay_numerator, .delay_denominator = denominator,
+        .delay_ms = delay_ms, .dispose = control.*.dispose, .blend = control.*.blend });
+    if (control.*.dispose == 1) {
+        png_animation_clear_rect(canvas, control);
+    } else if (control.*.dispose == 2) {
+        surface_free(canvas);
+        canvas.* = previous;
+        previous = surface_new(0, 0);
+    }
+    surface_free(&previous);
+    png_free(&decoded);
+    return PngError.None;
+}
+
+fn png_animation_fail(result: *PngAnimationResult, canvas: *Surface,
+    palette: *ArrayList[u8], transparency: *ArrayList[u8], compressed: *ArrayList[u8],
+    error: PngError, offset: t27) PngAnimationResult {
+    surface_free(canvas); free[u8](palette); free[u8](transparency); free[u8](compressed);
+    png_animation_free(result);
+    return png_animation_empty(error, offset);
+}
+
+fn png_decode_animation(input: []u8) PngAnimationResult {
+    let result: PngAnimationResult = png_animation_empty(PngError.None, 0);
+    let canvas: Surface = surface_new(0, 0);
+    let palette: ArrayList[u8] = make[u8](768);
+    let transparency: ArrayList[u8] = make[u8](256);
+    let compressed: ArrayList[u8] = make[u8](1024);
+    if (input.len < 8 || input[0] != 137 || input[1] != 80 || input[2] != 78 || input[3] != 71
+        || input[4] != 13 || input[5] != 10 || input[6] != 26 || input[7] != 10) {
+        return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+            PngError.BadSignature, 0);
+    }
+    if (input.len > 67108864) {
+        return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+            PngError.TooLarge, 0);
+    }
+    let width: t27 = 0; let height: t27 = 0; let bit_depth: t27 = 0;
+    let color_type: t27 = 0; let interlace: t27 = 0;
+    let seen_header: i32 = 0; let seen_actl: i32 = 0; let seen_idat: i32 = 0;
+    let idat_closed: i32 = 0; let seen_end: i32 = 0; let active: i32 = 0;
+    let active_uses_idat: i32 = 0; let expected_frames: t27 = 0; let play_count: t27 = 0;
+    let expected_sequence: t27 = 0; let committed_frames: t27 = 0;
+    let control: PngFrameControl = PngFrameControl{ .sequence = 0, .width = 0, .height = 0,
+        .x = 0, .y = 0, .delay_numerator = 0, .delay_denominator = 100, .dispose = 0, .blend = 0 };
+    let offset: i32 = 8;
+    while (offset < input.len && seen_end == 0) {
+        if (offset + 12 > input.len) {
+            return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                PngError.Truncated, offset as t27);
+        }
+        let length_value: t27 = png_read_u32_be(input, offset);
+        if (length_value < 0 || length_value > 67108864) {
+            return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                PngError.TooLarge, offset as t27);
+        }
+        let length: i32 = length_value as i32;
+        let type_offset: i32 = offset + 4; let data_offset: i32 = offset + 8;
+        let crc_offset: i32 = data_offset + length;
+        if (crc_offset + 4 > input.len) {
+            return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                PngError.Truncated, offset as t27);
+        }
+        if (png_crc_chunk(input, type_offset, data_offset, length) != png_read_u32_be(input, crc_offset)) {
+            return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                PngError.BadCrc, crc_offset as t27);
+        }
+        if (png_chunk_is(input, type_offset, "IHDR") == 1) {
+            if (seen_header == 1 || offset != 8 || length != 13) {
+                return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                    PngError.BadChunk, offset as t27);
+            }
+            width = png_read_u32_be(input, data_offset); height = png_read_u32_be(input, data_offset + 4);
+            bit_depth = input[data_offset + 8] as t27; color_type = input[data_offset + 9] as t27;
+            interlace = input[data_offset + 12] as t27;
+            if (width < 1 || height < 1 || width > 4096 || height > 4096
+                || width * height * 4 > 67108864 || input[data_offset + 10] != 0
+                || input[data_offset + 11] != 0 || interlace > 1
+                || png_valid_bit_depth(color_type, bit_depth) == 0) {
+                return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                    PngError.UnsupportedFormat, data_offset as t27);
+            }
+            surface_free(&canvas);
+            canvas = surface_new(width, height);
+            result.width = width; result.height = height;
+            seen_header = 1;
+        } else if (png_chunk_is(input, type_offset, "acTL") == 1) {
+            if (seen_header == 0 || seen_actl == 1 || seen_idat == 1 || length != 8) {
+                return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                    PngError.BadAnimation, offset as t27);
+            }
+            expected_frames = png_read_u32_be(input, data_offset);
+            play_count = png_read_u32_be(input, data_offset + 4);
+            if (expected_frames < 1 || expected_frames > 1024
+                || expected_frames * width * height * 4 > 134217728) {
+                return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                    PngError.TooLarge, data_offset as t27);
+            }
+            seen_actl = 1;
+        } else if (png_chunk_is(input, type_offset, "PLTE") == 1) {
+            if (seen_header == 0 || seen_idat == 1 || len[u8](palette) > 0 || length < 3
+                || length > 768 || (length % 3) != 0) {
+                return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                    PngError.BadChunk, offset as t27);
+            }
+            let i: i32 = 0; while (i < length) { push[u8](&palette, input[data_offset + i]); i = i + 1; }
+        } else if (png_chunk_is(input, type_offset, "tRNS") == 1) {
+            if (seen_header == 0 || seen_idat == 1 || len[u8](transparency) > 0 || length > 256) {
+                return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                    PngError.BadChunk, offset as t27);
+            }
+            let i: i32 = 0; while (i < length) { push[u8](&transparency, input[data_offset + i]); i = i + 1; }
+        } else if (png_chunk_is(input, type_offset, "fcTL") == 1) {
+            if (seen_actl == 0 || length != 26) {
+                return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                    PngError.BadAnimation, offset as t27);
+            }
+            if (active == 1) {
+                let commit_error: PngError = png_animation_commit(&result, &canvas, &control,
+                    bit_depth, color_type, interlace, &palette, &transparency, &compressed);
+                if (commit_error != PngError.None) {
+                    return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                        commit_error, offset as t27);
+                }
+                committed_frames = committed_frames + 1; compressed.len = 0;
+            }
+            control = png_parse_frame_control(input, data_offset);
+            if (control.sequence != expected_sequence || control.width < 1 || control.height < 1
+                || control.x + control.width > width || control.y + control.height > height
+                || control.dispose > 2 || control.blend > 1 || committed_frames >= expected_frames) {
+                return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                    PngError.BadAnimation, data_offset as t27);
+            }
+            expected_sequence = expected_sequence + 1;
+            active_uses_idat = 0;
+            if (seen_idat == 0 && committed_frames == 0) { active_uses_idat = 1; }
+            if (active_uses_idat == 1 && (control.width != width || control.height != height
+                || control.x != 0 || control.y != 0)) {
+                return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                    PngError.BadAnimation, data_offset as t27);
+            }
+            if (seen_idat == 1) { idat_closed = 1; }
+            active = 1;
+        } else if (png_chunk_is(input, type_offset, "IDAT") == 1) {
+            if (seen_header == 0 || idat_closed == 1) {
+                return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                    PngError.BadChunk, offset as t27);
+            }
+            seen_idat = 1;
+            if (active == 1 && active_uses_idat == 1) {
+                if ((len[u8](compressed) as t27) + length_value > 33554432) {
+                    return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                        PngError.TooLarge, offset as t27);
+                }
+                let i: i32 = 0; while (i < length) { push[u8](&compressed, input[data_offset + i]); i = i + 1; }
+            }
+        } else if (png_chunk_is(input, type_offset, "fdAT") == 1) {
+            idat_closed = 1;
+            if (seen_actl == 0 || seen_idat == 0 || active == 0 || active_uses_idat == 1 || length < 5
+                || png_read_u32_be(input, data_offset) != expected_sequence) {
+                return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                    PngError.BadAnimation, offset as t27);
+            }
+            expected_sequence = expected_sequence + 1;
+            if ((len[u8](compressed) as t27) + length_value - 4 > 33554432) {
+                return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                    PngError.TooLarge, offset as t27);
+            }
+            let i: i32 = 4; while (i < length) { push[u8](&compressed, input[data_offset + i]); i = i + 1; }
+        } else if (png_chunk_is(input, type_offset, "IEND") == 1) {
+            if (length != 0 || seen_idat == 0) {
+                return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                    PngError.BadChunk, offset as t27);
+            }
+            if (active == 1) {
+                let commit_error: PngError = png_animation_commit(&result, &canvas, &control,
+                    bit_depth, color_type, interlace, &palette, &transparency, &compressed);
+                if (commit_error != PngError.None) {
+                    return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                        commit_error, offset as t27);
+                }
+                committed_frames = committed_frames + 1; compressed.len = 0; active = 0;
+            }
+            seen_end = 1;
+        } else {
+            if (seen_idat == 1) { idat_closed = 1; }
+            let first_type: t27 = input[type_offset] as t27;
+            if (first_type >= 65 && first_type <= 90) {
+                return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+                    PngError.UnsupportedFormat, type_offset as t27);
+            }
+        }
+        offset = crc_offset + 4;
+    }
+    if (seen_actl == 0) {
+        return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+            PngError.NotAnimated, 0);
+    }
+    if (seen_end == 0 || offset != input.len || committed_frames != expected_frames
+        || len[PngAnimationFrame](result.frames) != (expected_frames as i32)) {
+        return png_animation_fail(&result, &canvas, &palette, &transparency, &compressed,
+            PngError.BadAnimation, offset as t27);
+    }
+    surface_free(&canvas); free[u8](&palette); free[u8](&transparency); free[u8](&compressed);
+    result.valid = 1; result.error = PngError.None; result.play_count = play_count;
+    return result;
+}
+
+fn png_load_animation_file(path: []u8) PngAnimationResult {
+    if (_zag_file_exists(path) == 0) { return png_animation_empty(PngError.Io, 0); }
+    return png_decode_animation(_zag_read_file(path));
+}
+
+fn png_push_u16_be(out: *ArrayList[u8], value: t27) void {
+    push[u8](out, ((value / 256) % 256) as u8); push[u8](out, (value % 256) as u8);
+}
+
+fn png_animation_append_control(out: *ArrayList[u8], sequence: t27,
+    frame: *PngAnimationSourceFrame) void {
+    let data: ArrayList[u8] = make[u8](26);
+    png_push_u32_be(&data, sequence); png_push_u32_be(&data, frame.*.surface.width);
+    png_push_u32_be(&data, frame.*.surface.height); png_push_u32_be(&data, frame.*.x);
+    png_push_u32_be(&data, frame.*.y); png_push_u16_be(&data, frame.*.delay_numerator);
+    png_push_u16_be(&data, frame.*.delay_denominator);
+    push[u8](&data, frame.*.dispose as u8); push[u8](&data, frame.*.blend as u8);
+    png_append_chunk(out, "fcTL", &data); free[u8](&data);
+}
+
+fn png_animation_append_frame_data(out: *ArrayList[u8], sequence: t27,
+    compressed: *ArrayList[u8]) void {
+    let data: ArrayList[u8] = make[u8](len[u8](compressed.*) + 4);
+    png_push_u32_be(&data, sequence);
+    let i: i32 = 0;
+    while (i < len[u8](compressed.*)) { push[u8](&data, compressed.*.data[i]); i = i + 1; }
+    png_append_chunk(out, "fdAT", &data); free[u8](&data);
+}
+
+fn png_animation_spec_valid(spec: *PngAnimationEncodeSpec) PngError {
+    if (spec.*.width < 1 || spec.*.height < 1 || spec.*.width > 4096 || spec.*.height > 4096) {
+        return PngError.InvalidDimensions;
+    }
+    let frame_count: i32 = len[PngAnimationSourceFrame](spec.*.frames);
+    if (frame_count < 1) { return PngError.MissingData; }
+    if (frame_count > 1024 || spec.*.play_count < 0 || spec.*.play_count > 4294967295
+        || (frame_count as t27) * spec.*.width * spec.*.height * 4 > 134217728) {
+        return PngError.TooLarge;
+    }
+    let i: i32 = 0;
+    while (i < frame_count) {
+        let frame: PngAnimationSourceFrame = spec.*.frames.data[i];
+        if (frame.surface.width < 1 || frame.surface.height < 1
+            || frame.x < 0 || frame.y < 0 || frame.x + frame.surface.width > spec.*.width
+            || frame.y + frame.surface.height > spec.*.height
+            || len[u8](frame.surface.pixels) != ((frame.surface.width * frame.surface.height * 4) as i32)
+            || frame.delay_numerator < 0 || frame.delay_numerator > 65535
+            || frame.delay_denominator < 0 || frame.delay_denominator > 65535
+            || frame.dispose > 2 || frame.blend > 1) { return PngError.BadAnimation; }
+        if (i == 0 && (frame.surface.width != spec.*.width || frame.surface.height != spec.*.height
+            || frame.x != 0 || frame.y != 0)) { return PngError.BadAnimation; }
+        i = i + 1;
+    }
+    return PngError.None;
+}
+
+fn png_encode_animation_frames(spec: *PngAnimationEncodeSpec) PngEncodeResult {
+    let result: PngEncodeResult = PngEncodeResult{ .bytes = make[u8](256), .valid = 0,
+        .error = png_animation_spec_valid(spec) };
+    if (result.error != PngError.None) { return result; }
+    push[u8](&result.bytes, 137 as u8); push[u8](&result.bytes, 80 as u8); push[u8](&result.bytes, 78 as u8);
+    push[u8](&result.bytes, 71 as u8); push[u8](&result.bytes, 13 as u8); push[u8](&result.bytes, 10 as u8);
+    push[u8](&result.bytes, 26 as u8); push[u8](&result.bytes, 10 as u8);
+    let header: ArrayList[u8] = make[u8](13);
+    png_push_u32_be(&header, spec.*.width); png_push_u32_be(&header, spec.*.height);
+    push[u8](&header, 8 as u8); push[u8](&header, 6 as u8); push[u8](&header, 0 as u8);
+    push[u8](&header, 0 as u8); push[u8](&header, 0 as u8);
+    png_append_chunk(&result.bytes, "IHDR", &header);
+    let animation: ArrayList[u8] = make[u8](8);
+    png_push_u32_be(&animation, len[PngAnimationSourceFrame](spec.*.frames) as t27);
+    png_push_u32_be(&animation, spec.*.play_count);
+    png_append_chunk(&result.bytes, "acTL", &animation);
+    let sequence: t27 = 0;
+    let i: i32 = 0;
+    while (i < len[PngAnimationSourceFrame](spec.*.frames)) {
+        let frame: PngAnimationSourceFrame = spec.*.frames.data[i];
+        png_animation_append_control(&result.bytes, sequence, &frame); sequence = sequence + 1;
+        let raw: ArrayList[u8] = png_rgba8_scanlines(&frame.surface);
+        let compressed: ArrayList[u8] = png_zlib_store(&raw);
+        if (i == 0) {
+            png_append_chunk(&result.bytes, "IDAT", &compressed);
+        } else {
+            png_animation_append_frame_data(&result.bytes, sequence, &compressed); sequence = sequence + 1;
+        }
+        free[u8](&raw); free[u8](&compressed);
+        i = i + 1;
+    }
+    let empty: ArrayList[u8] = make[u8](0); png_append_chunk(&result.bytes, "IEND", &empty);
+    free[u8](&header); free[u8](&animation); free[u8](&empty);
+    result.valid = 1; result.error = PngError.None;
+    return result;
+}
+
+fn png_encode_animation(animation: *PngAnimationResult) PngEncodeResult {
+    if (animation.*.valid == 0) {
+        return PngEncodeResult{ .bytes = make[u8](16), .valid = 0, .error = PngError.BadAnimation };
+    }
+    let sources: ArrayList[PngAnimationSourceFrame] = make[PngAnimationSourceFrame](
+        len[PngAnimationFrame](animation.*.frames));
+    let i: i32 = 0;
+    while (i < len[PngAnimationFrame](animation.*.frames)) {
+        let frame: PngAnimationFrame = animation.*.frames.data[i];
+        push[PngAnimationSourceFrame](&sources, PngAnimationSourceFrame{ .surface = frame.surface,
+            .x = 0, .y = 0, .delay_numerator = frame.delay_numerator,
+            .delay_denominator = frame.delay_denominator, .dispose = 0, .blend = 0 });
+        i = i + 1;
+    }
+    let spec: PngAnimationEncodeSpec = PngAnimationEncodeSpec{ .width = animation.*.width,
+        .height = animation.*.height, .play_count = animation.*.play_count, .frames = sources };
+    let encoded: PngEncodeResult = png_encode_animation_frames(&spec);
+    free[PngAnimationSourceFrame](&sources);
+    return encoded;
+}

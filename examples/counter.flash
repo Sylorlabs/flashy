@@ -1,0 +1,18 @@
+@import("../src/flashy.flash") as fy
+
+fn main() i32 {
+    let ui: Ui = ui_new(320, 200);
+    ui_begin(&ui);
+    let s: Style = theme_button();
+    let button: i32 = ui_node(&ui, 1, NodeKind.Button, -1, rect(32, 32, 160, 48), s,
+        semantics(Role.Button, "Launch", "", "launch"), "Launch", Action{ .id = 1 });
+    ui_end(&ui);
+    let surface: Surface = surface_new(320, 200);
+    let painted: t27 = ui_render(&ui, &surface, 1);
+    _zag_print("Flashy ");
+    _zag_println(flashy_version());
+    _zag_print("checksum-valid=");
+    if (surface_checksum(&surface) > 0) { _zag_println("yes"); }
+    else { _zag_println("no"); }
+    return 0;
+}

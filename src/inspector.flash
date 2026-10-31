@@ -1,0 +1,176 @@
+// Deterministic inspector snapshots over retained component, layout, focus, and semantic state.
+
+struct InspectorNode {
+    key: t27,
+    kind: NodeKind,
+    role: Role,
+    parent_key: t27,
+    bounds: Rect,
+    depth: t27,
+    focus_order: t27,
+    focused: i32,
+    dirty_layout: i32,
+    dirty_paint: i32,
+    caret: t27,
+    selection_start: t27,
+    selection_end: t27,
+    grapheme_count: t27,
+    selection_anchor: t27,
+    selection_valid: i32,
+    clipped: i32,
+    invalid_geometry: i32,
+    undersized: i32,
+    unlabeled: i32,
+    off_token_spacing: i32,
+    low_contrast: i32,
+    overlaps_sibling: i32,
+}
+
+struct InspectorSnapshot {
+    nodes: ArrayList[InspectorNode],
+    reconcile: ReconcileStats,
+    focusable: t27,
+    violations: t27,
+}
+
+fn inspector_node_depth(ui: *Ui, node_id: i32) t27 {
+    let depth: t27 = 0; let current: i32 = node_id; let visited: i32 = 0;
+    while (current >= 0 && current < len[Node](ui.*.nodes) && visited < len[Node](ui.*.nodes)) {
+        let node: Node = get[Node](ui.*.nodes, current);
+        current = node.parent;
+        if (current >= 0) { depth = depth + 1; }
+        visited = visited + 1;
+    }
+    return depth;
+}
+
+fn ui_inspect(ui: *Ui) InspectorSnapshot {
+    let snapshot: InspectorSnapshot = InspectorSnapshot{ .nodes = make[InspectorNode](len[Node](ui.*.nodes)),
+        .reconcile = ui.*.reconcile, .focusable = 0, .violations = 0 };
+    let focus_order: t27 = 0; let i: i32 = 0;
+    while (i < len[Node](ui.*.nodes)) {
+        let node: Node = get[Node](ui.*.nodes, i);
+        if (node.live == 1) {
+            let parent_key: t27 = 0;
+            if (node.parent >= 0 && node.parent < len[Node](ui.*.nodes)) {
+                parent_key = get[Node](ui.*.nodes, node.parent).key;
+            }
+            let inspect: InspectorNode = InspectorNode{ .key = node.key, .kind = node.kind,
+                .role = node.semantics.role, .parent_key = parent_key, .bounds = node.bounds,
+                .depth = inspector_node_depth(ui, i), .focus_order = -1, .focused = node.focused,
+                .dirty_layout = node.dirty_layout, .dirty_paint = node.dirty_paint, .caret = node.caret,
+                .selection_start = node.selection_start, .selection_end = node.selection_end,
+                .grapheme_count = 0, .selection_anchor = 0, .selection_valid = 1,
+                .clipped = 0, .invalid_geometry = 0, .undersized = 0, .unlabeled = 0, .off_token_spacing = 0,
+                .low_contrast = 0, .overlaps_sibling = 0 };
+            if (node.kind == NodeKind.TextField) {
+                let value: []u8 = text_buffer_view(&node.text_buffer);
+                if (utf8_validate(value).valid == 1) { inspect.grapheme_count = utf8_grapheme_count(value); }
+                if (text_node_storage_valid(&node) == 1) {
+                    inspect.selection_anchor = ui_get_text_selection(ui, i).anchor;
+                } else {
+                    inspect.selection_anchor = -1; inspect.selection_valid = 0;
+                }
+            }
+            if (node_interactive(node) == 1) {
+                inspect.focus_order = focus_order; focus_order = focus_order + 1; snapshot.focusable = snapshot.focusable + 1;
+            }
+            layout_check_axis(node.bounds.x, node.bounds.w, ui.*.width,
+                &inspect.clipped, &inspect.invalid_geometry);
+            layout_check_axis(node.bounds.y, node.bounds.h, ui.*.height,
+                &inspect.clipped, &inspect.invalid_geometry);
+            if (layout_style_geometry_valid(ui, i, node) == 0) { inspect.invalid_geometry = 1; }
+            if ((node.semantics.role == Role.Button || node.semantics.role == Role.Checkbox
+                || node.semantics.role == Role.Radio || node.semantics.role == Role.Tab
+                || node.semantics.role == Role.MenuItem) && (node.bounds.w < 44 || node.bounds.h < 44)) {
+                inspect.undersized = 1;
+            }
+            if (role_needs_label(node.semantics.role) == 1 && node.semantics.label.len == 0) { inspect.unlabeled = 1; }
+            if ((node.style.padding % 4) != 0 || (node.style.gap % 4) != 0 || (node.style.margin % 4) != 0) {
+                inspect.off_token_spacing = 1;
+            }
+            if (node.text.len > 0 && color_contrast_ok(node.style.fg, node.style.bg) == 0) { inspect.low_contrast = 1; }
+            let sibling: i32 = 0;
+            while (sibling < len[Node](ui.*.nodes)) {
+                let other: Node = get[Node](ui.*.nodes, sibling);
+                if (sibling != i && other.live == 1 && node.parent >= 0 && other.parent == node.parent
+                    && rect_intersects(node.bounds, other.bounds) == 1) { inspect.overlaps_sibling = 1; }
+                sibling = sibling + 1;
+            }
+            snapshot.violations = snapshot.violations + inspect.clipped as t27 + inspect.invalid_geometry as t27
+                + inspect.undersized as t27
+                + inspect.unlabeled as t27 + inspect.off_token_spacing as t27 + inspect.low_contrast as t27
+                + inspect.overlaps_sibling as t27;
+            if (inspect.selection_valid == 0) { snapshot.violations = snapshot.violations + 1; }
+            push[InspectorNode](&snapshot.nodes, inspect);
+        }
+        i = i + 1;
+    }
+    return snapshot;
+}
+
+fn inspector_find_key(snapshot: *InspectorSnapshot, key: t27) i32 {
+    let i: i32 = 0;
+    while (i < len[InspectorNode](snapshot.*.nodes)) {
+        if (get[InspectorNode](snapshot.*.nodes, i).key == key) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn inspector_print_number(value: i64) void {
+    let rendered: []u8 = _zag_i64_to_str(value);
+    _zag_print(rendered);
+    _zag_str_free(rendered);
+}
+
+fn inspector_println_number(value: i64) void {
+    let rendered: []u8 = _zag_i64_to_str(value);
+    _zag_println(rendered);
+    _zag_str_free(rendered);
+}
+
+fn inspector_dump(snapshot: *InspectorSnapshot) void {
+    let i: i32 = 0;
+    _zag_println("Flashy inspector snapshot");
+    _zag_print("reconcile mounted="); inspector_print_number(snapshot.*.reconcile.mounted as i64);
+    _zag_print(" updated="); inspector_print_number(snapshot.*.reconcile.updated as i64);
+    _zag_print(" unmounted="); inspector_print_number(snapshot.*.reconcile.unmounted as i64);
+    _zag_print(" focus_preserved="); inspector_print_number(snapshot.*.reconcile.focus_preserved as i64);
+    _zag_print(" state_preserved="); inspector_print_number(snapshot.*.reconcile.state_preserved as i64);
+    _zag_print(" state_migrated="); inspector_print_number(snapshot.*.reconcile.state_migrated as i64);
+    _zag_print(" focusable="); inspector_print_number(snapshot.*.focusable as i64);
+    _zag_print(" violations="); inspector_println_number(snapshot.*.violations as i64);
+    while (i < len[InspectorNode](snapshot.*.nodes)) {
+        let node: InspectorNode = get[InspectorNode](snapshot.*.nodes, i);
+        _zag_print("node["); inspector_print_number(i as i64); _zag_print("] ");
+        _zag_print("key="); inspector_print_number(node.key as i64);
+        _zag_print(" role="); inspector_print_number(node.role as i64);
+        _zag_print(" kind="); inspector_print_number(node.kind as i64);
+        _zag_print(" parent_key="); inspector_print_number(node.parent_key as i64);
+        _zag_print(" focused="); inspector_print_number(node.focused as i64);
+        _zag_print(" dirty_layout="); inspector_print_number(node.dirty_layout as i64);
+        _zag_print(" dirty_paint="); inspector_print_number(node.dirty_paint as i64);
+        _zag_print(" graphemes="); inspector_print_number(node.grapheme_count as i64);
+        _zag_print(" caret="); inspector_print_number(node.caret as i64);
+        _zag_print(" selection_anchor="); inspector_print_number(node.selection_anchor as i64);
+        _zag_print(" selection_valid="); inspector_print_number(node.selection_valid as i64);
+        _zag_print(" focus_order="); inspector_print_number(node.focus_order as i64);
+        _zag_print(" clipped="); inspector_print_number(node.clipped as i64);
+        _zag_print(" invalid_geometry="); inspector_print_number(node.invalid_geometry as i64);
+        _zag_print(" undersized="); inspector_print_number(node.undersized as i64);
+        _zag_print(" unlabeled="); inspector_print_number(node.unlabeled as i64);
+        _zag_print(" off_token_spacing="); inspector_print_number(node.off_token_spacing as i64);
+        _zag_print(" low_contrast="); inspector_print_number(node.low_contrast as i64);
+        _zag_print(" overlaps_sibling="); inspector_print_number(node.overlaps_sibling as i64);
+        _zag_print(" bounds="); inspector_print_number(node.bounds.x as i64); _zag_print(",");
+        inspector_print_number(node.bounds.y as i64); _zag_print(",");
+        inspector_print_number(node.bounds.w as i64); _zag_print(",");
+        inspector_println_number(node.bounds.h as i64);
+        i = i + 1;
+    }
+}
+
+fn inspector_free(snapshot: *InspectorSnapshot) void {
+    free[InspectorNode](&snapshot.*.nodes); snapshot.*.focusable = 0; snapshot.*.violations = 0;
+}

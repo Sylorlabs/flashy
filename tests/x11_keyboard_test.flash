@@ -1,0 +1,633 @@
+@import("../src/flashy.flash")
+
+fn x11_keyboard_expect(ok: i32, message: []u8) i32 {
+    if (ok == 0) { _zag_print("FAIL "); _zag_println(message); return 1; }
+    return 0;
+}
+
+fn x11_test_key_event(response: t27, keycode: t27, time: t27,
+    window: t27, state: t27) WireBuffer {
+    let out: WireBuffer = wire_new(32);
+    wire_push_u8(&out, response); wire_push_u8(&out, keycode); wire_push_u16_le(&out, 7);
+    wire_push_u32_le(&out, time); wire_push_u32_le(&out, 256); wire_push_u32_le(&out, window);
+    wire_push_u32_le(&out, 0); wire_push_u16_le(&out, 1); wire_push_u16_le(&out, 2);
+    wire_push_u16_le(&out, 65532); wire_push_u16_le(&out, 7); wire_push_u16_le(&out, state);
+    wire_push_u8(&out, 1); wire_push_u8(&out, 0);
+    return out;
+}
+
+fn x11_test_mapping_notify(request: t27, first_keycode: t27, count: t27) WireBuffer {
+    let out: WireBuffer = wire_new(32);
+    wire_push_u8(&out, 34); wire_push_u8(&out, request); wire_push_u16_le(&out, 8);
+    wire_push_u8(&out, first_keycode); wire_push_u8(&out, count);
+    while (len[u8](out.bytes) < 32) { wire_push_u8(&out, 0); }
+    return out;
+}
+
+fn x11_test_keysyms(per_code: t27, keycode_count: t27) ArrayList[t27] {
+    let out: ArrayList[t27] = make[t27]((per_code * keycode_count) as i32);
+    let keycode: t27 = 0;
+    while (keycode < keycode_count) {
+        let column: t27 = 0;
+        while (column < per_code) {
+            push[t27](&out, 4096 + keycode * 16 + column);
+            column = column + 1;
+        }
+        keycode = keycode + 1;
+    }
+    return out;
+}
+
+fn x11_test_modifiers() ArrayList[t27] {
+    let out: ArrayList[t27] = make[t27](16);
+    // Two keycode slots for each of Shift, Lock, Control, and Mod1-Mod5.
+    push[t27](&out, 50); push[t27](&out, 62);
+    push[t27](&out, 66); push[t27](&out, 0);
+    push[t27](&out, 37); push[t27](&out, 105);
+    push[t27](&out, 64); push[t27](&out, 0);
+    push[t27](&out, 77); push[t27](&out, 0);
+    push[t27](&out, 0); push[t27](&out, 0);
+    push[t27](&out, 133); push[t27](&out, 134);
+    push[t27](&out, 92); push[t27](&out, 0);
+    return out;
+}
+
+fn x11_test_native_window(window_id: t27, gc_id: t27) X11NativeWindow {
+    return X11NativeWindow{ .window_id = window_id, .gc_id = gc_id,
+        .width = 32, .height = 24, .live = 1, .mapped = 1 };
+}
+
+fn x11_test_set_sequence(input: *WireBuffer, sequence: t27) void {
+    input.*.bytes.data[2] = (sequence % 256) as u8;
+    input.*.bytes.data[3] = ((sequence / 256) % 256) as u8;
+}
+
+fn x11_test_wire_range(input: *WireBuffer, start: i32, end: i32) WireBuffer {
+    let out: WireBuffer = wire_new(end - start);
+    let i: i32 = start;
+    while (i < end) { wire_push_u8(&out, wire_read_u8(input, i)); i = i + 1; }
+    return out;
+}
+
+fn x11_test_server_header(response: t27, sequence: t27, units: t27) WireBuffer {
+    let out: WireBuffer = wire_new(32);
+    wire_push_u8(&out, response); wire_push_u8(&out, 0);
+    wire_push_u16_le(&out, sequence); wire_push_u32_le(&out, units);
+    while (len[u8](out.bytes) < 32) { wire_push_u8(&out, 0); }
+    return out;
+}
+
+fn x11_test_map_event(window: t27, sequence: t27) WireBuffer {
+    let out: WireBuffer = wire_new(32);
+    wire_push_u8(&out, 19); wire_push_u8(&out, 0); wire_push_u16_le(&out, sequence);
+    wire_push_u32_le(&out, 256); wire_push_u32_le(&out, window);
+    while (len[u8](out.bytes) < 32) { wire_push_u8(&out, 0); }
+    return out;
+}
+
+fn main() i32 {
+    let failures: i32 = 0;
+
+    let setup_wire: WireBuffer = x11_setup_success(268435456, 268435455, 65535);
+    let setup: X11SetupSuccess = x11_decode_setup_success(&setup_wire);
+    failures = failures + x11_keyboard_expect(setup.valid == 1
+        && setup.minimum_keycode == 8 && setup.maximum_keycode == 255,
+        "X11 setup captures the server keycode bounds");
+
+    let map_request: WireBuffer = x11_get_keyboard_mapping_request(8, 3);
+    let map_frame: X11Request = x11_decode_request(&map_request, 0);
+    failures = failures + x11_keyboard_expect(map_frame.valid == 1
+        && map_frame.opcode == 101 && map_frame.detail == 8 && map_frame.length_units == 2
+        && wire_read_u8(&map_request, map_frame.payload_offset) == 3,
+        "GetKeyboardMapping request preserves first keycode and bounded count");
+    let bad_map_request: WireBuffer = x11_get_keyboard_mapping_request(254, 3);
+    failures = failures + x11_keyboard_expect(bad_map_request.error == 1,
+        "GetKeyboardMapping rejects a count outside the core keycode range");
+
+    let keysyms: ArrayList[t27] = x11_test_keysyms(4, 3);
+    let map_reply: WireBuffer = x11_keyboard_mapping_reply(4, &keysyms);
+    let mapping: X11KeyboardMapping = x11_decode_keyboard_mapping_reply(&map_reply, 8, 3, 8, 10);
+    let lookup: X11KeysymLookup = x11_keyboard_lookup(&mapping, 9, 3);
+    failures = failures + x11_keyboard_expect(mapping.valid == 1
+        && mapping.first_keycode == 8 && mapping.keycode_count == 3
+        && mapping.keysyms_per_keycode == 4 && len[t27](mapping.keysyms) == 12
+        && lookup.valid == 1 && lookup.keycode == 9 && lookup.keysym == 4115
+        && lookup.column == 3 && lookup.group == 1 && lookup.level == 1,
+        "keyboard reply decodes bounded keysyms without assigning text or a US layout");
+    failures = failures + x11_keyboard_expect(x11_keyboard_lookup(&mapping, 7, 0).valid == 0
+        && x11_keyboard_lookup(&mapping, 11, 0).valid == 0
+        && x11_keyboard_lookup(&mapping, 8, 4).valid == 0
+        && x11_keyboard_lookup_level(&mapping, 8, 0, 2).valid == 0,
+        "keysym lookup enforces keycode, group, and level bounds");
+
+    let short_reply: WireBuffer = x11_keyboard_mapping_reply(4, &keysyms);
+    short_reply.bytes.len = short_reply.bytes.len - 4;
+    let short_mapping: X11KeyboardMapping = x11_decode_keyboard_mapping_reply(&short_reply, 8, 3, 8, 10);
+    let wrong_count_mapping: X11KeyboardMapping = x11_decode_keyboard_mapping_reply(&map_reply, 8, 2, 8, 10);
+    let bad_per_reply: WireBuffer = x11_keyboard_mapping_reply(4, &keysyms);
+    bad_per_reply.bytes.data[1] = 0 as u8;
+    let bad_per_mapping: X11KeyboardMapping = x11_decode_keyboard_mapping_reply(&bad_per_reply, 8, 3, 8, 10);
+    failures = failures + x11_keyboard_expect(short_mapping.valid == 0
+        && wrong_count_mapping.valid == 0 && bad_per_mapping.valid == 0,
+        "keyboard mapping rejects truncated, mismatched-count, and zero-width replies");
+
+    let modifier_request: WireBuffer = x11_get_modifier_mapping_request();
+    let modifier_frame: X11Request = x11_decode_request(&modifier_request, 0);
+    failures = failures + x11_keyboard_expect(modifier_frame.valid == 1
+        && modifier_frame.opcode == 119 && modifier_frame.length_units == 1,
+        "GetModifierMapping uses the exact core request frame");
+    let modifier_keycodes: ArrayList[t27] = x11_test_modifiers();
+    let modifier_reply: WireBuffer = x11_modifier_mapping_reply(2, &modifier_keycodes);
+    let modifiers: X11ModifierMapping = x11_decode_modifier_mapping_reply(&modifier_reply);
+    failures = failures + x11_keyboard_expect(modifiers.valid == 1
+        && modifiers.keycodes_per_modifier == 2
+        && modifiers.shift_resolved == 1 && modifiers.control_resolved == 1
+        && x11_modifier_keycode_is_shift(&modifiers, 50) == 1
+        && x11_modifier_keycode_is_control(&modifiers, 105) == 1
+        && x11_modifier_mapping_within_bounds(&modifiers, 8, 255) == 1
+        && x11_modifier_mapping_within_bounds(&modifiers, 8, 100) == 0
+        && modifiers.mod1_resolved == 0 && modifiers.mod2_resolved == 0
+        && modifiers.mod3_resolved == 0 && modifiers.mod4_resolved == 0
+        && modifiers.mod5_resolved == 0,
+        "modifier mapping identifies Shift and Control without guessing Alt or Meta");
+    failures = failures + x11_keyboard_expect(x11_state_shift(5) == 1
+        && x11_state_control(5) == 1 && x11_state_shift(8) == 0
+        && x11_state_control(8) == 0,
+        "wire state exposes only explicit Shift and Control bits");
+    let malformed_modifier_reply: WireBuffer = x11_modifier_mapping_reply(2, &modifier_keycodes);
+    malformed_modifier_reply.bytes.data[4] = 5 as u8;
+    let malformed_modifiers: X11ModifierMapping = x11_decode_modifier_mapping_reply(&malformed_modifier_reply);
+    failures = failures + x11_keyboard_expect(malformed_modifiers.valid == 0,
+        "modifier mapping rejects an inconsistent reply length");
+
+    let press_wire: WireBuffer = x11_test_key_event(2, 38, 123456, 900, 5);
+    let press: X11Event = x11_decode_event(&press_wire, 0);
+    let release_wire: WireBuffer = x11_test_key_event(131, 38, 123457, 900, 4);
+    let release: X11Event = x11_decode_event(&release_wire, 0);
+    failures = failures + x11_keyboard_expect(press.valid == 1
+        && press.kind == X11EventKind.KeyDown && press.response_type == 2
+        && press.send_event == 0 && press.sequence == 7
+        && press.detail == 38 && press.time == 123456 && press.window == 900
+        && press.state == 5 && press.x == -4 && press.y == 7,
+        "KeyPress preserves response type, keycode, time, state, window, and signed coordinates");
+    failures = failures + x11_keyboard_expect(release.valid == 1
+        && release.kind == X11EventKind.KeyUp && release.response_type == 3
+        && release.send_event == 1 && release.sequence == 7
+        && release.detail == 38 && release.time == 123457 && release.state == 4,
+        "KeyRelease remains a release even when the send-event bit is present");
+    let short_event: WireBuffer = wire_new(31);
+    while (len[u8](short_event.bytes) < 31) { wire_push_u8(&short_event, 0); }
+    failures = failures + x11_keyboard_expect(x11_decode_event(&short_event, 0).valid == 0,
+        "key event decoding rejects a short frame");
+
+    let notify_wire: WireBuffer = x11_test_mapping_notify(1, 8, 3);
+    let notify: X11Event = x11_decode_event(&notify_wire, 0);
+    let invalid_notify_wire: WireBuffer = x11_test_mapping_notify(3, 8, 3);
+    failures = failures + x11_keyboard_expect(notify.valid == 1
+        && notify.kind == X11EventKind.MappingNotify && notify.response_type == 34
+        && notify.mapping_request == 1 && notify.mapping_first_keycode == 8
+        && notify.mapping_keycode_count == 3
+        && x11_decode_event(&invalid_notify_wire, 0).valid == 0,
+        "MappingNotify decodes bounded keyboard change metadata");
+
+    let sequence_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + x11_keyboard_expect(sequence_peer.ok == 1,
+        "X11 request-sequence fixture opens");
+    if (sequence_peer.ok == 1) {
+        let sequence_connection: X11NativeConnection = x11_empty_connection();
+        sequence_connection.fd = sequence_peer.first; sequence_connection.connected = 1;
+        let setup_request: WireBuffer = x11_setup_request("", "");
+        let setup_sent: i32 = x11_native_send_request(
+            &sequence_connection, &setup_request, 1);
+        let received_setup: WireBuffer = linux_receive_wire(sequence_peer.second, 32);
+        sequence_connection.authenticated = 1;
+        let core_request: WireBuffer = x11_map_window_request(900);
+        let core_sent: i32 = x11_native_send_request(
+            &sequence_connection, &core_request, 1);
+        let received_core: WireBuffer = linux_receive_wire(sequence_peer.second, 16);
+        failures = failures + x11_keyboard_expect(setup_sent == 1 && core_sent == 1
+            && len[u8](received_setup.bytes) == 12 && len[u8](received_core.bytes) == 8
+            && sequence_connection.last_sent_sequence == 1,
+            "setup is excluded and only complete authenticated core requests advance sequence");
+        wire_free(&received_setup); wire_free(&received_core);
+        x11_disconnect(&sequence_connection);
+        let _closed_sequence_peer: i64 = linux_close(sequence_peer.second);
+    }
+
+    let peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + x11_keyboard_expect(peer.ok == 1, "X11 keyboard fake peer transport opens");
+    if (peer.ok == 1) {
+        let connection: X11NativeConnection = x11_empty_connection();
+        connection.fd = peer.first; connection.connected = 1; connection.authenticated = 1;
+        connection.setup = setup; connection.setup.minimum_keycode = 8; connection.setup.maximum_keycode = 10;
+
+        let native_keysyms: ArrayList[t27] = x11_test_keysyms(2, 3);
+        let native_map_reply: WireBuffer = x11_keyboard_mapping_reply(2, &native_keysyms);
+        x11_test_set_sequence(&native_map_reply, 1);
+        let _sent_map_reply: i64 = linux_send_wire(peer.second, &native_map_reply);
+        let map_refreshed: i32 = x11_refresh_keyboard_mapping(&connection, 200);
+        let received_map_request: WireBuffer = linux_receive_wire(peer.second, 16);
+        let received_map_frame: X11Request = x11_decode_request(&received_map_request, 0);
+        failures = failures + x11_keyboard_expect(map_refreshed == 1
+            && received_map_frame.valid == 1 && received_map_frame.opcode == 101
+            && received_map_frame.detail == 8
+            && wire_read_u8(&received_map_request, received_map_frame.payload_offset) == 3
+            && x11_connection_keysym(&connection, 8, 1).valid == 1
+            && connection.last_sent_sequence == 1,
+            "native keyboard refresh exchanges a bounded core mapping with a fake peer");
+
+        let native_modifier_reply: WireBuffer = x11_modifier_mapping_reply(2, &modifier_keycodes);
+        x11_test_set_sequence(&native_modifier_reply, 2);
+        let _sent_modifier_reply: i64 = linux_send_wire(peer.second, &native_modifier_reply);
+        connection.setup.maximum_keycode = 255;
+        let modifiers_refreshed: i32 = x11_refresh_modifier_mapping(&connection, 200);
+        let received_modifier_request: WireBuffer = linux_receive_wire(peer.second, 16);
+        let received_modifier_frame: X11Request = x11_decode_request(&received_modifier_request, 0);
+        failures = failures + x11_keyboard_expect(modifiers_refreshed == 1
+            && received_modifier_frame.valid == 1 && received_modifier_frame.opcode == 119
+            && connection.modifier_mapping.mod1_resolved == 0
+            && connection.last_sent_sequence == 2,
+            "native modifier refresh preserves unresolved Mod1-Mod5 semantics");
+
+        let stale_generation: t27 = connection.keyboard_mapping.generation;
+        let event_batch: WireBuffer = wire_new(64);
+        wire_append(&event_batch, &notify_wire); wire_append(&event_batch, &release_wire);
+        let _sent_events: i64 = linux_send_wire(peer.second, &event_batch);
+        let queued_notify: X11Event = x11_next_event(&connection, 200);
+        let queued_release: X11Event = x11_next_event(&connection, 0);
+        let stale_lookup: X11KeysymLookup = x11_connection_keysym(&connection, 8, 0);
+        failures = failures + x11_keyboard_expect(queued_notify.kind == X11EventKind.MappingNotify
+            && queued_release.kind == X11EventKind.KeyUp
+            && connection.keyboard_mapping.valid == 0
+            && connection.modifier_mapping.valid == 0
+            && connection.keyboard_mapping.generation > stale_generation
+            && stale_lookup.valid == 0,
+            "MappingNotify invalidates authority before a queued key can use stale keysyms or text");
+
+        free[t27](&native_keysyms);
+        wire_free(&native_map_reply); wire_free(&received_map_request);
+        wire_free(&native_modifier_reply); wire_free(&received_modifier_request);
+        wire_free(&event_batch);
+        x11_disconnect(&connection);
+        let _closed_peer: i64 = linux_close(peer.second);
+    }
+
+    let fragmented_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + x11_keyboard_expect(fragmented_peer.ok == 1,
+        "X11 fragmented-frame fixture opens");
+    if (fragmented_peer.ok == 1) {
+        let fragmented_connection: X11NativeConnection = x11_empty_connection();
+        fragmented_connection.fd = fragmented_peer.first;
+        fragmented_connection.connected = 1; fragmented_connection.authenticated = 1;
+        let fragmented_prefix: WireBuffer = x11_test_wire_range(&press_wire, 0, 11);
+        let fragmented_tail: WireBuffer = x11_test_wire_range(&press_wire, 11, 32);
+        let prefix_sent: i64 = linux_send_wire(fragmented_peer.second, &fragmented_prefix);
+        let tail_sent: i64 = linux_send_wire(fragmented_peer.second, &fragmented_tail);
+        let fragmented_event: X11Event = x11_next_event(&fragmented_connection, 100);
+        failures = failures + x11_keyboard_expect(prefix_sent == 11 && tail_sent == 21
+            && fragmented_event.valid == 1 && fragmented_event.kind == X11EventKind.KeyDown
+            && fragmented_event.detail == 38 && fragmented_connection.fd >= 0,
+            "exact frame reader joins fragmented core-event bytes without losing order");
+        wire_free(&fragmented_prefix); wire_free(&fragmented_tail);
+        x11_disconnect(&fragmented_connection);
+        let _closed_fragmented_peer: i64 = linux_close(fragmented_peer.second);
+    }
+
+    let partial_header_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + x11_keyboard_expect(partial_header_peer.ok == 1,
+        "X11 partial-header fixture opens");
+    if (partial_header_peer.ok == 1) {
+        let partial_connection: X11NativeConnection = x11_empty_connection();
+        partial_connection.fd = partial_header_peer.first;
+        partial_connection.connected = 1; partial_connection.authenticated = 1;
+        partial_connection.keyboard_mapping.keysyms = make[t27](1);
+        push[t27](&partial_connection.keyboard_mapping.keysyms, 65);
+        partial_connection.keyboard_mapping.valid = 1;
+        let partial_header: WireBuffer = x11_test_wire_range(&press_wire, 0, 12);
+        let _partial_header_sent: i64 = linux_send_wire(partial_header_peer.second, &partial_header);
+        let partial_started: i64 = linux_monotonic_ms();
+        let partial_event: X11Event = x11_next_event(&partial_connection, 30);
+        let partial_elapsed: i64 = linux_monotonic_ms() - partial_started;
+        failures = failures + x11_keyboard_expect(partial_event.valid == 0
+            && partial_connection.fd < 0 && partial_connection.connected == 0
+            && partial_connection.authenticated == 0
+            && partial_connection.keyboard_mapping.valid == 0
+            && partial_connection.keyboard_mapping.keysyms.cap == 0
+            && partial_elapsed <= 200,
+            "timeout after a partial 32-byte frame retires transport and keyboard authority");
+        wire_free(&partial_header); x11_disconnect(&partial_connection);
+        let _closed_partial_header_peer: i64 = linux_close(partial_header_peer.second);
+    }
+
+    let partial_tail_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + x11_keyboard_expect(partial_tail_peer.ok == 1,
+        "X11 partial-reply-tail fixture opens");
+    if (partial_tail_peer.ok == 1) {
+        let partial_tail_connection: X11NativeConnection = x11_empty_connection();
+        partial_tail_connection.fd = partial_tail_peer.first;
+        partial_tail_connection.connected = 1; partial_tail_connection.authenticated = 1;
+        partial_tail_connection.setup = setup;
+        let partial_modifier_reply: WireBuffer = x11_test_wire_range(&modifier_reply, 0, 36);
+        x11_test_set_sequence(&partial_modifier_reply, 1);
+        let _partial_tail_sent: i64 = linux_send_wire(
+            partial_tail_peer.second, &partial_modifier_reply);
+        let partial_tail_started: i64 = linux_monotonic_ms();
+        let partial_tail_refreshed: i32 = x11_refresh_modifier_mapping(
+            &partial_tail_connection, 30);
+        let partial_tail_elapsed: i64 = linux_monotonic_ms() - partial_tail_started;
+        failures = failures + x11_keyboard_expect(partial_tail_refreshed == 0
+            && partial_tail_connection.fd < 0 && partial_tail_connection.connected == 0
+            && partial_tail_connection.authenticated == 0 && partial_tail_elapsed <= 200,
+            "timeout inside a declared reply tail retires the stream without stale authority");
+        wire_free(&partial_modifier_reply); x11_disconnect(&partial_tail_connection);
+        let _closed_partial_tail_peer: i64 = linux_close(partial_tail_peer.second);
+    }
+
+    let reply_timeout_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + x11_keyboard_expect(reply_timeout_peer.ok == 1,
+        "X11 reply-timeout fixture opens");
+    if (reply_timeout_peer.ok == 1) {
+        let reply_timeout_connection: X11NativeConnection = x11_empty_connection();
+        reply_timeout_connection.fd = reply_timeout_peer.first;
+        reply_timeout_connection.connected = 1; reply_timeout_connection.authenticated = 1;
+        reply_timeout_connection.setup = setup;
+        let reply_timeout_refreshed: i32 = x11_refresh_keyboard_mapping(
+            &reply_timeout_connection, 20);
+        failures = failures + x11_keyboard_expect(reply_timeout_refreshed == 0
+            && reply_timeout_connection.fd < 0 && reply_timeout_connection.connected == 0
+            && reply_timeout_connection.authenticated == 0,
+            "no-progress timeout after a reply-bearing request retires stale reply authority");
+        x11_disconnect(&reply_timeout_connection);
+        let _closed_reply_timeout_peer: i64 = linux_close(reply_timeout_peer.second);
+    }
+
+    let wrong_sequence_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + x11_keyboard_expect(wrong_sequence_peer.ok == 1,
+        "X11 wrong-sequence fixture opens");
+    if (wrong_sequence_peer.ok == 1) {
+        let wrong_sequence_connection: X11NativeConnection = x11_empty_connection();
+        wrong_sequence_connection.fd = wrong_sequence_peer.first;
+        wrong_sequence_connection.connected = 1; wrong_sequence_connection.authenticated = 1;
+        wrong_sequence_connection.setup = setup;
+        wrong_sequence_connection.setup.maximum_keycode = 10;
+        wrong_sequence_connection.keyboard_mapping.keysyms = make[t27](1);
+        push[t27](&wrong_sequence_connection.keyboard_mapping.keysyms, 65);
+        wrong_sequence_connection.keyboard_mapping.valid = 1;
+        wrong_sequence_connection.modifier_mapping.keycodes = make[t27](1);
+        push[t27](&wrong_sequence_connection.modifier_mapping.keycodes, 50);
+        wrong_sequence_connection.modifier_mapping.valid = 1;
+        let _wrong_sequence_event_queued: i32 = x11_note_event(
+            &wrong_sequence_connection, press);
+        let wrong_sequence_reply: WireBuffer = x11_test_wire_range(
+            &map_reply, 0, len[u8](map_reply.bytes));
+        x11_test_set_sequence(&wrong_sequence_reply, 2);
+        let _wrong_sequence_sent: i64 = linux_send_wire(
+            wrong_sequence_peer.second, &wrong_sequence_reply);
+        let wrong_sequence_refreshed: i32 = x11_refresh_keyboard_mapping(
+            &wrong_sequence_connection, 100);
+        failures = failures + x11_keyboard_expect(wrong_sequence_refreshed == 0
+            && wrong_sequence_connection.fd < 0 && wrong_sequence_connection.connected == 0
+            && wrong_sequence_connection.authenticated == 0
+            && len[X11Event](wrong_sequence_connection.pending_events) == 0
+            && wrong_sequence_connection.keyboard_mapping.valid == 0
+            && wrong_sequence_connection.keyboard_mapping.keysyms.cap == 0
+            && wrong_sequence_connection.modifier_mapping.valid == 0
+            && wrong_sequence_connection.modifier_mapping.keycodes.cap == 0,
+            "wrong reply sequence retires queued events and all stale keyboard authority");
+        wire_free(&wrong_sequence_reply); x11_disconnect(&wrong_sequence_connection);
+        let _closed_wrong_sequence_peer: i64 = linux_close(wrong_sequence_peer.second);
+    }
+
+    let error_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + x11_keyboard_expect(error_peer.ok == 1,
+        "X11 error-packet fixture opens");
+    if (error_peer.ok == 1) {
+        let error_connection: X11NativeConnection = x11_empty_connection();
+        error_connection.fd = error_peer.first;
+        error_connection.connected = 1; error_connection.authenticated = 1;
+        error_connection.setup = setup; error_connection.setup.maximum_keycode = 10;
+        let error_packet: WireBuffer = x11_test_server_header(0, 1, 0);
+        let _error_packet_sent: i64 = linux_send_wire(error_peer.second, &error_packet);
+        let error_refreshed: i32 = x11_refresh_keyboard_mapping(&error_connection, 100);
+        failures = failures + x11_keyboard_expect(error_refreshed == 0
+            && error_connection.fd < 0 && error_connection.connected == 0
+            && error_connection.authenticated == 0,
+            "any fixed X11 protocol error packet retires the connection");
+        wire_free(&error_packet); x11_disconnect(&error_connection);
+        let _closed_error_peer: i64 = linux_close(error_peer.second);
+    }
+
+    let oversized_reply_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + x11_keyboard_expect(oversized_reply_peer.ok == 1,
+        "X11 oversized-reply fixture opens");
+    if (oversized_reply_peer.ok == 1) {
+        let oversized_reply_connection: X11NativeConnection = x11_empty_connection();
+        oversized_reply_connection.fd = oversized_reply_peer.first;
+        oversized_reply_connection.connected = 1;
+        oversized_reply_connection.authenticated = 1;
+        oversized_reply_connection.setup = setup;
+        oversized_reply_connection.setup.maximum_keycode = 10;
+        let oversized_reply: WireBuffer = x11_test_server_header(1, 1, 766);
+        let oversized_started: i64 = linux_monotonic_ms();
+        let _oversized_reply_sent: i64 = linux_send_wire(
+            oversized_reply_peer.second, &oversized_reply);
+        let oversized_refreshed: i32 = x11_refresh_keyboard_mapping(
+            &oversized_reply_connection, 100);
+        let oversized_elapsed: i64 = linux_monotonic_ms() - oversized_started;
+        failures = failures + x11_keyboard_expect(oversized_refreshed == 0
+            && oversized_reply_connection.fd < 0
+            && oversized_reply_connection.authenticated == 0 && oversized_elapsed <= 200,
+            "declared reply length is rejected before allocating or waiting for its tail");
+        wire_free(&oversized_reply); x11_disconnect(&oversized_reply_connection);
+        let _closed_oversized_reply_peer: i64 = linux_close(oversized_reply_peer.second);
+    }
+
+    let generic_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + x11_keyboard_expect(generic_peer.ok == 1,
+        "X11 GenericEvent fixture opens");
+    if (generic_peer.ok == 1) {
+        let generic_connection: X11NativeConnection = x11_empty_connection();
+        generic_connection.fd = generic_peer.first;
+        generic_connection.connected = 1; generic_connection.authenticated = 1;
+        let generic_header: WireBuffer = x11_test_server_header(35, 7, 2);
+        let _generic_sent: i64 = linux_send_wire(generic_peer.second, &generic_header);
+        let generic_started: i64 = linux_monotonic_ms();
+        let generic_event: X11Event = x11_next_event(&generic_connection, 100);
+        let generic_elapsed: i64 = linux_monotonic_ms() - generic_started;
+        failures = failures + x11_keyboard_expect(generic_event.valid == 0
+            && generic_connection.fd < 0 && generic_connection.connected == 0
+            && generic_connection.authenticated == 0 && generic_elapsed <= 200,
+            "unsupported variable-length GenericEvent retires before its tail can desynchronize framing");
+        wire_free(&generic_header); x11_disconnect(&generic_connection);
+        let _closed_generic_peer: i64 = linux_close(generic_peer.second);
+    }
+
+    let mapping_schema_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + x11_keyboard_expect(mapping_schema_peer.ok == 1,
+        "X11 MappingNotify-schema fixture opens");
+    if (mapping_schema_peer.ok == 1) {
+        let mapping_schema_connection: X11NativeConnection = x11_empty_connection();
+        mapping_schema_connection.fd = mapping_schema_peer.first;
+        mapping_schema_connection.connected = 1;
+        mapping_schema_connection.authenticated = 1;
+        let _mapping_schema_sent: i64 = linux_send_wire(
+            mapping_schema_peer.second, &invalid_notify_wire);
+        let malformed_mapping_event: X11Event = x11_next_event(
+            &mapping_schema_connection, 100);
+        failures = failures + x11_keyboard_expect(malformed_mapping_event.valid == 0
+            && mapping_schema_connection.fd < 0
+            && mapping_schema_connection.authenticated == 0,
+            "malformed MappingNotify schema is terminal instead of becoming map authority");
+        x11_disconnect(&mapping_schema_connection);
+        let _closed_mapping_schema_peer: i64 = linux_close(mapping_schema_peer.second);
+    }
+
+    let interleaved_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + x11_keyboard_expect(interleaved_peer.ok == 1,
+        "X11 reply/event interleaving fixture opens");
+    if (interleaved_peer.ok == 1) {
+        let interleaved_connection: X11NativeConnection = x11_empty_connection();
+        interleaved_connection.fd = interleaved_peer.first;
+        interleaved_connection.connected = 1; interleaved_connection.authenticated = 1;
+        interleaved_connection.setup = setup; interleaved_connection.setup.maximum_keycode = 10;
+        let interleaved_reply: WireBuffer = x11_test_wire_range(
+            &map_reply, 0, len[u8](map_reply.bytes));
+        x11_test_set_sequence(&interleaved_reply, 1);
+        let interleaved_batch: WireBuffer = wire_new(
+            64 + len[u8](interleaved_reply.bytes));
+        wire_append(&interleaved_batch, &press_wire);
+        wire_append(&interleaved_batch, &interleaved_reply);
+        wire_append(&interleaved_batch, &release_wire);
+        let _interleaved_sent: i64 = linux_send_wire(
+            interleaved_peer.second, &interleaved_batch);
+        let interleaved_refreshed: i32 = x11_refresh_keyboard_mapping(
+            &interleaved_connection, 100);
+        let interleaved_request: WireBuffer = linux_receive_wire(interleaved_peer.second, 16);
+        let interleaved_first: X11Event = x11_next_event(&interleaved_connection, 0);
+        let interleaved_second: X11Event = x11_next_event(&interleaved_connection, 100);
+        failures = failures + x11_keyboard_expect(interleaved_refreshed == 1
+            && interleaved_connection.last_sent_sequence == 1
+            && interleaved_first.kind == X11EventKind.KeyDown
+            && interleaved_second.kind == X11EventKind.KeyUp
+            && interleaved_connection.fd >= 0,
+            "events surrounding a matching reply retain FIFO order and reply identity");
+        wire_free(&interleaved_reply); wire_free(&interleaved_batch);
+        wire_free(&interleaved_request); x11_disconnect(&interleaved_connection);
+        let _closed_interleaved_peer: i64 = linux_close(interleaved_peer.second);
+    }
+
+    let multiwindow_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + x11_keyboard_expect(multiwindow_peer.ok == 1,
+        "X11 multiwindow-ready fixture opens");
+    if (multiwindow_peer.ok == 1) {
+        let multiwindow_connection: X11NativeConnection = x11_empty_connection();
+        multiwindow_connection.fd = multiwindow_peer.first;
+        multiwindow_connection.connected = 1; multiwindow_connection.authenticated = 1;
+        let target_map: WireBuffer = x11_test_map_event(902, 9);
+        let multiwindow_batch: WireBuffer = wire_new(96);
+        wire_append(&multiwindow_batch, &press_wire);
+        wire_append(&multiwindow_batch, &target_map);
+        wire_append(&multiwindow_batch, &release_wire);
+        let _multiwindow_sent: i64 = linux_send_wire(
+            multiwindow_peer.second, &multiwindow_batch);
+        let target_window: X11NativeWindow = x11_test_native_window(902, 903);
+        target_window.mapped = 0;
+        let target_ready: i32 = x11_wait_window_ready(
+            &multiwindow_connection, &target_window, 100);
+        let preserved_first: X11Event = x11_next_event(&multiwindow_connection, 0);
+        let preserved_second: X11Event = x11_next_event(&multiwindow_connection, 100);
+        failures = failures + x11_keyboard_expect(target_ready == 1 && target_window.mapped == 1
+            && preserved_first.kind == X11EventKind.KeyDown && preserved_first.window == 900
+            && preserved_second.kind == X11EventKind.KeyUp && preserved_second.window == 900,
+            "window-ready wait removes only its target event and preserves other-window FIFO input");
+        wire_free(&target_map); wire_free(&multiwindow_batch);
+        x11_disconnect(&multiwindow_connection);
+        let _closed_multiwindow_peer: i64 = linux_close(multiwindow_peer.second);
+    }
+
+    let queue_bound_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + x11_keyboard_expect(queue_bound_peer.ok == 1,
+        "X11 event-queue bound fixture opens");
+    if (queue_bound_peer.ok == 1) {
+        let queue_bound_connection: X11NativeConnection = x11_empty_connection();
+        queue_bound_connection.fd = queue_bound_peer.first;
+        queue_bound_connection.connected = 1; queue_bound_connection.authenticated = 1;
+        let fill_ok: i32 = 1;
+        let queue_i: t27 = 0;
+        while (queue_i < x11_native_max_pending_events()) {
+            if (x11_note_event(&queue_bound_connection, press) == 0) { fill_ok = 0; }
+            queue_i = queue_i + 1;
+        }
+        let overflow_rejected: i32 = x11_note_event(&queue_bound_connection, press);
+        failures = failures + x11_keyboard_expect(fill_ok == 1 && overflow_rejected == 0
+            && queue_bound_connection.fd < 0 && queue_bound_connection.connected == 0
+            && queue_bound_connection.authenticated == 0
+            && len[X11Event](queue_bound_connection.pending_events) == 0,
+            "pending event cap is checked before push and overflow retires the connection");
+        x11_disconnect(&queue_bound_connection);
+        let _closed_queue_bound_peer: i64 = linux_close(queue_bound_peer.second);
+    }
+
+    let closed_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + x11_keyboard_expect(closed_peer.ok == 1,
+        "X11 exact-send closed-peer fixture opens");
+    if (closed_peer.ok == 1) {
+        let closed_connection: X11NativeConnection = x11_empty_connection();
+        closed_connection.fd = closed_peer.first;
+        closed_connection.connected = 1; closed_connection.authenticated = 1;
+        closed_connection.keyboard_mapping.keysyms = make[t27](1);
+        push[t27](&closed_connection.keyboard_mapping.keysyms, 65);
+        closed_connection.keyboard_mapping.valid = 1;
+        closed_connection.modifier_mapping.keycodes = make[t27](1);
+        push[t27](&closed_connection.modifier_mapping.keycodes, 50);
+        closed_connection.modifier_mapping.valid = 1;
+        x11_note_event(&closed_connection, press);
+        let _closed_server_before_send: i64 = linux_close(closed_peer.second);
+        let closed_request: WireBuffer = x11_map_window_request(900);
+        let closed_sent: i32 = x11_native_send_request(
+            &closed_connection, &closed_request, 1);
+        failures = failures + x11_keyboard_expect(closed_sent == 0
+            && closed_connection.fd < 0 && closed_connection.connected == 0
+            && closed_connection.authenticated == 0
+            && linux_fd_flags(closed_peer.first) < 0
+            && len[u8](closed_request.bytes) == 0
+            && len[X11Event](closed_connection.pending_events) == 0
+            && closed_connection.keyboard_mapping.valid == 0
+            && closed_connection.keyboard_mapping.keysyms.cap == 0
+            && closed_connection.modifier_mapping.valid == 0
+            && closed_connection.modifier_mapping.keycodes.cap == 0,
+            "closed-peer exact send avoids SIGPIPE, frees its request, and retires all authority");
+        x11_disconnect(&closed_connection);
+    }
+
+    let cleanup_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + x11_keyboard_expect(cleanup_peer.ok == 1,
+        "X11 local-close cleanup fixture opens");
+    if (cleanup_peer.ok == 1) {
+        let cleanup_connection: X11NativeConnection = x11_empty_connection();
+        cleanup_connection.fd = cleanup_peer.first;
+        cleanup_connection.connected = 1; cleanup_connection.authenticated = 1;
+        let cleanup_window: X11NativeWindow = x11_test_native_window(901, 902);
+        let _closed_cleanup_server: i64 = linux_close(cleanup_peer.second);
+        let cleanup_result: i32 = x11_close_window(&cleanup_connection, &cleanup_window);
+        failures = failures + x11_keyboard_expect(cleanup_result == 0
+            && cleanup_connection.fd < 0 && cleanup_connection.authenticated == 0
+            && cleanup_window.live == 0 && cleanup_window.mapped == 0,
+            "window close reclaims local live/mapped state after protocol retirement");
+        x11_disconnect(&cleanup_connection);
+    }
+
+    x11_keyboard_mapping_free(&mapping); x11_keyboard_mapping_free(&short_mapping);
+    x11_keyboard_mapping_free(&wrong_count_mapping); x11_keyboard_mapping_free(&bad_per_mapping);
+    x11_modifier_mapping_free(&modifiers); x11_modifier_mapping_free(&malformed_modifiers);
+    free[t27](&keysyms); free[t27](&modifier_keycodes);
+    wire_free(&setup_wire); wire_free(&map_request); wire_free(&bad_map_request);
+    wire_free(&map_reply); wire_free(&short_reply); wire_free(&bad_per_reply);
+    wire_free(&modifier_request); wire_free(&modifier_reply); wire_free(&malformed_modifier_reply);
+    wire_free(&press_wire); wire_free(&release_wire); wire_free(&short_event);
+    wire_free(&notify_wire); wire_free(&invalid_notify_wire);
+
+    if (failures != 0) { return 1; }
+    _zag_println("x11_keyboard_test: ok");
+    return 0;
+}

@@ -1,0 +1,130 @@
+@import("../src/core.flash")
+@import("../src/layout.flash")
+@import("../src/text.flash")
+@import("../src/events.flash")
+@import("../src/inspector.flash")
+
+fn inspector_expect(ok: i32, message: []u8) i32 {
+    if (ok == 0) { _zag_print("FAIL "); _zag_println(message); return 1; }
+    return 0;
+}
+
+fn main() i32 {
+    let failures: i32 = 0;
+    let maximum: t27 = flashy_t27_max();
+
+    let valid: Ui = ui_new(maximum, 40);
+    ui_begin(&valid);
+    let valid_parent: i32 = ui_node(&valid, 1, NodeKind.Panel, -1,
+        rect(0, 0, maximum, 40), style_default(),
+        semantics(Role.Group, "", "", "valid-parent"), "", Action{ .id = 0 });
+    let _valid_edge: i32 = ui_node(&valid, 2, NodeKind.Panel, valid_parent,
+        rect(maximum - 1, 0, 1, 10), style_default(),
+        semantics(Role.Group, "", "", "valid-edge"), "", Action{ .id = 0 });
+    let _valid_empty: i32 = ui_node(&valid, 3, NodeKind.Panel, valid_parent,
+        rect(maximum, 20, 0, 0), style_default(),
+        semantics(Role.Group, "", "", "valid-empty"), "", Action{ .id = 0 });
+    ui_end(&valid);
+    let valid_snapshot: InspectorSnapshot = ui_inspect(&valid);
+    let valid_edge: i32 = inspector_find_key(&valid_snapshot, 2);
+    let valid_empty: i32 = inspector_find_key(&valid_snapshot, 3);
+    failures = failures + inspector_expect(valid_snapshot.violations == 0
+        && valid_edge >= 0 && valid_snapshot.nodes.data[valid_edge].clipped == 0
+        && valid_snapshot.nodes.data[valid_edge].invalid_geometry == 0
+        && valid_snapshot.nodes.data[valid_edge].bounds.x == maximum - 1
+        && valid_empty >= 0 && valid_snapshot.nodes.data[valid_empty].clipped == 0
+        && valid_snapshot.nodes.data[valid_empty].invalid_geometry == 0,
+        "full-t27 boundary and empty half-open bounds preserve an exact valid snapshot");
+    inspector_free(&valid_snapshot);
+    ui_free(&valid);
+
+    let overflowing: Ui = ui_new(maximum, 40);
+    ui_begin(&overflowing);
+    let overflow_parent: i32 = ui_node(&overflowing, 10, NodeKind.Panel, -1,
+        rect(0, 0, maximum, 40), style_default(),
+        semantics(Role.Group, "", "", "overflow-parent"), "", Action{ .id = 0 });
+    let _overflow_first: i32 = ui_node(&overflowing, 11, NodeKind.Panel, overflow_parent,
+        rect(maximum - 2, 0, 6, 10), style_default(),
+        semantics(Role.Group, "", "", "overflow-first"), "", Action{ .id = 0 });
+    let _overflow_second: i32 = ui_node(&overflowing, 12, NodeKind.Panel, overflow_parent,
+        rect(maximum - 1, 0, 2, 10), style_default(),
+        semantics(Role.Group, "", "", "overflow-second"), "", Action{ .id = 0 });
+    let _invalid_extent: i32 = ui_node(&overflowing, 13, NodeKind.Panel, overflow_parent,
+        rect(0, 20, -1, 1), style_default(),
+        semantics(Role.Group, "", "", "invalid-extent"), "", Action{ .id = 0 });
+    ui_end(&overflowing);
+    let overflow_snapshot: InspectorSnapshot = ui_inspect(&overflowing);
+    let overflow_first: i32 = inspector_find_key(&overflow_snapshot, 11);
+    let overflow_second: i32 = inspector_find_key(&overflow_snapshot, 12);
+    let invalid_extent: i32 = inspector_find_key(&overflow_snapshot, 13);
+    failures = failures + inspector_expect(overflow_first >= 0 && overflow_second >= 0
+        && overflow_snapshot.nodes.data[overflow_first].clipped == 1
+        && overflow_snapshot.nodes.data[overflow_first].invalid_geometry == 1
+        && overflow_snapshot.nodes.data[overflow_first].overlaps_sibling == 1
+        && overflow_snapshot.nodes.data[overflow_second].clipped == 1
+        && overflow_snapshot.nodes.data[overflow_second].invalid_geometry == 1
+        && overflow_snapshot.nodes.data[overflow_second].overlaps_sibling == 1,
+        "endpoint overflow cannot hide inspector clipping, invalid geometry, or overlap");
+    failures = failures + inspector_expect(invalid_extent >= 0
+        && overflow_snapshot.nodes.data[invalid_extent].clipped == 1
+        && overflow_snapshot.nodes.data[invalid_extent].invalid_geometry == 1
+        && overflow_snapshot.nodes.data[invalid_extent].overlaps_sibling == 0
+        && overflow_snapshot.violations == 8,
+        "negative extents fail closed and invalid rectangles do not invent overlaps");
+    inspector_free(&overflow_snapshot);
+    ui_free(&overflowing);
+
+    let spacing: Ui = ui_new(100, 100);
+    ui_begin(&spacing);
+    let negative_spacing_style: Style = style_default(); negative_spacing_style.layout = LayoutKind.Row;
+    negative_spacing_style.gap = -4;
+    let _negative_spacing: i32 = ui_node(&spacing, 20, NodeKind.Panel, -1,
+        rect(0, 0, 20, 20), negative_spacing_style,
+        semantics(Role.Group, "", "", "negative-spacing"), "", Action{ .id = 0 });
+    let row_gap_style: Style = style_default(); row_gap_style.layout = LayoutKind.Grid;
+    row_gap_style.columns = 1; row_gap_style.gap = maximum;
+    let row_gap_grid: i32 = ui_node(&spacing, 21, NodeKind.Grid, -1,
+        rect(30, 0, 20, 20), row_gap_style,
+        semantics(Role.Grid, "", "", "row-gap-grid"), "", Action{ .id = 0 });
+    let _row0: i32 = ui_node(&spacing, 22, NodeKind.Panel, row_gap_grid,
+        rect(60, 0, 1, 1), style_default(), semantics(Role.Cell, "", "", "row0"), "", Action{ .id = 0 });
+    let _row1: i32 = ui_node(&spacing, 23, NodeKind.Panel, row_gap_grid,
+        rect(60, 2, 1, 1), style_default(), semantics(Role.Cell, "", "", "row1"), "", Action{ .id = 0 });
+    let _row2: i32 = ui_node(&spacing, 24, NodeKind.Panel, row_gap_grid,
+        rect(60, 4, 1, 1), style_default(), semantics(Role.Cell, "", "", "row2"), "", Action{ .id = 0 });
+    let invalid_columns_style: Style = style_default(); invalid_columns_style.layout = LayoutKind.Grid;
+    invalid_columns_style.columns = 0;
+    let _invalid_columns: i32 = ui_node(&spacing, 25, NodeKind.Grid, -1,
+        rect(70, 20, 20, 20), invalid_columns_style,
+        semantics(Role.Grid, "", "", "invalid-columns"), "", Action{ .id = 0 });
+    ui_end(&spacing);
+    let spacing_snapshot: InspectorSnapshot = ui_inspect(&spacing);
+    let negative_spacing: i32 = inspector_find_key(&spacing_snapshot, 20);
+    let gap_grid: i32 = inspector_find_key(&spacing_snapshot, 21);
+    let invalid_columns: i32 = inspector_find_key(&spacing_snapshot, 25);
+    failures = failures + inspector_expect(negative_spacing >= 0
+        && spacing_snapshot.nodes.data[negative_spacing].invalid_geometry == 1
+        && spacing_snapshot.nodes.data[negative_spacing].off_token_spacing == 0
+        && gap_grid >= 0 && spacing_snapshot.nodes.data[gap_grid].invalid_geometry == 1
+        && invalid_columns >= 0 && spacing_snapshot.nodes.data[invalid_columns].invalid_geometry == 1,
+        "on-token negative spacing, derived row-gap overflow, and invalid columns remain visible");
+    inspector_free(&spacing_snapshot);
+    ui_free(&spacing);
+
+    let invalid_surface: Ui = ui_new(-1, 10);
+    ui_begin(&invalid_surface);
+    let _surface_child: i32 = ui_node(&invalid_surface, 30, NodeKind.Panel, -1,
+        rect(0, 0, 0, 1), style_default(),
+        semantics(Role.Group, "", "", "surface-child"), "", Action{ .id = 0 });
+    ui_end(&invalid_surface);
+    let invalid_surface_snapshot: InspectorSnapshot = ui_inspect(&invalid_surface);
+    failures = failures + inspector_expect(invalid_surface_snapshot.nodes.data[0].clipped == 1
+        && invalid_surface_snapshot.nodes.data[0].invalid_geometry == 1,
+        "negative viewport bounds fail closed without changing allocation size");
+    inspector_free(&invalid_surface_snapshot);
+    ui_free(&invalid_surface);
+
+    if (failures != 0) { return 1; }
+    _zag_println("inspector_test: ok");
+    return 0;
+}

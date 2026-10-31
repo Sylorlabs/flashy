@@ -1,0 +1,497 @@
+@import("../src/flashy.flash")
+
+fn platform_expect(ok: i32, message: []u8) i32 {
+    if (ok == 0) { _zag_print("FAIL "); _zag_println(message); return 1; }
+    return 0;
+}
+
+fn main() i32 {
+    let failures: i32 = 0;
+    let headless: BackendSelection = backend_select(BackendKind.Headless);
+    failures = failures + platform_expect(headless.connected == 1 && headless.deterministic == 1, "explicit headless selection");
+    let caps: GraphicsCapabilities = graphics_capabilities_for_selection(headless);
+    failures = failures + platform_expect(caps.acceleration == AccelerationKind.HeadlessEmulation && caps.physical_dispatch_proven == 0, "headless identifies as emulation");
+
+    let proven: BackendSelection = BackendSelection{ .requested = BackendKind.Wayland, .active = BackendKind.Wayland,
+        .configured = 1, .connected = 1, .deterministic = 0, .reason = "proven native path" };
+    let proven_caps: GraphicsCapabilities = graphics_capabilities_for_selection(proven);
+    failures = failures + platform_expect(proven_caps.physical_dispatch_proven == 1 && proven_caps.acceleration == AccelerationKind.Cpu,
+        "native-connected backends mark dispatch proven");
+
+    let unproven: BackendSelection = BackendSelection{ .requested = BackendKind.X11, .active = BackendKind.X11,
+        .configured = 1, .connected = 0, .deterministic = 0, .reason = "environment configured" };
+    let unproven_caps: GraphicsCapabilities = graphics_capabilities_for_selection(unproven);
+    failures = failures + platform_expect(unproven_caps.physical_dispatch_proven == 0 && unproven_caps.acceleration == AccelerationKind.Cpu,
+        "unconnected backends avoid proven dispatch");
+
+    let wl_payload: WireBuffer = wire_new(4);
+    wire_push_u32_le(&wl_payload, 42);
+    let wl_bytes: WireBuffer = wayland_encode(7, 2, &wl_payload);
+    let wl: WaylandFrame = wayland_decode(&wl_bytes, 0);
+    failures = failures + platform_expect(wl.valid == 1 && wl.object_id == 7 && wl.opcode == 2 && wl.size == 12, "Wayland frame round trip");
+    failures = failures + platform_expect(wire_read_u32_le(&wl_bytes, wl.payload_offset) == 42, "Wayland payload round trip");
+    failures = failures + platform_expect(wire_read_u8(&wl_bytes, 4) == 2 && wire_read_u8(&wl_bytes, 6) == 12, "Wayland canonical header bytes");
+
+    let signed_fixed: WireBuffer = wire_new(4);
+    wire_push_u32_le(&signed_fixed, 4294967040);
+    failures = failures + platform_expect(wire_read_i32_le(&signed_fixed, 0) == -256
+        && wire_read_wayland_fixed(&signed_fixed, 0) == -1,
+        "Wayland signed 24.8 storage converts to balanced integral coordinates");
+    wire_free(&signed_fixed);
+
+    let pair: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + platform_expect(pair.ok == 1, "real AF_UNIX transport opens");
+    if (pair.ok == 1) {
+        let sent: i64 = linux_send_wire(pair.first, &wl_bytes);
+        let received_wire: WireBuffer = linux_receive_wire(pair.second, 64);
+        let received_frame: WaylandFrame = wayland_decode(&received_wire, 0);
+        failures = failures + platform_expect(sent == 12 && received_frame.valid == 1 && received_frame.object_id == 7, "Wayland frame crosses real Unix socket");
+        let _close_first: i64 = linux_close(pair.first);
+        let _close_second: i64 = linux_close(pair.second);
+    }
+
+    let unix_addr: LinuxByteBuffer = linux_unix_address("/tmp/.X11-unix/X0");
+    failures = failures + platform_expect(unix_addr.len == 20 && linux_buffer_byte(&unix_addr, 0) == 1
+        && linux_buffer_byte(&unix_addr, 2) == '/' && linux_buffer_byte(&unix_addr, 19) == 0, "sockaddr_un packing");
+    linux_buffer_free(&unix_addr);
+
+    let wl_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + platform_expect(wl_peer.ok == 1, "Wayland fake peer transport");
+    if (wl_peer.ok == 1) {
+        let registry_request: WireBuffer = wayland_display_get_registry(2);
+        let _sent_request: i64 = linux_send_wire(wl_peer.first, &registry_request);
+        let server_input: WireBuffer = linux_receive_wire(wl_peer.second, 64);
+        let server_frame: WaylandFrame = wayland_decode(&server_input, 0);
+        failures = failures + platform_expect(server_frame.valid == 1 && server_frame.object_id == 1
+            && server_frame.opcode == 1 && wire_read_u32_le(&server_input, server_frame.payload_offset) == 2, "Wayland get_registry request");
+        let global_event: WireBuffer = wayland_registry_global(2, 5, "wl_compositor", 4);
+        let _sent_global: i64 = linux_send_wire(wl_peer.second, &global_event);
+        let client_input: WireBuffer = linux_receive_wire(wl_peer.first, 128);
+        let client_frame: WaylandFrame = wayland_decode(&client_input, 0);
+        let advertised_global: WaylandGlobal = wayland_decode_global(&client_input, client_frame, 2);
+        failures = failures + platform_expect(advertised_global.valid == 1 && advertised_global.name == 5 && advertised_global.version == 4
+            && @strEq(advertised_global.interface, "wl_compositor") == 1, "Wayland registry global event");
+        let _close_wl_client: i64 = linux_close(wl_peer.first);
+        let _close_wl_server: i64 = linux_close(wl_peer.second);
+    }
+
+    let wl_registry_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + platform_expect(wl_registry_peer.ok == 1, "Wayland registry round-trip peer");
+    if (wl_registry_peer.ok == 1) {
+        let wl_connection: WaylandNativeConnection = wayland_empty_connection();
+        wl_connection.fd = wl_registry_peer.first; wl_connection.connected = 1;
+        failures = failures + platform_expect(wayland_begin_registry(&wl_connection) == 1, "Wayland registry round trip begins");
+        let registry_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let sync_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let registry_frame: WaylandFrame = wayland_decode(&registry_call, 0);
+        let sync_frame: WaylandFrame = wayland_decode(&sync_call, 0);
+        failures = failures + platform_expect(registry_frame.object_id == 1 && registry_frame.opcode == 1
+            && sync_frame.object_id == 1 && sync_frame.opcode == 0, "Wayland registry and sync requests");
+        let compositor_global: WireBuffer = wayland_registry_global(2, 10, "wl_compositor", 5);
+        let shm_global: WireBuffer = wayland_registry_global(2, 11, "wl_shm", 1);
+        let shell_global: WireBuffer = wayland_registry_global(2, 12, "xdg_wm_base", 6);
+        let seat_global: WireBuffer = wayland_registry_global(2, 13, "wl_seat", 8);
+        let callback_done: WireBuffer = wayland_callback_done(3, 77);
+        let _send_compositor: i64 = linux_send_wire(wl_registry_peer.second, &compositor_global);
+        let _send_shm: i64 = linux_send_wire(wl_registry_peer.second, &shm_global);
+        let _send_shell: i64 = linux_send_wire(wl_registry_peer.second, &shell_global);
+        let _send_seat: i64 = linux_send_wire(wl_registry_peer.second, &seat_global);
+        let _send_done: i64 = linux_send_wire(wl_registry_peer.second, &callback_done);
+        failures = failures + platform_expect(wayland_finish_registry(&wl_connection, 500) == 1
+            && wl_connection.registry_ready == 1 && wl_connection.compositor_name == 10
+            && wl_connection.shm_name == 11 && wl_connection.xdg_wm_base_name == 12
+            && wl_connection.seat_name == 13, "Wayland typed global discovery");
+        failures = failures + platform_expect(wayland_bind_shell(&wl_connection) == 1, "Wayland compositor and xdg-shell bind");
+        let bind_compositor_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let bind_shell_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let bind_shm_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let bind_seat_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let bind_compositor_frame: WaylandFrame = wayland_decode(&bind_compositor_call, 0);
+        let bind_shell_frame: WaylandFrame = wayland_decode(&bind_shell_call, 0);
+        let bind_shm_frame: WaylandFrame = wayland_decode(&bind_shm_call, 0);
+        let bind_seat_frame: WaylandFrame = wayland_decode(&bind_seat_call, 0);
+        failures = failures + platform_expect(bind_compositor_frame.object_id == 2 && bind_compositor_frame.opcode == 0
+            && bind_shell_frame.object_id == 2 && bind_shell_frame.opcode == 0
+            && bind_shm_frame.object_id == 2 && bind_shm_frame.opcode == 0
+            && bind_seat_frame.object_id == 2 && bind_seat_frame.opcode == 0
+            && wl_connection.compositor_id != 0 && wl_connection.wm_base_id != 0
+            && wl_connection.shm_id != 0 && wl_connection.seat_id != 0,
+            "Wayland registry and optional seat bind requests");
+
+        let seat_capabilities_event: WireBuffer = wayland_seat_capabilities_event(wl_connection.seat_id, 7);
+        let seat_capabilities_frame: WaylandFrame = wayland_decode(&seat_capabilities_event, 0);
+        let decoded_capabilities: WaylandSeatCapabilities = wayland_decode_seat_capabilities(
+            &seat_capabilities_event, seat_capabilities_frame, wl_connection.seat_id);
+        failures = failures + platform_expect(decoded_capabilities.valid == 1
+            && decoded_capabilities.raw == 7 && decoded_capabilities.pointer == 1
+            && decoded_capabilities.keyboard == 1 && decoded_capabilities.touch == 1,
+            "Wayland seat capability bits decode explicitly");
+        let pointer_capabilities_event: WireBuffer = wayland_seat_capabilities_event(
+            wl_connection.seat_id, 1);
+        let pointer_capabilities_frame: WaylandFrame = wayland_decode(
+            &pointer_capabilities_event, 0);
+        failures = failures + platform_expect(wayland_process_seat_frame(&wl_connection,
+            &pointer_capabilities_event, pointer_capabilities_frame) == 1
+            && wl_connection.pointer_id != 0 && wl_connection.keyboard_id == 0,
+            "Wayland pointer capability allocates a pointer object");
+        let pointer_id: t27 = wl_connection.pointer_id;
+        let get_pointer_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let get_pointer_frame: WaylandFrame = wayland_decode(&get_pointer_call, 0);
+        failures = failures + platform_expect(get_pointer_frame.valid == 1
+            && get_pointer_frame.object_id == wl_connection.seat_id && get_pointer_frame.opcode == 0
+            && wire_read_u32_le(&get_pointer_call, get_pointer_frame.payload_offset) == pointer_id,
+            "Wayland seat emits get_pointer for the allocated object");
+
+        failures = failures + platform_expect(
+            wayland_connection_register_surface(&wl_connection, 99) == 1,
+            "Wayland pointer fixture registers an owned surface identity");
+
+        let pointer_enter_wire: WireBuffer = wayland_pointer_enter_event(pointer_id, 101, 99, -3, 17);
+        let pointer_enter: WaylandPointerEvent = wayland_process_pointer_frame(&wl_connection,
+            &pointer_enter_wire, wayland_decode(&pointer_enter_wire, 0));
+        failures = failures + platform_expect(pointer_enter.valid == 1
+            && pointer_enter.kind == WaylandPointerEventKind.Enter && pointer_enter.surface_id == 99
+            && pointer_enter.x == -3 && pointer_enter.y == 17
+            && wl_connection.pointer_focus_surface == 99 && wl_connection.pointer_x == -3,
+            "Wayland pointer enter preserves signed fixed coordinates");
+        let pointer_motion_wire: WireBuffer = wayland_pointer_motion_event(pointer_id, 102, 22, -4);
+        let pointer_motion: WaylandPointerEvent = wayland_process_pointer_frame(&wl_connection,
+            &pointer_motion_wire, wayland_decode(&pointer_motion_wire, 0));
+        failures = failures + platform_expect(pointer_motion.valid == 1
+            && pointer_motion.kind == WaylandPointerEventKind.Motion
+            && pointer_motion.time == 102 && pointer_motion.x == 22 && pointer_motion.y == -4
+            && wl_connection.pointer_x == 22 && wl_connection.pointer_y == -4,
+            "Wayland pointer motion updates retained coordinates");
+        let pointer_button_wire: WireBuffer = wayland_pointer_button_event(pointer_id, 103, 104, 272, 1);
+        let pointer_button: WaylandPointerEvent = wayland_process_pointer_frame(&wl_connection,
+            &pointer_button_wire, wayland_decode(&pointer_button_wire, 0));
+        failures = failures + platform_expect(pointer_button.valid == 1
+            && pointer_button.kind == WaylandPointerEventKind.Button
+            && pointer_button.button == 272 && pointer_button.button_state == 1,
+            "Wayland primary pointer button decodes");
+        let pointer_axis_wire: WireBuffer = wayland_pointer_axis_event(pointer_id, 105, 0, -9);
+        let pointer_axis: WaylandPointerEvent = wayland_process_pointer_frame(&wl_connection,
+            &pointer_axis_wire, wayland_decode(&pointer_axis_wire, 0));
+        failures = failures + platform_expect(pointer_axis.valid == 1
+            && pointer_axis.kind == WaylandPointerEventKind.Axis
+            && pointer_axis.axis == 0 && pointer_axis.axis_value == -9,
+            "Wayland vertical pointer axis decodes signed fixed distance");
+        let pointer_leave_wire: WireBuffer = wayland_pointer_leave_event(pointer_id, 106, 99);
+        let pointer_leave: WaylandPointerEvent = wayland_process_pointer_frame(&wl_connection,
+            &pointer_leave_wire, wayland_decode(&pointer_leave_wire, 0));
+        failures = failures + platform_expect(pointer_leave.valid == 1
+            && pointer_leave.kind == WaylandPointerEventKind.Leave
+            && pointer_leave.surface_id == 99 && wl_connection.pointer_focus_surface == 0,
+            "Wayland pointer leave clears retained focus");
+        let malformed_pointer_wire: WireBuffer = wayland_empty_request(pointer_id, 0);
+        let malformed_pointer: WaylandPointerEvent = wayland_decode_pointer_event(&malformed_pointer_wire,
+            wayland_decode(&malformed_pointer_wire, 0), pointer_id);
+        failures = failures + platform_expect(malformed_pointer.valid == 0,
+            "Wayland pointer decoder rejects a malformed event size");
+
+        let pointer_removed_wire: WireBuffer = wayland_seat_capabilities_event(wl_connection.seat_id, 0);
+        failures = failures + platform_expect(wayland_process_seat_frame(&wl_connection,
+            &pointer_removed_wire, wayland_decode(&pointer_removed_wire, 0)) == 1
+            && wl_connection.seat_has_pointer == 0 && wl_connection.pointer_id == 0,
+            "Wayland pointer removal retires the local pointer identity");
+        let pointer_release_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let pointer_release_frame: WaylandFrame = wayland_decode(&pointer_release_call, 0);
+        failures = failures + platform_expect(pointer_release_frame.valid == 1
+            && pointer_release_frame.object_id == pointer_id
+            && pointer_release_frame.opcode == 1 && pointer_release_frame.size == 8,
+            "Wayland v3 pointer removal releases the server-side resource");
+        let pointer_restored_wire: WireBuffer = wayland_seat_capabilities_event(wl_connection.seat_id, 1);
+        failures = failures + platform_expect(wayland_process_seat_frame(&wl_connection,
+            &pointer_restored_wire, wayland_decode(&pointer_restored_wire, 0)) == 1
+            && wl_connection.pointer_id > pointer_id,
+            "Wayland pointer restoration allocates a fresh object identity");
+        let restored_get_pointer_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let restored_get_pointer_frame: WaylandFrame = wayland_decode(&restored_get_pointer_call, 0);
+        failures = failures + platform_expect(restored_get_pointer_frame.valid == 1
+            && restored_get_pointer_frame.object_id == wl_connection.seat_id
+            && wire_read_u32_le(&restored_get_pointer_call, restored_get_pointer_frame.payload_offset)
+                == wl_connection.pointer_id,
+            "Wayland restored capability emits get_pointer for the fresh identity");
+
+        let wl_window: WaylandNativeWindow = wayland_open_window(&wl_connection, "Flashy", 320, 180);
+        failures = failures + platform_expect(wl_window.live == 1 && wl_window.surface_id != 0
+            && wl_window.xdg_surface_id != 0 && wl_window.toplevel_id != 0,
+            "Wayland xdg window requests begin after optional input objects");
+        let create_surface_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let get_xdg_surface_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let get_toplevel_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let set_title_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let initial_commit_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        failures = failures + platform_expect(wayland_decode(&create_surface_call, 0).object_id == wl_connection.compositor_id
+            && wayland_decode(&get_xdg_surface_call, 0).object_id == wl_connection.wm_base_id
+            && wayland_decode(&get_toplevel_call, 0).object_id == wl_window.xdg_surface_id
+            && wayland_decode(&set_title_call, 0).object_id == wl_window.toplevel_id
+            && wayland_decode(&initial_commit_call, 0).object_id == wl_window.surface_id,
+            "Wayland xdg window request sequence uses allocated object IDs");
+        let ping_event: WireBuffer = wayland_u32_request(wl_connection.wm_base_id, 0, 90);
+        let toplevel_configure: WireBuffer = wayland_xdg_toplevel_configure(wl_window.toplevel_id, 300, 170);
+        let surface_configure: WireBuffer = wayland_xdg_surface_configure(wl_window.xdg_surface_id, 91);
+        let _send_ping: i64 = linux_send_wire(wl_registry_peer.second, &ping_event);
+        let _send_toplevel_configure: i64 = linux_send_wire(wl_registry_peer.second, &toplevel_configure);
+        let _send_surface_configure: i64 = linux_send_wire(wl_registry_peer.second, &surface_configure);
+        failures = failures + platform_expect(wayland_wait_window_configure(&wl_connection, &wl_window, 500) == 1
+            && wl_window.configured == 1 && wl_window.width == 300 && wl_window.height == 170,
+            "Wayland ping and xdg configure handshake");
+        let pong_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let ack_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        failures = failures + platform_expect(wayland_decode(&pong_call, 0).object_id == wl_connection.wm_base_id
+            && wayland_decode(&pong_call, 0).opcode == 3 && wayland_decode(&ack_call, 0).object_id == wl_window.xdg_surface_id
+            && wayland_decode(&ack_call, 0).opcode == 4, "Wayland pong and configure acknowledgement");
+        let wl_surface: Surface = surface_new(300, 170);
+        surface_fill(&wl_surface, rect(0, 0, 300, 170), color_rgba(22, 25, 34, 255));
+        let wl_presented: WaylandPresentResult = wayland_present_surface(&wl_connection, &wl_window, &wl_surface);
+        failures = failures + platform_expect(wl_presented.ok == 1 && wl_presented.bytes == 204000,
+            "Wayland shared-memory CPU presentation");
+        let create_pool_receive: LinuxWireFdReceive = linux_receive_wire_fd(wl_registry_peer.second, 16);
+        let create_pool_call: WireBuffer = create_pool_receive.wire;
+        let create_buffer_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let destroy_pool_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let attach_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let damage_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let commit_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let create_pool_frame: WaylandFrame = wayland_decode(&create_pool_call, 0);
+        let pool_id: t27 = wire_read_u32_le(&create_pool_call, create_pool_frame.payload_offset);
+        failures = failures + platform_expect(create_pool_receive.ok == 1 && create_pool_receive.received_fd >= 0
+            && wayland_decode(&create_pool_call, 0).object_id == wl_connection.shm_id
+            && wayland_decode(&create_buffer_call, 0).object_id == pool_id
+            && wayland_decode(&destroy_pool_call, 0).object_id == pool_id
+            && wayland_decode(&attach_call, 0).object_id == wl_window.surface_id && wayland_decode(&attach_call, 0).opcode == 1
+            && wayland_decode(&damage_call, 0).opcode == 9 && wayland_decode(&commit_call, 0).opcode == 6,
+            "Wayland shm pool, buffer, attach, damage, and commit sequence");
+        if (create_pool_receive.received_fd >= 0) { let _close_received_shm: i64 = linux_close(create_pool_receive.received_fd); }
+        let release_event: WireBuffer = wayland_empty_request(wl_window.buffer_id, 0);
+        let _send_release: i64 = linux_send_wire(wl_registry_peer.second, &release_event);
+        failures = failures + platform_expect(wayland_wait_buffer_release(&wl_connection, &wl_window, 500) == 1
+            && wl_window.buffer_busy == 0, "Wayland compositor buffer release");
+        let compositor_global_index: i32 = 0 - 1;
+        let compositor_global_i: i32 = 0;
+        while (compositor_global_i < len[WaylandGlobal](wl_connection.globals)) {
+            if (wl_connection.globals.data[compositor_global_i].name == wl_connection.compositor_name) {
+                compositor_global_index = compositor_global_i;
+            }
+            compositor_global_i = compositor_global_i + 1;
+        }
+        if (compositor_global_index >= 0) {
+            wl_connection.globals.data[compositor_global_index].version = 3;
+        }
+        let wl_presented_again: WaylandPresentResult = wayland_present_surface(&wl_connection, &wl_window, &wl_surface);
+        failures = failures + platform_expect(wl_presented_again.ok == 1 && wl_window.buffer_busy == 1,
+            "Wayland released buffer can be reused");
+        let reattach_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let redamage_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let recommit_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        failures = failures + platform_expect(wayland_decode(&reattach_call, 0).opcode == 1
+            && wayland_decode(&redamage_call, 0).opcode == 2 && wayland_decode(&recommit_call, 0).opcode == 6,
+            "Wayland v1-v3 surface fallback emits attach, damage, and commit");
+        if (compositor_global_index >= 0) {
+            wl_connection.globals.data[compositor_global_index].version = 5;
+        }
+        let old_buffer_id: t27 = wl_window.buffer_id;
+        let second_release: WireBuffer = wayland_empty_request(old_buffer_id, 0);
+        let _send_second_release: i64 = linux_send_wire(wl_registry_peer.second, &second_release);
+        failures = failures + platform_expect(wayland_wait_buffer_release(&wl_connection, &wl_window, 500) == 1,
+            "Wayland reused buffer is released before resize");
+        wl_window.width = 280; wl_window.height = 160;
+        surface_resize(&wl_surface, 280, 160);
+        let resized_present: WaylandPresentResult = wayland_present_surface(&wl_connection, &wl_window, &wl_surface);
+        failures = failures + platform_expect(resized_present.ok == 1 && resized_present.bytes == 179200
+            && wl_window.buffer_id != old_buffer_id && wl_window.buffer_width == 280 && wl_window.buffer_height == 160,
+            "Wayland resize allocates a dimension-matched buffer");
+        let destroy_old_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let resized_pool_receive: LinuxWireFdReceive = linux_receive_wire_fd(wl_registry_peer.second, 16);
+        let resized_buffer_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let resized_pool_destroy_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let resized_attach_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let resized_damage_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        let resized_commit_call: WireBuffer = wayland_receive_frame(wl_registry_peer.second, 100);
+        failures = failures + platform_expect(wayland_decode(&destroy_old_call, 0).object_id == old_buffer_id
+            && resized_pool_receive.ok == 1 && resized_pool_receive.received_fd >= 0
+            && wayland_decode(&resized_buffer_call, 0).opcode == 0
+            && wayland_decode(&resized_pool_destroy_call, 0).opcode == 1
+            && wayland_decode(&resized_attach_call, 0).opcode == 1
+            && wayland_decode(&resized_damage_call, 0).opcode == 9
+            && wayland_decode(&resized_commit_call, 0).opcode == 6,
+            "Wayland resize destroys stale storage and transfers a replacement FD");
+        if (resized_pool_receive.received_fd >= 0) { let _close_resized_shm: i64 = linux_close(resized_pool_receive.received_fd); }
+        surface_free(&wl_surface);
+        failures = failures + platform_expect(wayland_close_window(&wl_connection, &wl_window) == 1,
+            "Wayland window resources close");
+        wayland_disconnect(&wl_connection);
+        let _close_registry_server: i64 = linux_close(wl_registry_peer.second);
+    }
+
+    let failed_present_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + platform_expect(failed_present_peer.ok == 1,
+        "Wayland failed-presentation peer opens");
+    if (failed_present_peer.ok == 1) {
+        let failed_connection: WaylandNativeConnection = wayland_empty_connection();
+        failed_connection.fd = failed_present_peer.first;
+        failed_connection.connected = 1;
+        failed_connection.shm_id = 4;
+        failed_connection.next_id = 10;
+        let failed_window: WaylandNativeWindow = WaylandNativeWindow{
+            .surface_id = 7, .xdg_surface_id = 8, .toplevel_id = 9,
+            .width = 1, .height = 1, .live = 1, .configured = 1,
+            .close_requested = 0, .buffer_id = 0, .buffer_width = 0,
+            .buffer_height = 0,
+            .memory = LinuxSharedMemory{ .fd = 0 - 1, .address = 0,
+                .len = 0, .valid = 0 }, .buffer_busy = 0 };
+        let failed_surface: Surface = surface_new(1, 1);
+        let _close_failed_present_peer: i64 = linux_close(failed_present_peer.second);
+        let failed_present: WaylandPresentResult = wayland_present_surface(
+            &failed_connection, &failed_window, &failed_surface);
+        failures = failures + platform_expect(failed_present.ok == 0
+            && failed_connection.connected == 0 && failed_connection.fd < 0
+            && failed_window.memory.valid == 0 && failed_window.memory.fd < 0
+            && failed_window.buffer_id == 0 && failed_window.buffer_busy == 0,
+            "failed Wayland FD presentation retires the stream and reclaims local shm state");
+        surface_free(&failed_surface);
+        wayland_disconnect(&failed_connection);
+    }
+
+    let failed_commit_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + platform_expect(failed_commit_peer.ok == 1,
+        "Wayland post-pool failure peer opens");
+    if (failed_commit_peer.ok == 1) {
+        let failed_commit_connection: WaylandNativeConnection = wayland_empty_connection();
+        failed_commit_connection.fd = failed_commit_peer.first;
+        failed_commit_connection.connected = 1;
+        failed_commit_connection.shm_id = 4;
+        failed_commit_connection.next_id = 10;
+        let failed_commit_window: WaylandNativeWindow = WaylandNativeWindow{
+            .surface_id = 0, .xdg_surface_id = 8, .toplevel_id = 9,
+            .width = 1, .height = 1, .live = 1, .configured = 1,
+            .close_requested = 0, .buffer_id = 0, .buffer_width = 0,
+            .buffer_height = 0,
+            .memory = LinuxSharedMemory{ .fd = 0 - 1, .address = 0,
+                .len = 0, .valid = 0 }, .buffer_busy = 0 };
+        let failed_commit_surface: Surface = surface_new(1, 1);
+        let failed_commit_present: WaylandPresentResult = wayland_present_surface(
+            &failed_commit_connection, &failed_commit_window, &failed_commit_surface);
+        failures = failures + platform_expect(failed_commit_present.ok == 0
+            && failed_commit_connection.connected == 0
+            && failed_commit_connection.fd < 0
+            && failed_commit_window.memory.valid == 0
+            && failed_commit_window.memory.fd < 0
+            && failed_commit_window.buffer_id == 0
+            && failed_commit_window.buffer_busy == 0,
+            "failed Wayland attach after pool creation retires the stream and reclaims local shm state");
+        surface_free(&failed_commit_surface);
+        wayland_disconnect(&failed_commit_connection);
+        let _close_failed_commit_peer: i64 = linux_close(failed_commit_peer.second);
+    }
+
+    let x_payload: WireBuffer = wire_new(8);
+    wire_push_u32_le(&x_payload, 99); wire_push_u32_le(&x_payload, 100);
+    let x_bytes: WireBuffer = x11_encode_request(98, 0, &x_payload);
+    let xr: X11Request = x11_decode_request(&x_bytes, 0);
+    failures = failures + platform_expect(xr.valid == 1 && xr.opcode == 98 && xr.length_units == 3, "X11 request round trip");
+    failures = failures + platform_expect(wire_read_u8(&x_bytes, 0) == 98 && wire_read_u8(&x_bytes, 2) == 3, "X11 canonical header bytes");
+
+    let x_peer: LinuxFdPair = linux_socketpair_stream();
+    failures = failures + platform_expect(x_peer.ok == 1, "X11 fake peer transport");
+    if (x_peer.ok == 1) {
+        let setup_request: WireBuffer = x11_setup_request("", "");
+        let _sent_setup: i64 = linux_send_wire(x_peer.first, &setup_request);
+        let x_server_input: WireBuffer = linux_receive_wire(x_peer.second, 64);
+        let decoded_setup: X11SetupRequest = x11_decode_setup_request(&x_server_input);
+        failures = failures + platform_expect(decoded_setup.valid == 1 && decoded_setup.protocol_major == 11, "X11 setup request");
+        let setup_reply: WireBuffer = x11_setup_success(268435456, 268435455, 65535);
+        let _sent_reply: i64 = linux_send_wire(x_peer.second, &setup_reply);
+        let x_client_input: WireBuffer = linux_receive_wire(x_peer.first, 128);
+        let setup: X11SetupSuccess = x11_decode_setup_success(&x_client_input);
+        failures = failures + platform_expect(setup.valid == 1 && setup.resource_id_base == 268435456
+            && setup.resource_id_mask == 268435455 && setup.maximum_request_length == 65535
+            && setup.root_window == 256 && setup.screen_width == 800 && setup.screen_height == 600
+            && setup.root_depth == 24 && setup.bits_per_pixel == 32 && setup.scanline_pad == 32
+            && setup.pixel_format_valid == 1 && setup.red_mask == 16711680
+            && setup.green_mask == 65280 && setup.blue_mask == 255, "X11 setup success reply");
+        let create_window: WireBuffer = x11_create_window_request(setup.resource_id_base + 1,
+            setup.root_window, 160, 90, setup.white_pixel);
+        let create_frame: X11Request = x11_decode_request(&create_window, 0);
+        failures = failures + platform_expect(create_frame.valid == 1 && create_frame.opcode == 1
+            && create_frame.length_units == 10 && wire_read_u32_le(&create_window, create_frame.payload_offset) == setup.resource_id_base + 1,
+            "X11 CreateWindow request");
+        let geometry_reply: WireBuffer = wire_new(32);
+        wire_push_u8(&geometry_reply, 1); wire_push_u8(&geometry_reply, 24); wire_push_u16_le(&geometry_reply, 3);
+        wire_push_u32_le(&geometry_reply, 0); wire_push_u32_le(&geometry_reply, setup.root_window);
+        wire_push_u16_le(&geometry_reply, 0); wire_push_u16_le(&geometry_reply, 0);
+        wire_push_u16_le(&geometry_reply, 160); wire_push_u16_le(&geometry_reply, 90);
+        wire_push_u16_le(&geometry_reply, 0);
+        while (len[u8](geometry_reply.bytes) < 32) { wire_push_u8(&geometry_reply, 0); }
+        let geometry: X11Geometry = x11_decode_geometry_reply(&geometry_reply);
+        failures = failures + platform_expect(geometry.valid == 1 && geometry.root == setup.root_window
+            && geometry.width == 160 && geometry.height == 90 && geometry.depth == 24,
+            "X11 GetGeometry reply");
+        let map_event_wire: WireBuffer = wire_new(32);
+        wire_push_u8(&map_event_wire, 19); wire_push_u8(&map_event_wire, 0); wire_push_u16_le(&map_event_wire, 4);
+        wire_push_u32_le(&map_event_wire, setup.root_window); wire_push_u32_le(&map_event_wire, setup.resource_id_base + 1);
+        while (len[u8](map_event_wire.bytes) < 32) { wire_push_u8(&map_event_wire, 0); }
+        let map_event: X11Event = x11_decode_event(&map_event_wire, 0);
+        failures = failures + platform_expect(map_event.valid == 1 && map_event.kind == X11EventKind.Mapped
+            && map_event.window == setup.resource_id_base + 1, "X11 MapNotify normalization");
+        let configure_wire: WireBuffer = wire_new(32);
+        wire_push_u8(&configure_wire, 22); wire_push_u8(&configure_wire, 0); wire_push_u16_le(&configure_wire, 5);
+        wire_push_u32_le(&configure_wire, setup.root_window); wire_push_u32_le(&configure_wire, setup.resource_id_base + 1);
+        wire_push_u32_le(&configure_wire, 0); wire_push_u16_le(&configure_wire, 12); wire_push_u16_le(&configure_wire, 18);
+        wire_push_u16_le(&configure_wire, 320); wire_push_u16_le(&configure_wire, 180);
+        while (len[u8](configure_wire.bytes) < 32) { wire_push_u8(&configure_wire, 0); }
+        let configure: X11Event = x11_decode_event(&configure_wire, 0);
+        failures = failures + platform_expect(configure.valid == 1 && configure.kind == X11EventKind.Configure
+            && configure.window == setup.resource_id_base + 1 && configure.x == 12 && configure.y == 18
+            && configure.width == 320 && configure.height == 180, "X11 ConfigureNotify normalization");
+        let event_batch: WireBuffer = wire_new(64);
+        wire_append(&event_batch, &map_event_wire); wire_append(&event_batch, &configure_wire);
+        let _sent_events: i64 = linux_send_wire(x_peer.second, &event_batch);
+        let fake_connection: X11NativeConnection = x11_empty_connection();
+        fake_connection.fd = x_peer.first; fake_connection.connected = 1; fake_connection.authenticated = 1; fake_connection.setup = setup;
+        let queued_map: X11Event = x11_next_event(&fake_connection, 100);
+        let queued_configure: X11Event = x11_next_event(&fake_connection, 0);
+        failures = failures + platform_expect(queued_map.kind == X11EventKind.Mapped
+            && queued_configure.kind == X11EventKind.Configure, "X11 batched events remain queued");
+        let title_request: WireBuffer = x11_change_property8_request(setup.resource_id_base + 1, 39, 31, "Flashy");
+        let title_frame: X11Request = x11_decode_request(&title_request, 0);
+        failures = failures + platform_expect(title_frame.valid == 1 && title_frame.opcode == 18
+            && title_frame.length_units == 8, "X11 window metadata request");
+        let close_wire: WireBuffer = wire_new(32);
+        wire_push_u8(&close_wire, 33); wire_push_u8(&close_wire, 32); wire_push_u16_le(&close_wire, 6);
+        wire_push_u32_le(&close_wire, setup.resource_id_base + 1); wire_push_u32_le(&close_wire, 400);
+        wire_push_u32_le(&close_wire, 401);
+        while (len[u8](close_wire.bytes) < 32) { wire_push_u8(&close_wire, 0); }
+        let close_event: X11Event = x11_decode_event(&close_wire, 0);
+        failures = failures + platform_expect(close_event.valid == 1 && close_event.kind == X11EventKind.ClientMessage
+            && close_event.message_type == 400 && close_event.data0 == 401, "X11 WM_DELETE client message normalization");
+        x11_disconnect(&fake_connection);
+        let _close_x_server: i64 = linux_close(x_peer.second);
+    }
+
+    let auth_wire: WireBuffer = wire_new(40);
+    wire_push_u8(&auth_wire, 1); wire_push_u8(&auth_wire, 0); // FamilyLocal, big-endian
+    wire_push_u8(&auth_wire, 0); wire_push_u8(&auth_wire, 0); // address length
+    wire_push_u8(&auth_wire, 0); wire_push_u8(&auth_wire, 0); // display 0 encoded empty
+    wire_push_u8(&auth_wire, 0); wire_push_u8(&auth_wire, 18);
+    let auth_name: []u8 = "MIT-MAGIC-COOKIE-1";
+    let auth_i: i32 = 0;
+    while (auth_i < auth_name.len) { wire_push_u8(&auth_wire, auth_name[auth_i] as t27); auth_i = auth_i + 1; }
+    wire_push_u8(&auth_wire, 0); wire_push_u8(&auth_wire, 4);
+    wire_push_u8(&auth_wire, 1); wire_push_u8(&auth_wire, 2); wire_push_u8(&auth_wire, 3); wire_push_u8(&auth_wire, 4);
+    let auth: XAuthRecord = xauth_parse(auth_wire.bytes.data[0..len[u8](auth_wire.bytes)], "0");
+    failures = failures + platform_expect(auth.valid == 1 && auth.family == 256 && auth.data.len == 4
+        && @strEq(auth.protocol_name, "MIT-MAGIC-COOKIE-1") == 1, "Xauthority binary record parsing");
+
+    let malformed: WireBuffer = wire_new(8);
+    wire_push_u32_le(&malformed, 1); wire_push_u32_le(&malformed, 4 * 65536);
+    failures = failures + platform_expect(wayland_decode(&malformed, 0).valid == 0, "Wayland rejects undersized frame");
+    let short_x: WireBuffer = wire_new(4);
+    wire_push_u8(&short_x, 1); wire_push_u8(&short_x, 0); wire_push_u16_le(&short_x, 2);
+    failures = failures + platform_expect(x11_decode_request(&short_x, 0).valid == 0, "X11 rejects truncated request");
+
+    if (failures != 0) { return 1; }
+    _zag_println("platform_test: ok");
+    return 0;
+}

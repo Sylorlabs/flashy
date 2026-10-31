@@ -1,0 +1,2087 @@
+@import("../src/core.flash")
+@import("../src/wire.flash")
+@import("../src/wayland.flash")
+@import("../src/linux_transport.flash")
+@import("../src/wayland_clipboard.flash")
+
+// Deterministic fake-peer protocol/ownership proof only. This suite makes no
+// live-compositor, desktop-integration, or hardware execution claim.
+
+fn wayland_clipboard_expect(ok: i32, message: []u8) i32 {
+    if (ok == 0) { _zag_print("FAIL "); _zag_println(message); return 1; }
+    return 0;
+}
+
+fn wayland_clipboard_test_process(state: *WaylandClipboardState,
+    frame: *WireBuffer) WaylandClipboardDispatch {
+    return wayland_clipboard_process_frame(state, frame, 0 - 1, 0, 1);
+}
+
+fn wayland_clipboard_test_server_id(index: t27) t27 {
+    return wayland_server_new_id_min() + index;
+}
+
+fn wayland_clipboard_test_native_wire(
+    input: *LinuxByteBuffer) WireBuffer {
+    let out: WireBuffer = wire_new(input.*.len);
+    let i: i32 = 0;
+    while (i < input.*.len) {
+        wire_push_u8(&out, linux_buffer_byte(input, i) as t27); i = i + 1;
+    }
+    return out;
+}
+
+fn wayland_clipboard_test_wire_prefix(input: *WireBuffer,
+    count: i32) WireBuffer {
+    let out: WireBuffer = wire_new(count);
+    if (count < 0 || count > len[u8](input.*.bytes)) {
+        out.error = 1; return out;
+    }
+    let i: i32 = 0;
+    while (i < count) {
+        wire_push_u8(&out, get[u8](input.*.bytes, i) as t27); i = i + 1;
+    }
+    return out;
+}
+
+fn wayland_clipboard_test_linux_bytes(value: []u8) LinuxByteBuffer {
+    let out: LinuxByteBuffer = linux_buffer_new(value.len);
+    let i: i32 = 0;
+    while (i < value.len) {
+        linux_buffer_set_byte(&out, i, value[i] as t9); i = i + 1;
+    }
+    return out;
+}
+
+fn wayland_clipboard_test_text_equal(
+    result: *WaylandClipboardTextResult, expected: []u8) i32 {
+    if (result.*.valid == 0 || len[u8](result.*.bytes) != expected.len) { return 0; }
+    let i: i32 = 0;
+    while (i < expected.len) {
+        if (get[u8](result.*.bytes, i) != expected[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Test-only malicious sender. Production uses the frozen exact-write adapter;
+// this fixture attaches two descriptors so the runtime and protocol can prove
+// fail-closed cardinality and close ownership.
+fn wayland_clipboard_test_send_many(socket_fd: i64, input: *WireBuffer,
+    fds: *ArrayList[i64]) i64 {
+    let packed: LinuxByteBuffer = linux_pack_wire(input);
+    let count: i32 = len[i64](fds.*);
+    if (socket_fd < 0 || packed.len < 1 || count < 1 || count > 2) {
+        linux_buffer_free(&packed); return 0 - 22;
+    }
+    let iovec: LinuxByteBuffer = linux_buffer_new(16);
+    linux_buffer_set_u64(&iovec, 0, packed.words.data as i64);
+    linux_buffer_set_u64(&iovec, 8, packed.len as i64);
+    let cmsg_len: i64 = 16 + (count as i64) * 4;
+    let control_len: i32 = linux_cmsg_align(cmsg_len) as i32;
+    let control: LinuxByteBuffer = linux_buffer_new(control_len);
+    linux_buffer_set_u64(&control, 0, cmsg_len);
+    linux_buffer_set_u32(&control, 8, 1); linux_buffer_set_u32(&control, 12, 1);
+    let fd_i: i32 = 0;
+    while (fd_i < count) {
+        linux_buffer_set_u32(&control, 16 + fd_i * 4,
+            get[i64](fds.*, fd_i)); fd_i = fd_i + 1;
+    }
+    control.len = control_len;
+    let message: LinuxByteBuffer = linux_buffer_new(56);
+    linux_buffer_zero_storage(&message);
+    linux_buffer_set_u64(&message, 16, iovec.words.data as i64);
+    linux_buffer_set_u64(&message, 24, 1);
+    linux_buffer_set_u64(&message, 32, control.words.data as i64);
+    linux_buffer_set_u64(&message, 40, control_len as i64);
+    message.len = 56;
+    let sent: i64 = _zag_raw_syscall(linux_sys_sendmsg(), socket_fd,
+        message.words.data as i64, 0, 0, 0, 0);
+    linux_buffer_free(&message); linux_buffer_free(&control);
+    linux_buffer_free(&iovec); linux_buffer_free(&packed);
+    return sent;
+}
+
+fn wayland_clipboard_test_ready_source(state: *WaylandClipboardState,
+    object_id: t27, selected: i32) WaylandClipboardIdentity {
+    let create: WireBuffer = wayland_clipboard_prepare_source(state, object_id);
+    if (create.error != 0) { wire_free(&create); return wayland_clipboard_bad_identity(); }
+    let identity: WaylandClipboardIdentity =
+        wayland_clipboard_register_source_commit(state, object_id, 1);
+    wire_free(&create);
+    if (identity.valid == 0) { return identity; }
+    let offer: WireBuffer = wayland_clipboard_source_offer(
+        state, identity, wayland_clipboard_text_mime());
+    if (offer.error != 0 || wayland_clipboard_source_offer_commit(
+        state, identity, 1) == 0) {
+        wire_free(&offer); return wayland_clipboard_bad_identity();
+    }
+    wire_free(&offer);
+    if (selected != 0) {
+        let select: WireBuffer = wayland_clipboard_set_source_selection(
+            state, identity, 0);
+        if (select.error != 0 || wayland_clipboard_set_source_selection_commit(
+            state, identity, 1) == 0) {
+            wire_free(&select); return wayland_clipboard_bad_identity();
+        }
+        wire_free(&select);
+    }
+    return identity;
+}
+
+fn main() i32 {
+    let failures: i32 = 0;
+
+    let empty: WaylandClipboardState = wayland_clipboard_empty_state();
+    wayland_clipboard_state_free(&empty);
+    failures = failures + wayland_clipboard_expect(empty.valid == 0,
+        "empty clipboard state is safe to free");
+
+    let client_min_frame: WireBuffer = wayland_new_id_request(
+        3, 0, wayland_client_new_id_min());
+    let client_max_frame: WireBuffer = wayland_new_id_request(
+        3, 0, wayland_client_new_id_max());
+    let client_reserved_one: WireBuffer = wayland_new_id_request(3, 0, 1);
+    let client_cross_role: WireBuffer = wayland_new_id_request(
+        3, 0, wayland_server_new_id_min());
+    let server_min_frame: WireBuffer = wayland_server_new_id_event(
+        4, 0, wayland_server_new_id_min());
+    let server_max_frame: WireBuffer = wayland_server_new_id_event(
+        4, 0, wayland_server_new_id_max());
+    let server_cross_role: WireBuffer = wayland_server_new_id_event(
+        4, 0, wayland_client_new_id_max());
+    let server_overflow: WireBuffer = wayland_server_new_id_event(
+        4, 0, wayland_server_new_id_max() + 1);
+    failures = failures + wayland_clipboard_expect(
+        wayland_client_new_id_valid(1) == 0
+        && wayland_client_new_id_valid(wayland_client_new_id_min()) == 1
+        && wayland_client_new_id_valid(wayland_client_new_id_max()) == 1
+        && wayland_client_new_id_valid(wayland_server_new_id_min()) == 0
+        && client_min_frame.error == 0 && client_max_frame.error == 0
+        && client_reserved_one.error != 0 && client_cross_role.error != 0
+        && wire_read_u32_le(&client_min_frame, 8) == 2
+        && wire_read_u32_le(&client_max_frame, 8) == 4278190079,
+        "client-created new_id accepts exactly 2 through 0xfeffffff");
+    failures = failures + wayland_clipboard_expect(
+        wayland_server_new_id_valid(wayland_client_new_id_max()) == 0
+        && wayland_server_new_id_valid(wayland_server_new_id_min()) == 1
+        && wayland_server_new_id_valid(wayland_server_new_id_max()) == 1
+        && wayland_server_new_id_valid(wayland_server_new_id_max() + 1) == 0
+        && server_min_frame.error == 0 && server_max_frame.error == 0
+        && server_cross_role.error != 0 && server_overflow.error != 0
+        && wire_read_u32_le(&server_min_frame, 8) == 4278190080
+        && wire_read_u32_le(&server_max_frame, 8) == 4294967295,
+        "server-created new_id accepts exactly 0xff000000 through uint32 max");
+    wire_free(&client_min_frame); wire_free(&client_max_frame);
+    wire_free(&client_reserved_one); wire_free(&client_cross_role);
+    wire_free(&server_min_frame); wire_free(&server_max_frame);
+    wire_free(&server_cross_role); wire_free(&server_overflow);
+
+    let sync_client_min: WireBuffer = wayland_display_sync(
+        wayland_client_new_id_min());
+    let registry_client_max: WireBuffer = wayland_display_get_registry(
+        wayland_client_new_id_max());
+    let sync_server_id: WireBuffer = wayland_display_sync(
+        wayland_server_new_id_min());
+    let registry_reserved_id: WireBuffer = wayland_display_get_registry(1);
+    let bind_server_id: WireBuffer = wayland_registry_bind(
+        2, 9, "wl_compositor", 1, wayland_server_new_id_min());
+    let seat_server_id: WireBuffer = wayland_seat_get_keyboard(
+        5, wayland_server_new_id_min());
+    let xdg_server_id: WireBuffer = wayland_xdg_get_surface(
+        6, wayland_server_new_id_min(), 7);
+    let pool_server_id: WireBuffer = wayland_shm_create_pool(
+        8, wayland_server_new_id_min(), 729);
+    let buffer_server_id: WireBuffer = wayland_shm_pool_create_buffer(
+        9, wayland_server_new_id_min(), 3, 3, 12);
+    failures = failures + wayland_clipboard_expect(sync_client_min.error == 0
+        && registry_client_max.error == 0
+        && wire_read_u32_le(&sync_client_min, 8) == wayland_client_new_id_min()
+        && wire_read_u32_le(&registry_client_max, 8)
+            == wayland_client_new_id_max()
+        && sync_server_id.error != 0 && registry_reserved_id.error != 0
+        && bind_server_id.error != 0 && seat_server_id.error != 0
+        && xdg_server_id.error != 0 && pool_server_id.error != 0
+        && buffer_server_id.error != 0,
+        "every shared client new_id encoder rejects reserved/server-owned IDs");
+    wire_free(&sync_client_min); wire_free(&registry_client_max);
+    wire_free(&sync_server_id); wire_free(&registry_reserved_id);
+    wire_free(&bind_server_id); wire_free(&seat_server_id);
+    wire_free(&xdg_server_id); wire_free(&pool_server_id);
+    wire_free(&buffer_server_id);
+
+    let client_role_state: WaylandClipboardState = wayland_clipboard_state_new(
+        wayland_client_new_id_min(), wayland_client_new_id_min() + 1,
+        wayland_client_new_id_max());
+    let reserved_manager_state: WaylandClipboardState =
+        wayland_clipboard_state_new(1, 3, 4);
+    let server_device_state: WaylandClipboardState =
+        wayland_clipboard_state_new(2, wayland_server_new_id_min(), 4);
+    let server_seat_state: WaylandClipboardState =
+        wayland_clipboard_state_new(2, 3, wayland_server_new_id_max());
+    failures = failures + wayland_clipboard_expect(client_role_state.valid == 1
+        && reserved_manager_state.valid == 0
+        && reserved_manager_state.error == WaylandClipboardError.InvalidIdentity
+        && server_device_state.valid == 0
+        && server_device_state.error == WaylandClipboardError.InvalidIdentity
+        && server_seat_state.valid == 0
+        && server_seat_state.error == WaylandClipboardError.InvalidIdentity,
+        "clipboard state accepts only client-created manager/device/seat IDs");
+    wayland_clipboard_state_free(&client_role_state);
+    wayland_clipboard_state_free(&reserved_manager_state);
+    wayland_clipboard_state_free(&server_device_state);
+    wayland_clipboard_state_free(&server_seat_state);
+
+    let source_role_state: WaylandClipboardState =
+        wayland_clipboard_state_new(3, 4, 5);
+    let source_reserved_prepare: WireBuffer = wayland_clipboard_prepare_source(
+        &source_role_state, 1);
+    let source_server_prepare: WireBuffer = wayland_clipboard_prepare_source(
+        &source_role_state, wayland_server_new_id_min());
+    let source_max_prepare: WireBuffer = wayland_clipboard_prepare_source(
+        &source_role_state, wayland_client_new_id_max());
+    let source_max_reserved: WaylandClipboardIdentity =
+        source_role_state.prepared_source;
+    let source_max_abort: WaylandClipboardIdentity =
+        wayland_clipboard_register_source_commit(&source_role_state,
+            wayland_client_new_id_max(), 0);
+    failures = failures + wayland_clipboard_expect(
+        source_reserved_prepare.error != 0 && source_server_prepare.error != 0
+        && source_max_prepare.error == 0 && source_max_reserved.valid == 1
+        && source_max_reserved.object_id == wayland_client_new_id_max()
+        && source_max_abort.valid == 0
+        && source_role_state.prepared_source.valid == 0
+        && len[WaylandClipboardSource](source_role_state.sources) == 0,
+        "source reservation enforces client new_id bounds before transport");
+    wire_free(&source_reserved_prepare); wire_free(&source_server_prepare);
+    wire_free(&source_max_prepare);
+    wayland_clipboard_state_free(&source_role_state);
+
+    let invalid_offer_event: WireBuffer = wayland_clipboard_data_offer_event(
+        4, wayland_client_new_id_max());
+    let raw_client_range_offer: WireBuffer = wayland_u32_request(
+        4, 0, wayland_client_new_id_max());
+    let invalid_offer_state: WaylandClipboardState =
+        wayland_clipboard_state_new(3, 4, 5);
+    let invalid_offer_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&invalid_offer_state,
+            &raw_client_range_offer);
+    failures = failures + wayland_clipboard_expect(invalid_offer_event.error != 0
+        && invalid_offer_dispatch.valid == 0
+        && invalid_offer_dispatch.error == WaylandClipboardError.InvalidIdentity
+        && invalid_offer_state.terminal == 1
+        && len[WaylandClipboardOffer](invalid_offer_state.offers) == 0,
+        "incoming data_offer rejects a client-range server new_id before authority");
+    wire_free(&invalid_offer_event); wire_free(&raw_client_range_offer);
+    wayland_clipboard_state_free(&invalid_offer_state);
+
+    let server_max_offer_state: WaylandClipboardState =
+        wayland_clipboard_state_new(3, 4, 5);
+    let server_max_offer_event: WireBuffer = wayland_clipboard_data_offer_event(
+        4, wayland_server_new_id_max());
+    let server_max_offer_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&server_max_offer_state,
+            &server_max_offer_event);
+    failures = failures + wayland_clipboard_expect(
+        server_max_offer_event.error == 0 && server_max_offer_dispatch.valid == 1
+        && server_max_offer_dispatch.identity.object_id
+            == wayland_server_new_id_max()
+        && server_max_offer_state.terminal == 0,
+        "incoming data_offer accepts the exact server-created upper bound");
+    wire_free(&server_max_offer_event);
+    wayland_clipboard_state_free(&server_max_offer_state);
+
+    // Outbound v1 schemas are literal wire contracts. Serial presence belongs
+    // to the caller; every uint32 value, including wrap-through zero, is data.
+    let create_source: WireBuffer =
+        wayland_clipboard_manager_create_source_request(3, 27);
+    let create_source_frame: WaylandFrame = wayland_decode(&create_source, 0);
+    failures = failures + wayland_clipboard_expect(create_source.error == 0
+        && create_source_frame.valid == 1 && create_source_frame.object_id == 3
+        && create_source_frame.opcode == 0 && create_source_frame.size == 12
+        && get[u8](create_source.bytes, 0) == 3
+        && get[u8](create_source.bytes, 4) == 0
+        && get[u8](create_source.bytes, 6) == 12
+        && wire_read_u32_le(&create_source, 8) == 27,
+        "create_data_source is an exact opcode-0 new-id frame");
+    wire_free(&create_source);
+    let create_source_reserved: WireBuffer =
+        wayland_clipboard_manager_create_source_request(3, 1);
+    let create_source_cross_role: WireBuffer =
+        wayland_clipboard_manager_create_source_request(
+            3, wayland_server_new_id_min());
+    failures = failures + wayland_clipboard_expect(
+        create_source_reserved.error != 0 && create_source_cross_role.error != 0,
+        "create_data_source rejects reserved and server-owned ID ranges");
+    wire_free(&create_source_reserved); wire_free(&create_source_cross_role);
+
+    let get_device: WireBuffer =
+        wayland_clipboard_manager_get_device_request(3, 4, 5);
+    let get_device_frame: WaylandFrame = wayland_decode(&get_device, 0);
+    failures = failures + wayland_clipboard_expect(get_device.error == 0
+        && get_device_frame.valid == 1 && get_device_frame.object_id == 3
+        && get_device_frame.opcode == 1 && get_device_frame.size == 16
+        && wire_read_u32_le(&get_device, 8) == 4
+        && wire_read_u32_le(&get_device, 12) == 5,
+        "get_data_device carries exact new-id then seat object payload");
+    wire_free(&get_device);
+    let get_device_cross_role: WireBuffer =
+        wayland_clipboard_manager_get_device_request(
+            3, wayland_server_new_id_min(), 5);
+    failures = failures + wayland_clipboard_expect(
+        get_device_cross_role.error != 0,
+        "get_data_device rejects a server-owned new-id while retaining seat references");
+    wire_free(&get_device_cross_role);
+
+    let selection_zero: WireBuffer =
+        wayland_clipboard_device_set_selection_request(4, 27, 0);
+    let selection_zero_frame: WaylandFrame = wayland_decode(&selection_zero, 0);
+    failures = failures + wayland_clipboard_expect(selection_zero.error == 0
+        && selection_zero_frame.valid == 1 && selection_zero_frame.object_id == 4
+        && selection_zero_frame.opcode == 1 && selection_zero_frame.size == 16
+        && get[u8](selection_zero.bytes, 4) == 1
+        && get[u8](selection_zero.bytes, 6) == 16
+        && wire_read_u32_le(&selection_zero, 8) == 27
+        && wire_read_u32_le(&selection_zero, 12) == 0,
+        "set_selection accepts serial zero and emits exact literal bytes");
+    wire_free(&selection_zero);
+    let selection_max: WireBuffer =
+        wayland_clipboard_device_set_selection_request(4, 27, 4294967295);
+    failures = failures + wayland_clipboard_expect(selection_max.error == 0
+        && wire_read_u32_le(&selection_max, 12) == 4294967295,
+        "set_selection preserves maximum uint32 serial");
+    wire_free(&selection_max);
+    let selection_overflow: WireBuffer =
+        wayland_clipboard_device_set_selection_request(4, 27, 4294967296);
+    failures = failures + wayland_clipboard_expect(selection_overflow.error != 0,
+        "set_selection rejects values outside uint32 without truncation");
+    wire_free(&selection_overflow);
+
+    let offer_request: WireBuffer = wayland_clipboard_source_offer_request(
+        27, wayland_clipboard_text_mime());
+    let offer_request_frame: WaylandFrame = wayland_decode(&offer_request, 0);
+    let offer_request_value: WireString = wire_read_string(&offer_request,
+        offer_request_frame.payload_offset, offer_request_frame.size as i32);
+    failures = failures + wayland_clipboard_expect(offer_request.error == 0
+        && offer_request_frame.valid == 1 && offer_request_frame.object_id == 27
+        && offer_request_frame.opcode == 0
+        && wire_read_u32_le(&offer_request, 8) == 25
+        && get[u8](offer_request.bytes, 12) == 't'
+        && get[u8](offer_request.bytes, 36) == 0
+        && offer_request_value.valid == 1
+        && @strEq(offer_request_value.value,
+            "text/plain;charset=utf-8") != 0,
+        "data_source.offer uses an exact NUL-terminated UTF-8 MIME string");
+    wire_free(&offer_request);
+
+    let source_destroy_wire: WireBuffer =
+        wayland_clipboard_source_destroy_request(27);
+    let source_destroy_frame: WaylandFrame = wayland_decode(&source_destroy_wire, 0);
+    failures = failures + wayland_clipboard_expect(source_destroy_frame.valid == 1
+        && source_destroy_frame.object_id == 27
+        && source_destroy_frame.opcode == 1 && source_destroy_frame.size == 8,
+        "data_source.destroy is the exact v1 opcode-1 empty frame");
+    wire_free(&source_destroy_wire);
+
+    let clear_selection_wire: WireBuffer =
+        wayland_clipboard_device_set_selection_request(4, 0, 0);
+    let clear_selection_frame: WaylandFrame = wayland_decode(&clear_selection_wire, 0);
+    failures = failures + wayland_clipboard_expect(clear_selection_frame.valid == 1
+        && clear_selection_frame.opcode == 1 && clear_selection_frame.size == 16
+        && wire_read_u32_le(&clear_selection_wire, 8) == 0
+        && wire_read_u32_le(&clear_selection_wire, 12) == 0,
+        "null set_selection emits object zero without inventing serial presence");
+    wire_free(&clear_selection_wire);
+
+    let outbound_offer_id: t27 = wayland_clipboard_test_server_id(0);
+    let receive_request_wire: WireBuffer = wayland_clipboard_offer_receive_request(
+        outbound_offer_id, wayland_clipboard_text_mime());
+    let receive_request_frame: WaylandFrame = wayland_decode(&receive_request_wire, 0);
+    let receive_request_value: WireString = wire_read_string(&receive_request_wire,
+        receive_request_frame.payload_offset, receive_request_frame.size as i32);
+    failures = failures + wayland_clipboard_expect(receive_request_wire.error == 0
+        && receive_request_frame.valid == 1
+        && receive_request_frame.object_id == outbound_offer_id
+        && receive_request_frame.opcode == 1
+        && receive_request_frame.size == 40
+        && receive_request_value.valid == 1
+        && @strEq(receive_request_value.value,
+            "text/plain;charset=utf-8") != 0,
+        "data_offer.receive keeps its fd ancillary and its frame exactly string-sized");
+    wire_free(&receive_request_wire);
+    let destroy_offer_wire: WireBuffer = wayland_clipboard_offer_destroy_request(
+        outbound_offer_id);
+    let destroy_offer_frame: WaylandFrame = wayland_decode(&destroy_offer_wire, 0);
+    failures = failures + wayland_clipboard_expect(destroy_offer_frame.valid == 1
+        && destroy_offer_frame.object_id == outbound_offer_id
+        && destroy_offer_frame.opcode == 2 && destroy_offer_frame.size == 8,
+        "data_offer.destroy is the exact v1 opcode-2 destructor");
+    wire_free(&destroy_offer_wire);
+
+    // Prepared-but-unsent requests cannot publish authority. Every stateful
+    // operation commits only after an owning transport reports full success.
+    let source_state: WaylandClipboardState = wayland_clipboard_state_new(3, 4, 5);
+    let create_prepared: WireBuffer = wayland_clipboard_prepare_source(
+        &source_state, 27);
+    let provisional_source: WaylandClipboardIdentity = source_state.prepared_source;
+    let provisional_index: i32 = wayland_clipboard_source_slot_index(
+        &source_state, 27);
+    let overlapping_prepare: WireBuffer = wayland_clipboard_prepare_source(
+        &source_state, 28);
+    let wrong_prepare_commit: WaylandClipboardIdentity =
+        wayland_clipboard_register_source_commit(&source_state, 28, 0);
+    failures = failures + wayland_clipboard_expect(create_prepared.error == 0
+        && provisional_source.valid == 1 && provisional_index >= 0
+        && len[WaylandClipboardSource](source_state.sources) == 1
+        && source_state.sources.data[provisional_index].committed == 0
+        && wayland_clipboard_source_index(&source_state, 27) < 0
+        && overlapping_prepare.error != 0 && wrong_prepare_commit.valid == 0
+        && wayland_clipboard_identity_equal(
+            source_state.prepared_source, provisional_source) == 1,
+        "prepare reserves one non-authoritative slot and rejects overlap/wrong commit");
+    wire_free(&overlapping_prepare);
+    let aborted_source: WaylandClipboardIdentity =
+        wayland_clipboard_register_source_commit(&source_state, 27, 0);
+    failures = failures + wayland_clipboard_expect(aborted_source.valid == 0
+        && source_state.prepared_source.valid == 0
+        && len[WaylandClipboardSource](source_state.sources) == 0,
+        "sent=0 abort removes the exact provisional source slot");
+    wire_free(&create_prepared);
+
+    let create_committed: WireBuffer = wayland_clipboard_prepare_source(
+        &source_state, 27);
+    let source_a: WaylandClipboardIdentity =
+        wayland_clipboard_register_source_commit(&source_state, 27, 1);
+    wire_free(&create_committed);
+    let source_collision_prepare: WireBuffer = wayland_clipboard_prepare_source(
+        &source_state, 27);
+    failures = failures + wayland_clipboard_expect(source_a.valid == 1
+        && source_a.generation > 0
+        && source_a.generation != provisional_source.generation
+        && len[WaylandClipboardSource](source_state.sources) == 1
+        && wayland_clipboard_source_index(&source_state, 27) >= 0
+        && source_collision_prepare.error != 0,
+        "sent=1 infallibly flips the reserved identity and blocks object collision");
+    wire_free(&source_collision_prepare);
+
+    let source_a_offer: WireBuffer = wayland_clipboard_source_offer(
+        &source_state, source_a, wayland_clipboard_text_mime());
+    let source_a_index: i32 = wayland_clipboard_identity_source_index(
+        &source_state, source_a);
+    failures = failures + wayland_clipboard_expect(source_a_offer.error == 0
+        && source_state.sources.data[source_a_index].authoritative_offered == 0
+        && wayland_clipboard_source_offer_commit(&source_state, source_a, 0) == 0
+        && source_state.sources.data[source_a_index].authoritative_offered == 0
+        && wayland_clipboard_source_offer_commit(&source_state, source_a, 1) == 1
+        && source_state.sources.data[source_a_index].authoritative_offered == 1,
+        "source MIME authority appears only after exact send commit");
+    wire_free(&source_a_offer);
+
+    let select_a: WireBuffer = wayland_clipboard_set_source_selection(
+        &source_state, source_a, 0);
+    failures = failures + wayland_clipboard_expect(select_a.error == 0
+        && source_state.sources.data[source_a_index].used == 0
+        && wayland_clipboard_set_source_selection_commit(
+            &source_state, source_a, 0) == 0
+        && source_state.sources.data[source_a_index].used == 0
+        && wayland_clipboard_set_source_selection_commit(
+            &source_state, source_a, 1) == 1
+        && source_state.sources.data[source_a_index].used == 1
+        && source_state.sources.data[source_a_index].selected == 1,
+        "selection commit marks a source immutably used exactly once");
+    wire_free(&select_a);
+    let reuse_a: WireBuffer = wayland_clipboard_set_source_selection(
+        &source_state, source_a, 1);
+    failures = failures + wayland_clipboard_expect(reuse_a.error != 0,
+        "one-shot data source reuse is rejected even while still selected");
+    wire_free(&reuse_a);
+
+    let create_b: WireBuffer = wayland_clipboard_prepare_source(
+        &source_state, 28);
+    let source_b: WaylandClipboardIdentity =
+        wayland_clipboard_register_source_commit(&source_state, 28, 1);
+    wire_free(&create_b);
+    let source_b_offer: WireBuffer = wayland_clipboard_source_offer(
+        &source_state, source_b, wayland_clipboard_text_mime());
+    let _source_b_offer_commit: i32 = wayland_clipboard_source_offer_commit(
+        &source_state, source_b, 1);
+    wire_free(&source_b_offer);
+    let select_b: WireBuffer = wayland_clipboard_set_source_selection(
+        &source_state, source_b, 4294967295);
+    let _select_b_commit: i32 = wayland_clipboard_set_source_selection_commit(
+        &source_state, source_b, 1);
+    wire_free(&select_b);
+    let source_a_after: i32 = wayland_clipboard_identity_source_index(
+        &source_state, source_a);
+    failures = failures + wayland_clipboard_expect(source_a_after >= 0
+        && source_state.sources.data[source_a_after].selected == 0
+        && source_state.sources.data[source_a_after].used == 1
+        && wayland_clipboard_identity_equal(source_state.current_source, source_b) == 1,
+        "replacement clears selection but never resets the prior source used bit");
+
+    let reuse_replaced_a: WireBuffer = wayland_clipboard_set_source_selection(
+        &source_state, source_a, 2);
+    let destroy_replaced_a: WireBuffer = wayland_clipboard_destroy_source(
+        &source_state, source_a);
+    failures = failures + wayland_clipboard_expect(reuse_replaced_a.error != 0
+        && destroy_replaced_a.error == 0
+        && wayland_clipboard_destroy_source_commit(
+            &source_state, source_a, 1) == 1
+        && wayland_clipboard_identity_source_index(&source_state, source_a) < 0,
+        "used sources cannot be reused but the protocol destructor remains unconditional");
+    wire_free(&reuse_replaced_a); wire_free(&destroy_replaced_a);
+
+    let destroy_selected_b: WireBuffer = wayland_clipboard_destroy_source(
+        &source_state, source_b);
+    failures = failures + wayland_clipboard_expect(destroy_selected_b.error == 0
+        && wayland_clipboard_destroy_source_commit(
+            &source_state, source_b, 1) == 1
+        && source_state.current_source.valid == 0,
+        "destroying the active source clears local current identity only on commit");
+    wire_free(&destroy_selected_b);
+    wayland_clipboard_state_free(&source_state);
+
+    let mismatched_commit_state: WaylandClipboardState =
+        wayland_clipboard_state_new(3, 4, 5);
+    let mismatched_prepare: WireBuffer = wayland_clipboard_prepare_source(
+        &mismatched_commit_state, 61);
+    let mismatched_commit: WaylandClipboardIdentity =
+        wayland_clipboard_register_source_commit(
+            &mismatched_commit_state, 62, 1);
+    let mismatched_cleanup: WaylandClipboardIdentity =
+        wayland_clipboard_register_source_commit(
+            &mismatched_commit_state, 61, 0);
+    failures = failures + wayland_clipboard_expect(mismatched_prepare.error == 0
+        && mismatched_commit.valid == 0 && mismatched_cleanup.valid == 0
+        && mismatched_commit_state.terminal == 1
+        && mismatched_commit_state.error == WaylandClipboardError.InvalidState
+        && mismatched_commit_state.prepared_source.valid == 0
+        && len[WaylandClipboardSource](mismatched_commit_state.sources) == 0,
+        "sent=1 mismatch terminals and clears provisional source authority");
+    wire_free(&mismatched_prepare);
+    wayland_clipboard_state_free(&mismatched_commit_state);
+
+    let source_collision_state: WaylandClipboardState =
+        wayland_clipboard_state_new(3, 4, 5);
+    let colliding_offer_id: t27 = wayland_clipboard_test_server_id(0);
+    let colliding_offer: WaylandClipboardIdentity = wayland_clipboard_add_offer(
+        &source_collision_state, colliding_offer_id);
+    let cross_type_prepare: WireBuffer = wayland_clipboard_prepare_source(
+        &source_collision_state, colliding_offer_id);
+    failures = failures + wayland_clipboard_expect(colliding_offer.valid == 1
+        && cross_type_prepare.error != 0
+        && source_collision_state.prepared_source.valid == 0
+        && len[WaylandClipboardSource](source_collision_state.sources) == 0,
+        "source prepare rejects the server-owned ID range before local reservation");
+    wire_free(&cross_type_prepare);
+    wayland_clipboard_state_free(&source_collision_state);
+
+    // Remote MIME strings are opaque bounded protocol strings. Unknown types,
+    // duplicates, and preference-list overflow never gain authority and never
+    // revoke the one exact Flashy text spelling.
+    let offer_state: WaylandClipboardState = wayland_clipboard_state_new(3, 4, 5);
+    let offer_a_id: t27 = wayland_clipboard_test_server_id(0);
+    let offer_b_id: t27 = wayland_clipboard_test_server_id(1);
+    let offer_c_id: t27 = wayland_clipboard_test_server_id(2);
+    let offer_a_event: WireBuffer = wayland_clipboard_data_offer_event(
+        4, offer_a_id);
+    let offer_a_frame: WaylandFrame = wayland_decode(&offer_a_event, 0);
+    let offer_a_payload: t27 = wire_read_u32_le(&offer_a_event, 8);
+    let offer_a_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&offer_state, &offer_a_event);
+    let offer_a: WaylandClipboardIdentity = offer_a_dispatch.identity;
+    wire_free(&offer_a_event);
+    failures = failures + wayland_clipboard_expect(offer_a_frame.valid == 1
+        && offer_a_frame.object_id == 4 && offer_a_frame.opcode == 0
+        && offer_a_frame.size == 12 && offer_a_payload == offer_a_id
+        && offer_a_dispatch.valid == 1
+        && offer_a_dispatch.kind == WaylandClipboardEventKind.OfferIntroduced
+        && offer_a.valid == 1
+        && wayland_clipboard_identity_equal(offer_state.pending_offer, offer_a) == 1,
+        "data_offer introduces one pending generation-tagged offer");
+
+    let opaque_mime_event: WireBuffer = wayland_clipboard_offer_mime_event(
+        offer_a_id, "application/x-weird; note=\"a / b\"");
+    let opaque_mime_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&offer_state, &opaque_mime_event);
+    wire_free(&opaque_mime_event);
+    let offer_a_index: i32 = wayland_clipboard_identity_offer_index(
+        &offer_state, offer_a);
+    failures = failures + wayland_clipboard_expect(opaque_mime_dispatch.valid == 1
+        && opaque_mime_dispatch.kind == WaylandClipboardEventKind.MimeOffered
+        && offer_state.terminal == 0 && offer_a_index >= 0
+        && len[WaylandClipboardMime](offer_state.offers.data[offer_a_index].mimes) == 1
+        && offer_state.offers.data[offer_a_index].authoritative == 0,
+        "quoted spaces and extra slashes remain opaque non-authoritative MIME data");
+    let duplicate_mime_event: WireBuffer = wayland_clipboard_offer_mime_event(
+        offer_a_id, "application/x-weird; note=\"a / b\"");
+    let duplicate_mime_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&offer_state, &duplicate_mime_event);
+    wire_free(&duplicate_mime_event);
+    failures = failures + wayland_clipboard_expect(duplicate_mime_dispatch.valid == 1
+        && offer_state.terminal == 0
+        && len[WaylandClipboardMime](offer_state.offers.data[offer_a_index].mimes) == 1,
+        "duplicate remote MIME offers are ignored without terminating the connection");
+    let exact_mime_event: WireBuffer = wayland_clipboard_offer_mime_event(
+        offer_a_id, wayland_clipboard_text_mime());
+    let exact_mime_frame: WaylandFrame = wayland_decode(&exact_mime_event, 0);
+    let exact_mime_value: WireString = wire_read_string(&exact_mime_event,
+        exact_mime_frame.payload_offset, exact_mime_frame.size as i32);
+    let exact_mime_literal: i32 = 0;
+    if (exact_mime_value.valid == 1 && @strEq(exact_mime_value.value,
+        "text/plain;charset=utf-8") != 0) { exact_mime_literal = 1; }
+    let exact_mime_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&offer_state, &exact_mime_event);
+    wire_free(&exact_mime_event);
+    let select_offer_a_event: WireBuffer = wayland_clipboard_selection_event(
+        4, offer_a_id);
+    let select_offer_a_frame: WaylandFrame = wayland_decode(
+        &select_offer_a_event, 0);
+    let select_offer_a_payload: t27 = wire_read_u32_le(
+        &select_offer_a_event, 8);
+    let select_offer_a_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&offer_state, &select_offer_a_event);
+    wire_free(&select_offer_a_event);
+    failures = failures + wayland_clipboard_expect(exact_mime_frame.valid == 1
+        && exact_mime_frame.object_id == offer_a_id && exact_mime_frame.opcode == 0
+        && exact_mime_frame.size == 40 && exact_mime_literal == 1
+        && exact_mime_dispatch.valid == 1
+        && offer_state.offers.data[offer_a_index].authoritative == 1
+        && select_offer_a_frame.valid == 1
+        && select_offer_a_frame.object_id == 4
+        && select_offer_a_frame.opcode == 5
+        && select_offer_a_frame.size == 12 && select_offer_a_payload == offer_a_id
+        && select_offer_a_dispatch.valid == 1
+        && select_offer_a_dispatch.kind == WaylandClipboardEventKind.SelectionSet
+        && select_offer_a_dispatch.authoritative == 1
+        && wayland_clipboard_identity_equal(offer_state.current_offer, offer_a) == 1,
+        "only exact text/plain;charset=utf-8 publishes selection text authority");
+
+    let offer_b_event: WireBuffer = wayland_clipboard_data_offer_event(
+        4, offer_b_id);
+    let offer_b_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&offer_state, &offer_b_event);
+    let offer_b: WaylandClipboardIdentity = offer_b_dispatch.identity;
+    wire_free(&offer_b_event);
+    let offer_b_mime: WireBuffer = wayland_clipboard_offer_mime_event(
+        offer_b_id, wayland_clipboard_text_mime());
+    let _offer_b_mime_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&offer_state, &offer_b_mime);
+    wire_free(&offer_b_mime);
+    let select_offer_b_event: WireBuffer = wayland_clipboard_selection_event(
+        4, offer_b_id);
+    let select_offer_b_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&offer_state, &select_offer_b_event);
+    wire_free(&select_offer_b_event);
+    let retired_a: WaylandClipboardIdentity =
+        wayland_clipboard_take_retired_offer(&offer_state);
+    failures = failures + wayland_clipboard_expect(select_offer_b_dispatch.valid == 1
+        && wayland_clipboard_identity_equal(select_offer_b_dispatch.replaced, offer_a) == 1
+        && wayland_clipboard_identity_equal(retired_a, offer_a) == 1
+        && wayland_clipboard_take_retired_offer(&offer_state).valid == 0,
+        "selection replacement retires the prior offer exactly once through the FIFO");
+    let destroy_a_request: WireBuffer = wayland_clipboard_destroy_offer(
+        &offer_state, retired_a);
+    let _destroy_a_commit: i32 = wayland_clipboard_destroy_offer_commit(
+        &offer_state, retired_a, 1);
+    wire_free(&destroy_a_request);
+
+    let offer_c_event: WireBuffer = wayland_clipboard_data_offer_event(
+        4, offer_c_id);
+    let offer_c_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&offer_state, &offer_c_event);
+    let offer_c: WaylandClipboardIdentity = offer_c_dispatch.identity;
+    wire_free(&offer_c_event);
+    let focus_retired: i32 = wayland_clipboard_selection_focus_lost(&offer_state);
+    let focus_first: WaylandClipboardIdentity =
+        wayland_clipboard_take_retired_offer(&offer_state);
+    let focus_second: WaylandClipboardIdentity =
+        wayland_clipboard_take_retired_offer(&offer_state);
+    failures = failures + wayland_clipboard_expect(focus_retired == 2
+        && offer_state.pending_offer.valid == 0 && offer_state.current_offer.valid == 0
+        && wayland_clipboard_identity_equal(focus_first, offer_c) == 1
+        && wayland_clipboard_identity_equal(focus_second, offer_b) == 1
+        && wayland_clipboard_take_retired_offer(&offer_state).valid == 0,
+        "keyboard focus loss retires pending then current authority through a drainable FIFO");
+    let destroy_c_request: WireBuffer = wayland_clipboard_destroy_offer(
+        &offer_state, focus_first);
+    let _destroy_c_commit: i32 = wayland_clipboard_destroy_offer_commit(
+        &offer_state, focus_first, 1);
+    wire_free(&destroy_c_request);
+    let destroy_b_request: WireBuffer = wayland_clipboard_destroy_offer(
+        &offer_state, focus_second);
+    let _destroy_b_commit: i32 = wayland_clipboard_destroy_offer_commit(
+        &offer_state, focus_second, 1);
+    wire_free(&destroy_b_request);
+
+    let reused_offer_event: WireBuffer = wayland_clipboard_data_offer_event(
+        4, offer_a_id);
+    let reused_offer_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&offer_state, &reused_offer_event);
+    let reused_offer: WaylandClipboardIdentity = reused_offer_dispatch.identity;
+    wire_free(&reused_offer_event);
+    let stale_destroy: WireBuffer = wayland_clipboard_destroy_offer(
+        &offer_state, offer_a);
+    let stale_receive: WaylandClipboardReceiveRequest =
+        wayland_clipboard_begin_receive(&offer_state, offer_a);
+    failures = failures + wayland_clipboard_expect(reused_offer.valid == 1
+        && reused_offer.object_id == offer_a.object_id
+        && reused_offer.generation != offer_a.generation
+        && stale_destroy.error != 0 && stale_receive.valid == 0
+        && stale_receive.error == WaylandClipboardError.StaleIdentity,
+        "object-id reuse receives a fresh generation and rejects stale handles");
+    wire_free(&stale_destroy);
+    let _abort_stale_receive: i32 =
+        wayland_clipboard_receive_request_abort(&stale_receive);
+    wayland_clipboard_state_free(&offer_state);
+
+    let late_mime_state: WaylandClipboardState = wayland_clipboard_state_new(3, 4, 5);
+    let late_offer_id: t27 = wayland_clipboard_test_server_id(0);
+    let late_offer_event: WireBuffer = wayland_clipboard_data_offer_event(
+        4, late_offer_id);
+    let late_offer_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&late_mime_state, &late_offer_event);
+    wire_free(&late_offer_event);
+    let late_i: i32 = 0;
+    while (late_i < 27) {
+        let unknown: ArrayList[u8] = make[u8](1);
+        push[u8](&unknown, ('A' + late_i) as u8);
+        let unknown_event: WireBuffer = wayland_clipboard_offer_mime_event(
+            late_offer_id, unknown.data[0..len[u8](unknown)]);
+        let unknown_dispatch: WaylandClipboardDispatch =
+            wayland_clipboard_test_process(&late_mime_state, &unknown_event);
+        failures = failures + wayland_clipboard_expect(unknown_dispatch.valid == 1
+            && late_mime_state.terminal == 0,
+            "bounded unknown MIME preference is nonterminal");
+        wire_free(&unknown_event); free[u8](&unknown); late_i = late_i + 1;
+    }
+    let late_exact_event: WireBuffer = wayland_clipboard_offer_mime_event(
+        late_offer_id, wayland_clipboard_text_mime());
+    let late_exact_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&late_mime_state, &late_exact_event);
+    wire_free(&late_exact_event);
+    let late_offer_index: i32 = wayland_clipboard_identity_offer_index(
+        &late_mime_state, late_offer_dispatch.identity);
+    let late_select_event: WireBuffer = wayland_clipboard_selection_event(
+        4, late_offer_id);
+    let late_select_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&late_mime_state, &late_select_event);
+    wire_free(&late_select_event);
+    failures = failures + wayland_clipboard_expect(late_exact_dispatch.valid == 1
+        && late_offer_index >= 0
+        && len[WaylandClipboardMime](late_mime_state.offers.data[late_offer_index].mimes) == 27
+        && late_mime_state.offers.data[late_offer_index].authoritative == 1
+        && late_select_dispatch.valid == 1 && late_select_dispatch.authoritative == 1,
+        "exact UTF-8 MIME grants authority even after 27 retained unknown types");
+    wayland_clipboard_state_free(&late_mime_state);
+
+    let early_mime_state: WaylandClipboardState = wayland_clipboard_state_new(3, 4, 5);
+    let early_offer_id: t27 = wayland_clipboard_test_server_id(0);
+    let early_offer_event: WireBuffer = wayland_clipboard_data_offer_event(
+        4, early_offer_id);
+    let early_offer_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&early_mime_state, &early_offer_event);
+    wire_free(&early_offer_event);
+    let early_exact_event: WireBuffer = wayland_clipboard_offer_mime_event(
+        early_offer_id, wayland_clipboard_text_mime());
+    let _early_exact_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&early_mime_state, &early_exact_event);
+    wire_free(&early_exact_event);
+    let early_i: i32 = 0;
+    while (early_i < 29) {
+        let unknown: ArrayList[u8] = make[u8](1);
+        push[u8](&unknown, ('a' + early_i) as u8);
+        let unknown_event: WireBuffer = wayland_clipboard_offer_mime_event(
+            early_offer_id, unknown.data[0..len[u8](unknown)]);
+        let unknown_dispatch: WaylandClipboardDispatch =
+            wayland_clipboard_test_process(&early_mime_state, &unknown_event);
+        failures = failures + wayland_clipboard_expect(unknown_dispatch.valid == 1
+            && early_mime_state.terminal == 0,
+            "post-authority MIME overflow remains nonterminal");
+        wire_free(&unknown_event); free[u8](&unknown); early_i = early_i + 1;
+    }
+    let early_offer_index: i32 = wayland_clipboard_identity_offer_index(
+        &early_mime_state, early_offer_dispatch.identity);
+    failures = failures + wayland_clipboard_expect(early_offer_index >= 0
+        && early_mime_state.offers.data[early_offer_index].authoritative == 1
+        && early_mime_state.offers.data[early_offer_index].mime_rejected == 1,
+        "overflow after exact authority is ignored without revoking it");
+    wayland_clipboard_state_free(&early_mime_state);
+
+    // Selection must name the immediately introduced pending offer. An older
+    // object ID can never acquire authority after a newer data_offer event.
+    let stale_state: WaylandClipboardState = wayland_clipboard_state_new(3, 4, 5);
+    let stale_a_id: t27 = wayland_clipboard_test_server_id(0);
+    let stale_b_id: t27 = wayland_clipboard_test_server_id(1);
+    let stale_a_event: WireBuffer = wayland_clipboard_data_offer_event(
+        4, stale_a_id);
+    let stale_a_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&stale_state, &stale_a_event);
+    wire_free(&stale_a_event);
+    let stale_b_event: WireBuffer = wayland_clipboard_data_offer_event(
+        4, stale_b_id);
+    let stale_b_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&stale_state, &stale_b_event);
+    wire_free(&stale_b_event);
+    let stale_selection_event: WireBuffer = wayland_clipboard_selection_event(
+        4, stale_a_id);
+    let stale_selection_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&stale_state, &stale_selection_event);
+    wire_free(&stale_selection_event);
+    failures = failures + wayland_clipboard_expect(stale_a_dispatch.valid == 1
+        && stale_b_dispatch.valid == 1
+        && wayland_clipboard_identity_equal(
+            stale_b_dispatch.replaced, stale_a_dispatch.identity) == 1
+        && stale_selection_dispatch.valid == 0
+        && stale_selection_dispatch.error == WaylandClipboardError.InvalidSelection
+        && stale_state.terminal == 1,
+        "selection of a superseded pending offer fails closed");
+    wayland_clipboard_state_free(&stale_state);
+
+    // selection(NULL) can retire both a pending candidate and current
+    // authority. Every identity remains available even though dispatch.replaced
+    // is a single convenience field.
+    let null_state: WaylandClipboardState = wayland_clipboard_state_new(3, 4, 5);
+    let null_current_id: t27 = wayland_clipboard_test_server_id(0);
+    let null_pending_id: t27 = wayland_clipboard_test_server_id(1);
+    let null_current_event: WireBuffer = wayland_clipboard_data_offer_event(
+        4, null_current_id);
+    let null_current_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&null_state, &null_current_event);
+    wire_free(&null_current_event);
+    let null_current_mime: WireBuffer = wayland_clipboard_offer_mime_event(
+        null_current_id, wayland_clipboard_text_mime());
+    let _null_current_mime_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&null_state, &null_current_mime);
+    wire_free(&null_current_mime);
+    let null_current_select: WireBuffer = wayland_clipboard_selection_event(
+        4, null_current_id);
+    let _null_current_select_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&null_state, &null_current_select);
+    wire_free(&null_current_select);
+    let null_pending_event: WireBuffer = wayland_clipboard_data_offer_event(
+        4, null_pending_id);
+    let null_pending_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&null_state, &null_pending_event);
+    wire_free(&null_pending_event);
+    let null_event: WireBuffer = wayland_clipboard_selection_event(4, 0);
+    let null_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&null_state, &null_event);
+    wire_free(&null_event);
+    let null_pending_retired: WaylandClipboardIdentity =
+        wayland_clipboard_take_retired_offer(&null_state);
+    failures = failures + wayland_clipboard_expect(null_dispatch.valid == 1
+        && null_dispatch.kind == WaylandClipboardEventKind.SelectionCleared
+        && wayland_clipboard_identity_equal(
+            null_dispatch.replaced, null_current_dispatch.identity) == 1
+        && wayland_clipboard_identity_equal(
+            null_pending_retired, null_pending_dispatch.identity) == 1,
+        "selection NULL retires pending and exposes current replacement identity");
+    let destroy_queued_pending: WireBuffer = wayland_clipboard_destroy_offer(
+        &null_state, null_pending_retired);
+    let _destroy_queued_pending_commit: i32 = wayland_clipboard_destroy_offer_commit(
+        &null_state, null_pending_retired, 1);
+    wire_free(&destroy_queued_pending);
+    let null_current_retired: WaylandClipboardIdentity =
+        wayland_clipboard_take_retired_offer(&null_state);
+    failures = failures + wayland_clipboard_expect(wayland_clipboard_identity_equal(
+        null_current_retired, null_current_dispatch.identity) == 1
+        && wayland_clipboard_take_retired_offer(&null_state).valid == 0,
+        "destroy commit removes its queued identity without hiding other retirements");
+    wayland_clipboard_state_free(&null_state);
+
+    // DnD is deliberately unsupported at the application layer, but valid v1
+    // destination events are still decoded with exact schemas. drop enters a
+    // one-step teardown phase because normal compositors then send leave.
+    let invalid_drag_state: WaylandClipboardState =
+        wayland_clipboard_state_new(3, 4, 5);
+    let invalid_drag_offer_id: t27 = wayland_clipboard_test_server_id(0);
+    let invalid_drag_offer: WireBuffer = wayland_clipboard_data_offer_event(
+        4, invalid_drag_offer_id);
+    let _invalid_drag_offer_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&invalid_drag_state, &invalid_drag_offer);
+    wire_free(&invalid_drag_offer);
+    let invalid_drag_constructor: WireBuffer = wayland_clipboard_drag_enter_event(
+        4, 0, wayland_server_new_id_min(), 0, 0, invalid_drag_offer_id);
+    let invalid_drag_payload: WireBuffer = wire_new(20);
+    wire_push_u32_le(&invalid_drag_payload, 0);
+    wire_push_u32_le(&invalid_drag_payload, wayland_server_new_id_min());
+    wire_push_i32_le(&invalid_drag_payload, 0);
+    wire_push_i32_le(&invalid_drag_payload, 0);
+    wire_push_u32_le(&invalid_drag_payload, invalid_drag_offer_id);
+    let invalid_drag_frame: WireBuffer = wayland_encode(
+        4, 1, &invalid_drag_payload);
+    wire_free(&invalid_drag_payload);
+    let invalid_drag_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&invalid_drag_state, &invalid_drag_frame);
+    failures = failures + wayland_clipboard_expect(
+        invalid_drag_constructor.error != 0 && invalid_drag_dispatch.valid == 0
+        && invalid_drag_dispatch.error == WaylandClipboardError.MalformedFrame
+        && invalid_drag_state.terminal == 1 && invalid_drag_state.drag_active == 0
+        && len[WaylandClipboardOffer](invalid_drag_state.offers) == 0,
+        "data_device.enter rejects a server-range wl_surface before DnD mutation");
+    wire_free(&invalid_drag_constructor); wire_free(&invalid_drag_frame);
+    wayland_clipboard_state_free(&invalid_drag_state);
+
+    let drag_state: WaylandClipboardState = wayland_clipboard_state_new(3, 4, 5);
+    let drag_offer_id: t27 = wayland_clipboard_test_server_id(0);
+    let drag_offer_event: WireBuffer = wayland_clipboard_data_offer_event(
+        4, drag_offer_id);
+    let drag_offer_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&drag_state, &drag_offer_event);
+    wire_free(&drag_offer_event);
+    let drag_mime_event: WireBuffer = wayland_clipboard_offer_mime_event(
+        drag_offer_id, "application/octet-stream");
+    let _drag_mime_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&drag_state, &drag_mime_event);
+    wire_free(&drag_mime_event);
+    let drag_enter_event: WireBuffer = wayland_clipboard_drag_enter_event(
+        4, 0, 77, 0 - 256, 512, drag_offer_id);
+    let drag_enter_frame: WaylandFrame = wayland_decode(&drag_enter_event, 0);
+    let drag_enter_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&drag_state, &drag_enter_event);
+    let drag_motion_event: WireBuffer = wayland_clipboard_drag_motion_event(
+        4, 4294967295, 27, 81);
+    let drag_motion_frame: WaylandFrame = wayland_decode(&drag_motion_event, 0);
+    let drag_motion_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&drag_state, &drag_motion_event);
+    let drag_drop_event: WireBuffer = wayland_clipboard_drag_drop_event(4);
+    let drag_drop_frame: WaylandFrame = wayland_decode(&drag_drop_event, 0);
+    let drag_drop_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&drag_state, &drag_drop_event);
+    let drag_phase_after_drop: i32 = drag_state.drag_active;
+    let drag_leave_event: WireBuffer = wayland_clipboard_drag_leave_event(4);
+    let drag_leave_frame: WaylandFrame = wayland_decode(&drag_leave_event, 0);
+    let drag_leave_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&drag_state, &drag_leave_event);
+    let drag_retired: WaylandClipboardIdentity =
+        wayland_clipboard_take_retired_offer(&drag_state);
+    failures = failures + wayland_clipboard_expect(drag_offer_dispatch.valid == 1
+        && drag_enter_frame.valid == 1 && drag_enter_frame.object_id == 4
+        && drag_enter_frame.opcode == 1 && drag_enter_frame.size == 28
+        && wire_read_u32_le(&drag_enter_event, 8) == 0
+        && wire_read_u32_le(&drag_enter_event, 12) == 77
+        && wire_read_i32_le(&drag_enter_event, 16) == (0 - 256)
+        && wire_read_i32_le(&drag_enter_event, 20) == 512
+        && wire_read_u32_le(&drag_enter_event, 24) == drag_offer_id
+        && drag_enter_dispatch.valid == 1
+        && drag_enter_dispatch.kind == WaylandClipboardEventKind.DragEnterIgnored
+        && drag_motion_frame.valid == 1 && drag_motion_frame.opcode == 3
+        && drag_motion_frame.size == 20
+        && wire_read_u32_le(&drag_motion_event, 8) == 4294967295
+        && wire_read_i32_le(&drag_motion_event, 12) == 27
+        && wire_read_i32_le(&drag_motion_event, 16) == 81
+        && drag_motion_dispatch.valid == 1
+        && drag_motion_dispatch.kind == WaylandClipboardEventKind.DragMotionIgnored
+        && drag_drop_frame.valid == 1 && drag_drop_frame.opcode == 4
+        && drag_drop_frame.size == 8
+        && drag_drop_dispatch.valid == 1
+        && drag_drop_dispatch.kind == WaylandClipboardEventKind.DragDropIgnored
+        && drag_phase_after_drop == 2
+        && drag_state.drag_active == 0
+        && drag_leave_frame.valid == 1 && drag_leave_frame.opcode == 2
+        && drag_leave_frame.size == 8
+        && drag_leave_dispatch.valid == 1
+        && drag_leave_dispatch.kind == WaylandClipboardEventKind.DragLeaveIgnored
+        && wayland_clipboard_identity_equal(drag_retired,
+            drag_offer_dispatch.identity) == 1
+        && wayland_clipboard_take_retired_offer(&drag_state).valid == 0,
+        "exact enter-motion-drop-leave is ignored safely and retires its offer once");
+    wire_free(&drag_enter_event); wire_free(&drag_motion_event);
+    wire_free(&drag_drop_event); wire_free(&drag_leave_event);
+    wayland_clipboard_state_free(&drag_state);
+
+    let unsolicited_drag_state: WaylandClipboardState =
+        wayland_clipboard_state_new(3, 4, 5);
+    let unsolicited_motion: WireBuffer = wayland_clipboard_drag_motion_event(
+        4, 1, 0, 0);
+    let unsolicited_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&unsolicited_drag_state, &unsolicited_motion);
+    wire_free(&unsolicited_motion);
+    failures = failures + wayland_clipboard_expect(unsolicited_dispatch.valid == 0
+        && unsolicited_drag_state.terminal == 1
+        && unsolicited_dispatch.error == WaylandClipboardError.MalformedFrame,
+        "unsolicited DnD motion outside the active phase fails closed");
+    wayland_clipboard_state_free(&unsolicited_drag_state);
+
+    // Source events exercise real SCM_RIGHTS transport. The received duplicate
+    // is CLOEXEC, generation-tagged, and owned by exactly one ordered dispatch.
+    let send_state: WaylandClipboardState = wayland_clipboard_state_new(3, 4, 5);
+    let send_create: WireBuffer = wayland_clipboard_prepare_source(
+        &send_state, 501);
+    let send_source: WaylandClipboardIdentity =
+        wayland_clipboard_register_source_commit(&send_state, 501, 1);
+    wire_free(&send_create);
+    let send_offer: WireBuffer = wayland_clipboard_source_offer(
+        &send_state, send_source, wayland_clipboard_text_mime());
+    let _send_offer_commit: i32 = wayland_clipboard_source_offer_commit(
+        &send_state, send_source, 1);
+    wire_free(&send_offer);
+    let send_select: WireBuffer = wayland_clipboard_set_source_selection(
+        &send_state, send_source, 0);
+    let _send_select_commit: i32 = wayland_clipboard_set_source_selection_commit(
+        &send_state, send_source, 1);
+    wire_free(&send_select);
+
+    let target_none_event: WireBuffer =
+        wayland_clipboard_source_target_none_event(501);
+    let target_none_frame: WaylandFrame = wayland_decode(&target_none_event, 0);
+    let target_none_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&send_state, &target_none_event);
+    let target_other_event: WireBuffer =
+        wayland_clipboard_source_target_event(501, "image/png");
+    let target_other_frame: WaylandFrame = wayland_decode(&target_other_event, 0);
+    let target_other_value: WireString = wire_read_string(&target_other_event,
+        target_other_frame.payload_offset, target_other_frame.size as i32);
+    let target_other_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&send_state, &target_other_event);
+    failures = failures + wayland_clipboard_expect(target_none_frame.valid == 1
+        && target_none_frame.object_id == 501 && target_none_frame.opcode == 0
+        && target_none_frame.size == 12
+        && target_none_dispatch.valid == 1
+        && target_none_dispatch.kind == WaylandClipboardEventKind.SourceTargetIgnored
+        && target_other_frame.valid == 1 && target_other_frame.opcode == 0
+        && target_other_value.valid == 1
+        && @strEq(target_other_value.value, "image/png") != 0
+        && target_other_dispatch.valid == 1,
+        "nullable and unsupported source.target frames decode exactly and grant no authority");
+    wire_free(&target_none_event); wire_free(&target_other_event);
+
+    let source_peer: LinuxFdPair = linux_socketpair_stream();
+    let source_pipe: LinuxFdPair = linux_pipe_cloexec();
+    failures = failures + wayland_clipboard_expect(source_peer.ok == 1
+        && source_pipe.ok == 1, "source.send fake peer owns socket and directional pipe");
+    if (source_peer.ok == 1 && source_pipe.ok == 1) {
+        let source_send_event: WireBuffer = wayland_clipboard_source_send_event(
+            501, wayland_clipboard_text_mime());
+        let source_send_frame: WaylandFrame = wayland_decode(&source_send_event, 0);
+        let source_send_value: WireString = wire_read_string(&source_send_event,
+            source_send_frame.payload_offset, source_send_frame.size as i32);
+        let sent_source_event: i64 = linux_send_wire_fd(source_peer.second,
+            &source_send_event, source_pipe.second);
+        let received_source_event: LinuxReceiveFdResult =
+            linux_receive_buffer_fd(source_peer.first, 81);
+        let received_source_wire: WireBuffer =
+            wayland_clipboard_test_native_wire(&received_source_event.data);
+        linux_buffer_free(&received_source_event.data);
+        let received_source_fd: i64 = received_source_event.received_fd;
+        let _close_original_source_write: i64 = linux_close(source_pipe.second);
+        let source_send_dispatch: WaylandClipboardDispatch =
+            wayland_clipboard_process_frame(&send_state, &received_source_wire,
+                received_source_fd, received_source_event.fd_count,
+                received_source_event.ok);
+        failures = failures + wayland_clipboard_expect(source_send_frame.valid == 1
+            && source_send_frame.object_id == 501 && source_send_frame.opcode == 1
+            && source_send_frame.size == 40 && source_send_value.valid == 1
+            && @strEq(source_send_value.value,
+                "text/plain;charset=utf-8") != 0
+            && sent_source_event == 40 && received_source_event.ok == 1
+            && received_source_event.fd_count == 1
+            && received_source_event.cloexec_applied == 1
+            && source_send_dispatch.valid == 1
+            && source_send_dispatch.kind == WaylandClipboardEventKind.SourceSend
+            && source_send_dispatch.authoritative == 1
+            && wayland_clipboard_identity_equal(
+                source_send_dispatch.identity, send_source) == 1,
+            "source.send retains one exact writable CLOEXEC fd at its wire position");
+        let source_write_fd: i64 = source_send_dispatch.transfer_fd;
+        let source_write_error: WaylandClipboardError =
+            wayland_clipboard_dispatch_write_text(&source_send_dispatch,
+                "optical text", linux_monotonic_ms() + 100);
+        let source_read_fd: i64 = source_pipe.first;
+        let source_text: WaylandClipboardTextResult =
+            wayland_clipboard_read_text_fd(source_read_fd, 27,
+                linux_monotonic_ms() + 100);
+        failures = failures + wayland_clipboard_expect(
+            source_write_error == WaylandClipboardError.None
+            && source_send_dispatch.transfer_fd < 0
+            && linux_fd_flags(source_write_fd) < 0
+            && wayland_clipboard_test_text_equal(&source_text, "optical text") == 1
+            && linux_fd_flags(source_read_fd) < 0,
+            "source.send writes exact UTF-8 before closing both directional endpoints");
+        wayland_clipboard_text_result_free(&source_text);
+        wire_free(&received_source_wire); wire_free(&source_send_event);
+        let _close_source_peer_first: i64 = linux_close(source_peer.first);
+        let _close_source_peer_second: i64 = linux_close(source_peer.second);
+    } else {
+        if (source_peer.ok == 1) {
+            let _close_source_peer_first: i64 = linux_close(source_peer.first);
+            let _close_source_peer_second: i64 = linux_close(source_peer.second);
+        }
+        if (source_pipe.ok == 1) {
+            let _close_source_pipe_first: i64 = linux_close(source_pipe.first);
+            let _close_source_pipe_second: i64 = linux_close(source_pipe.second);
+        }
+    }
+
+    let cancel_event: WireBuffer = wayland_clipboard_source_cancelled_event(501);
+    let cancel_frame: WaylandFrame = wayland_decode(&cancel_event, 0);
+    let cancel_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&send_state, &cancel_event);
+    wire_free(&cancel_event);
+    let send_source_index: i32 = wayland_clipboard_identity_source_index(
+        &send_state, send_source);
+    failures = failures + wayland_clipboard_expect(cancel_frame.valid == 1
+        && cancel_frame.object_id == 501 && cancel_frame.opcode == 2
+        && cancel_frame.size == 8 && cancel_dispatch.valid == 1
+        && cancel_dispatch.kind == WaylandClipboardEventKind.SourceCancelled
+        && send_source_index >= 0
+        && send_state.sources.data[send_source_index].cancelled == 1
+        && send_state.current_source.valid == 0,
+        "source.cancelled is exact, terminal for reuse, and clears current authority");
+    let destroy_cancelled: WireBuffer = wayland_clipboard_destroy_source(
+        &send_state, send_source);
+    let _destroy_cancelled_commit: i32 = wayland_clipboard_destroy_source_commit(
+        &send_state, send_source, 1);
+    wire_free(&destroy_cancelled);
+    wayland_clipboard_state_free(&send_state);
+
+    // O_RDWR is writable under the protocol even though ordinary transfer
+    // pipes are O_WRONLY. The decoder must not confuse access capability with
+    // one preferred kernel construction.
+    let rdwr_state: WaylandClipboardState = wayland_clipboard_state_new(3, 4, 5);
+    let rdwr_create: WireBuffer = wayland_clipboard_prepare_source(
+        &rdwr_state, 511);
+    let rdwr_source: WaylandClipboardIdentity =
+        wayland_clipboard_register_source_commit(&rdwr_state, 511, 1);
+    wire_free(&rdwr_create);
+    let rdwr_offer: WireBuffer = wayland_clipboard_source_offer(
+        &rdwr_state, rdwr_source, wayland_clipboard_text_mime());
+    let _rdwr_offer_commit: i32 = wayland_clipboard_source_offer_commit(
+        &rdwr_state, rdwr_source, 1);
+    wire_free(&rdwr_offer);
+    let rdwr_select: WireBuffer = wayland_clipboard_set_source_selection(
+        &rdwr_state, rdwr_source, 1);
+    let _rdwr_select_commit: i32 = wayland_clipboard_set_source_selection_commit(
+        &rdwr_state, rdwr_source, 1);
+    wire_free(&rdwr_select);
+    let rdwr_peer: LinuxFdPair = linux_socketpair_stream();
+    let rdwr_data: LinuxFdPair = linux_socketpair_stream();
+    if (rdwr_peer.ok == 1 && rdwr_data.ok == 1) {
+        let rdwr_event: WireBuffer = wayland_clipboard_source_send_event(
+            511, wayland_clipboard_text_mime());
+        let _rdwr_sent: i64 = linux_send_wire_fd(
+            rdwr_peer.second, &rdwr_event, rdwr_data.second);
+        let rdwr_received: LinuxReceiveFdResult = linux_receive_buffer_fd(
+            rdwr_peer.first, 81);
+        let rdwr_wire: WireBuffer =
+            wayland_clipboard_test_native_wire(&rdwr_received.data);
+        linux_buffer_free(&rdwr_received.data);
+        let _close_rdwr_original: i64 = linux_close(rdwr_data.second);
+        let rdwr_dispatch: WaylandClipboardDispatch = wayland_clipboard_process_frame(
+            &rdwr_state, &rdwr_wire, rdwr_received.received_fd,
+            rdwr_received.fd_count, rdwr_received.ok);
+        let rdwr_error: WaylandClipboardError =
+            wayland_clipboard_dispatch_write_text(&rdwr_dispatch, "rw",
+                linux_monotonic_ms() + 100);
+        let rdwr_read: LinuxReadAllResult = linux_pipe_read_all_until(
+            rdwr_data.first, 2, linux_monotonic_ms() + 100);
+        failures = failures + wayland_clipboard_expect(rdwr_dispatch.kind
+            == WaylandClipboardEventKind.SourceSend
+            && rdwr_error == WaylandClipboardError.None
+            && rdwr_read.complete == 1 && rdwr_read.eof == 1
+            && rdwr_read.read == 2
+            && linux_buffer_byte(&rdwr_read.data, 0) == 'r'
+            && linux_buffer_byte(&rdwr_read.data, 1) == 'w',
+            "source.send accepts a real writable O_RDWR descriptor");
+        linux_read_all_result_free(&rdwr_read);
+        let _close_rdwr_data: i64 = linux_close(rdwr_data.first);
+        let _close_rdwr_peer_first: i64 = linux_close(rdwr_peer.first);
+        let _close_rdwr_peer_second: i64 = linux_close(rdwr_peer.second);
+        wire_free(&rdwr_wire); wire_free(&rdwr_event);
+    } else {
+        failures = failures + wayland_clipboard_expect(0,
+            "O_RDWR fake peer creates socketpairs");
+        if (rdwr_peer.ok == 1) {
+            let _close_rdwr_peer_first: i64 = linux_close(rdwr_peer.first);
+            let _close_rdwr_peer_second: i64 = linux_close(rdwr_peer.second);
+        }
+        if (rdwr_data.ok == 1) {
+            let _close_rdwr_data_first: i64 = linux_close(rdwr_data.first);
+            let _close_rdwr_data_second: i64 = linux_close(rdwr_data.second);
+        }
+    }
+    wayland_clipboard_state_free(&rdwr_state);
+
+    let local_supersede_state: WaylandClipboardState =
+        wayland_clipboard_state_new(3, 4, 5);
+    let local_current_offer_id: t27 = wayland_clipboard_test_server_id(0);
+    let local_pending_offer_id: t27 = wayland_clipboard_test_server_id(1);
+    let local_current_event: WireBuffer =
+        wayland_clipboard_data_offer_event(4, local_current_offer_id);
+    let local_current_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&local_supersede_state, &local_current_event);
+    wire_free(&local_current_event);
+    let local_current_select: WireBuffer = wayland_clipboard_selection_event(
+        4, local_current_offer_id);
+    let _local_current_select_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&local_supersede_state, &local_current_select);
+    wire_free(&local_current_select);
+    let local_pending_event: WireBuffer =
+        wayland_clipboard_data_offer_event(4, local_pending_offer_id);
+    let local_pending_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&local_supersede_state, &local_pending_event);
+    wire_free(&local_pending_event);
+    let local_retired: WaylandClipboardIdentity =
+        wayland_clipboard_retire_current_offer(&local_supersede_state);
+    let local_drained: WaylandClipboardIdentity =
+        wayland_clipboard_take_retired_offer(&local_supersede_state);
+    failures = failures + wayland_clipboard_expect(wayland_clipboard_identity_equal(
+        local_retired, local_current_dispatch.identity) == 1
+        && wayland_clipboard_identity_equal(local_drained, local_retired) == 1
+        && local_supersede_state.current_offer.valid == 0
+        && wayland_clipboard_identity_equal(local_supersede_state.pending_offer,
+            local_pending_dispatch.identity) == 1,
+        "local supersession retires only current incoming authority and preserves pending/DnD state");
+    wayland_clipboard_state_free(&local_supersede_state);
+
+    // Incoming offer.receive owns an exact O_RDONLY/O_WRONLY pipe pair. The
+    // request keeps the local writer until full SCM_RIGHTS send confirmation;
+    // only then may EOF on the taken reader become authoritative.
+    let receive_state: WaylandClipboardState = wayland_clipboard_state_new(3, 4, 5);
+    let receive_offer_id: t27 = wayland_clipboard_test_server_id(0);
+    let pending_receive_offer_id: t27 = wayland_clipboard_test_server_id(1);
+    let receive_offer_event: WireBuffer = wayland_clipboard_data_offer_event(
+        4, receive_offer_id);
+    let receive_offer_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&receive_state, &receive_offer_event);
+    wire_free(&receive_offer_event);
+    let receive_mime_event: WireBuffer = wayland_clipboard_offer_mime_event(
+        receive_offer_id, wayland_clipboard_text_mime());
+    let _receive_mime_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&receive_state, &receive_mime_event);
+    wire_free(&receive_mime_event);
+    let receive_select_event: WireBuffer = wayland_clipboard_selection_event(
+        4, receive_offer_id);
+    let _receive_select_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&receive_state, &receive_select_event);
+    wire_free(&receive_select_event);
+
+    let default_receive: WaylandClipboardReceiveRequest =
+        wayland_clipboard_empty_receive_request();
+    failures = failures + wayland_clipboard_expect(default_receive.valid == 0
+        && default_receive.error == WaylandClipboardError.InvalidState
+        && default_receive.read_fd < 0 && default_receive.write_fd < 0
+        && default_receive.request.bytes.cap == 0,
+        "default receive request truthfully carries InvalidState");
+    let _abort_default_receive: i32 =
+        wayland_clipboard_receive_request_abort(&default_receive);
+
+    let inert_receive_state: WaylandClipboardState =
+        wayland_clipboard_empty_state();
+    let invalid_state_receive: WaylandClipboardReceiveRequest =
+        wayland_clipboard_begin_receive(&inert_receive_state,
+            receive_offer_dispatch.identity);
+    failures = failures + wayland_clipboard_expect(
+        invalid_state_receive.valid == 0
+        && invalid_state_receive.error == WaylandClipboardError.InvalidState
+        && invalid_state_receive.read_fd < 0
+        && invalid_state_receive.write_fd < 0,
+        "begin_receive distinguishes an invalid clipboard state");
+    let _abort_invalid_state_receive: i32 =
+        wayland_clipboard_receive_request_abort(&invalid_state_receive);
+    wayland_clipboard_state_free(&inert_receive_state);
+
+    let invalid_identity_receive: WaylandClipboardReceiveRequest =
+        wayland_clipboard_begin_receive(&receive_state,
+            wayland_clipboard_bad_identity());
+    failures = failures + wayland_clipboard_expect(
+        invalid_identity_receive.valid == 0
+        && invalid_identity_receive.error
+            == WaylandClipboardError.InvalidIdentity,
+        "begin_receive distinguishes a structurally invalid identity");
+    let _abort_invalid_identity_receive: i32 =
+        wayland_clipboard_receive_request_abort(&invalid_identity_receive);
+
+    let pending_receive_event: WireBuffer =
+        wayland_clipboard_data_offer_event(4, pending_receive_offer_id);
+    let pending_receive_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&receive_state, &pending_receive_event);
+    wire_free(&pending_receive_event);
+    let noncurrent_receive: WaylandClipboardReceiveRequest =
+        wayland_clipboard_begin_receive(&receive_state,
+            pending_receive_dispatch.identity);
+    failures = failures + wayland_clipboard_expect(
+        pending_receive_dispatch.valid == 1 && noncurrent_receive.valid == 0
+        && noncurrent_receive.error == WaylandClipboardError.InvalidSelection,
+        "begin_receive distinguishes a non-current offer");
+    let _abort_noncurrent_receive: i32 =
+        wayland_clipboard_receive_request_abort(&noncurrent_receive);
+
+    let unauthoritative_state: WaylandClipboardState =
+        wayland_clipboard_state_new(3, 4, 5);
+    let unauthoritative_offer_id: t27 = wayland_clipboard_test_server_id(0);
+    let unauthoritative_offer_event: WireBuffer =
+        wayland_clipboard_data_offer_event(4, unauthoritative_offer_id);
+    let unauthoritative_offer_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&unauthoritative_state,
+            &unauthoritative_offer_event);
+    wire_free(&unauthoritative_offer_event);
+    let unauthoritative_select_event: WireBuffer =
+        wayland_clipboard_selection_event(4, unauthoritative_offer_id);
+    let _unauthoritative_select_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&unauthoritative_state,
+            &unauthoritative_select_event);
+    wire_free(&unauthoritative_select_event);
+    let unauthoritative_receive: WaylandClipboardReceiveRequest =
+        wayland_clipboard_begin_receive(&unauthoritative_state,
+            unauthoritative_offer_dispatch.identity);
+    failures = failures + wayland_clipboard_expect(
+        unauthoritative_receive.valid == 0
+        && unauthoritative_receive.error == WaylandClipboardError.InvalidMime,
+        "begin_receive distinguishes a non-authoritative text target");
+    let _abort_unauthoritative_receive: i32 =
+        wayland_clipboard_receive_request_abort(&unauthoritative_receive);
+    wayland_clipboard_state_free(&unauthoritative_state);
+
+    let failed_receive_pipe: LinuxFdPair = LinuxFdPair{
+        .first = 0 - 1, .second = 0 - 1, .ok = 0 };
+    let pipe_failed_receive: WaylandClipboardReceiveRequest =
+        wayland_clipboard_begin_receive_with_pipe(&receive_state,
+            receive_offer_dispatch.identity, failed_receive_pipe);
+    let pipe_failed_abort_once: i32 =
+        wayland_clipboard_receive_request_abort(&pipe_failed_receive);
+    let pipe_failed_abort_twice: i32 =
+        wayland_clipboard_receive_request_abort(&pipe_failed_receive);
+    failures = failures + wayland_clipboard_expect(
+        pipe_failed_receive.valid == 0
+        && pipe_failed_receive.error == WaylandClipboardError.TransferFailed
+        && pipe_failed_receive.read_fd < 0 && pipe_failed_receive.write_fd < 0
+        && pipe_failed_receive.request.bytes.cap == 0
+        && pipe_failed_abort_once == 1 && pipe_failed_abort_twice == 1,
+        "failed pipe construction maps to TransferFailed and stays idempotent");
+
+    let wire_failure_pipe: LinuxFdPair = linux_pipe_cloexec();
+    if (wire_failure_pipe.ok == 1) {
+        let wire_failure_read: i64 = wire_failure_pipe.first;
+        let wire_failure_write: i64 = wire_failure_pipe.second;
+        let failed_wire: WireBuffer = wayland_clipboard_bad_wire();
+        let wire_failed_receive: WaylandClipboardReceiveRequest =
+            wayland_clipboard_finish_receive_request(
+                receive_offer_dispatch.identity, wire_failure_pipe, failed_wire);
+        let wire_failed_abort_once: i32 =
+            wayland_clipboard_receive_request_abort(&wire_failed_receive);
+        let wire_failed_abort_twice: i32 =
+            wayland_clipboard_receive_request_abort(&wire_failed_receive);
+        failures = failures + wayland_clipboard_expect(
+            wire_failed_receive.valid == 0
+            && wire_failed_receive.error == WaylandClipboardError.TransferFailed
+            && wire_failed_receive.request.bytes.cap == 0
+            && linux_fd_flags(wire_failure_read) < 0
+            && linux_fd_flags(wire_failure_write) < 0
+            && wire_failed_abort_once == 1 && wire_failed_abort_twice == 1,
+            "failed receive-wire construction closes both FDs and maps TransferFailed");
+    } else {
+        failures = failures + wayland_clipboard_expect(0,
+            "receive-wire failure seam has a real pipe pair");
+    }
+
+    let invalid_receive: WaylandClipboardReceiveRequest =
+        wayland_clipboard_begin_receive(&receive_state,
+            WaylandClipboardIdentity{ .object_id = receive_offer_id,
+                .generation = receive_offer_dispatch.identity.generation + 1,
+                .valid = 1 });
+    failures = failures + wayland_clipboard_expect(invalid_receive.valid == 0
+        && invalid_receive.error == WaylandClipboardError.StaleIdentity
+        && invalid_receive.read_fd < 0 && invalid_receive.write_fd < 0
+        && invalid_receive.request.bytes.cap == 0
+        && invalid_receive.request.bytes.len == 0,
+        "invalid begin_receive returns an allocation-free descriptor-free sentinel");
+    let invalid_receive_take: WireBuffer =
+        wayland_clipboard_receive_request_take_wire(&invalid_receive);
+    failures = failures + wayland_clipboard_expect(invalid_receive_take.error != 0
+        && invalid_receive_take.bytes.cap == 0,
+        "invalid request take returns an allocation-free owning sentinel");
+    wire_free(&invalid_receive_take);
+    let invalid_abort_once: i32 =
+        wayland_clipboard_receive_request_abort(&invalid_receive);
+    let invalid_abort_twice: i32 =
+        wayland_clipboard_receive_request_abort(&invalid_receive);
+    failures = failures + wayland_clipboard_expect(invalid_abort_once == 1
+        && invalid_abort_twice == 1 && invalid_receive.request.bytes.cap == 0
+        && invalid_receive.error == WaylandClipboardError.StaleIdentity,
+        "invalid receive cleanup is idempotent and allocation-free");
+
+    let receive_transfer: WaylandClipboardReceiveRequest =
+        wayland_clipboard_begin_receive(&receive_state,
+            receive_offer_dispatch.identity);
+    failures = failures + wayland_clipboard_expect(receive_transfer.valid == 1
+        && receive_transfer.error == WaylandClipboardError.None
+        && wayland_clipboard_fd_access_mode(receive_transfer.read_fd)
+            == linux_o_read_only()
+        && wayland_clipboard_fd_access_mode(receive_transfer.write_fd)
+            == linux_o_write_only()
+        && wayland_clipboard_fd_cloexec(receive_transfer.read_fd) == 1
+        && wayland_clipboard_fd_cloexec(receive_transfer.write_fd) == 1,
+        "begin_receive creates exact directional CLOEXEC endpoints");
+    let receive_peer: LinuxFdPair = linux_socketpair_stream();
+    if (receive_transfer.valid == 1 && receive_peer.ok == 1) {
+        let owned_receive_wire: WireBuffer =
+            wayland_clipboard_receive_request_take_wire(&receive_transfer);
+        let repeated_receive_take: WireBuffer =
+            wayland_clipboard_receive_request_take_wire(&receive_transfer);
+        let repeated_receive_take_invalid: i32 = 0;
+        if (repeated_receive_take.error != 0
+            && repeated_receive_take.bytes.len == 0
+            && repeated_receive_take.bytes.cap == 0) {
+            repeated_receive_take_invalid = 1;
+        }
+        let receive_request_frame: WaylandFrame = wayland_decode(
+            &owned_receive_wire, 0);
+        let receive_request_mime: WireString = wire_read_string(
+            &owned_receive_wire, receive_request_frame.payload_offset,
+            receive_request_frame.size as i32);
+        let receive_request_literal_valid: i32 = 0;
+        if (receive_request_mime.valid == 1
+            && @strEq(receive_request_mime.value,
+                "text/plain;charset=utf-8") != 0) {
+            receive_request_literal_valid = 1;
+        }
+        let local_write_fd: i64 = receive_transfer.write_fd;
+        let receive_request_sent: i64 = linux_send_wire_fd(receive_peer.second,
+            &owned_receive_wire, receive_transfer.write_fd);
+        // Production's owning native sender frees this moved wire. mark_sent
+        // must later see only the allocation-free sentinel left in transfer.
+        wire_free(&owned_receive_wire); wire_free(&repeated_receive_take);
+        let peer_receive_request: LinuxReceiveFdResult =
+            linux_receive_buffer_fd(receive_peer.first, 81);
+        let peer_receive_wire: WireBuffer =
+            wayland_clipboard_test_native_wire(&peer_receive_request.data);
+        linux_buffer_free(&peer_receive_request.data);
+        let peer_receive_frame: WaylandFrame = wayland_decode(&peer_receive_wire, 0);
+        let peer_receive_mime: WireString = wire_read_string(&peer_receive_wire,
+            peer_receive_frame.payload_offset, peer_receive_frame.size as i32);
+        let marked_sent: i32 = wayland_clipboard_receive_request_mark_sent(
+            &receive_transfer, 1);
+        failures = failures + wayland_clipboard_expect(receive_request_frame.valid == 1
+            && receive_request_frame.object_id == receive_offer_id
+            && receive_request_frame.opcode == 1
+            && receive_request_frame.size == 40
+            && receive_request_literal_valid == 1
+            && repeated_receive_take_invalid == 1
+            && receive_transfer.request.bytes.cap == 0
+            && receive_request_sent == 40 && peer_receive_request.ok == 1
+            && peer_receive_request.fd_count == 1
+            && wayland_clipboard_fd_access_mode(
+                peer_receive_request.received_fd) == linux_o_write_only()
+            && peer_receive_request.cloexec_applied == 1
+            && peer_receive_frame.valid == 1 && peer_receive_frame.opcode == 1
+            && peer_receive_mime.valid == 1
+            && @strEq(peer_receive_mime.value,
+                "text/plain;charset=utf-8") != 0
+            && marked_sent == 1 && receive_transfer.write_fd < 0
+            && receive_transfer.error == WaylandClipboardError.None
+            && linux_fd_flags(local_write_fd) < 0,
+            "fake compositor observes exact receive frame and one owned writable fd");
+        let peer_text: LinuxByteBuffer =
+            wayland_clipboard_test_linux_bytes("peer text");
+        let peer_write: LinuxPipeWriteResult = linux_pipe_write_buffer_all_until(
+            peer_receive_request.received_fd, &peer_text,
+            linux_monotonic_ms() + 100);
+        linux_buffer_free(&peer_text);
+        let peer_received_fd: i64 = peer_receive_request.received_fd;
+        let peer_write_close: i64 = linux_close(peer_received_fd);
+        let taken_read_fd: i64 =
+            wayland_clipboard_receive_request_take_read_fd(&receive_transfer);
+        let received_text: WaylandClipboardTextResult =
+            wayland_clipboard_read_text_fd(taken_read_fd, 27,
+                linux_monotonic_ms() + 100);
+        failures = failures + wayland_clipboard_expect(peer_write.complete == 1
+            && peer_write.error_code == 0 && peer_write.cleanup_error_code == 0
+            && peer_write_close == 0 && linux_fd_flags(peer_received_fd) < 0
+            && wayland_clipboard_test_text_equal(&received_text, "peer text") == 1
+            && linux_fd_flags(taken_read_fd) < 0,
+            "offer.receive reads exact EOF-bounded UTF-8 and closes every transferred fd");
+        wayland_clipboard_text_result_free(&received_text);
+        let _receive_abort_once: i32 =
+            wayland_clipboard_receive_request_abort(&receive_transfer);
+        let receive_abort_twice: i32 =
+            wayland_clipboard_receive_request_abort(&receive_transfer);
+        failures = failures + wayland_clipboard_expect(receive_abort_twice == 1
+            && receive_transfer.error == WaylandClipboardError.None,
+            "completed receive cleanup remains idempotent");
+        wire_free(&peer_receive_wire);
+        let _close_receive_peer_first: i64 = linux_close(receive_peer.first);
+        let _close_receive_peer_second: i64 = linux_close(receive_peer.second);
+    } else {
+        failures = failures + wayland_clipboard_expect(0,
+            "offer.receive fake peer and transfer are available");
+        let _abort_receive_transfer: i32 =
+            wayland_clipboard_receive_request_abort(&receive_transfer);
+        if (receive_peer.ok == 1) {
+            let _close_receive_peer_first: i64 = linux_close(receive_peer.first);
+            let _close_receive_peer_second: i64 = linux_close(receive_peer.second);
+        }
+    }
+    wayland_clipboard_state_free(&receive_state);
+
+    // Deadline-safe reads distinguish exact-cap EOF, cap+1, invalid UTF-8,
+    // stalled writers, invalid limits, and wrong endpoint direction. Each call
+    // takes and closes the read descriptor even on rejection.
+    let exact_cap_pipe: LinuxFdPair = linux_pipe_cloexec();
+    if (exact_cap_pipe.ok == 1) {
+        let exact_cap_bytes: LinuxByteBuffer =
+            wayland_clipboard_test_linux_bytes("tri");
+        let exact_cap_write: LinuxPipeWriteResult =
+            linux_pipe_write_buffer_all_until(exact_cap_pipe.second,
+                &exact_cap_bytes, linux_monotonic_ms() + 100);
+        linux_buffer_free(&exact_cap_bytes);
+        let _close_exact_cap_write: i64 = linux_close(exact_cap_pipe.second);
+        let exact_cap_read_fd: i64 = exact_cap_pipe.first;
+        let exact_cap_text: WaylandClipboardTextResult =
+            wayland_clipboard_read_text_fd(exact_cap_read_fd, 3,
+                linux_monotonic_ms() + 100);
+        failures = failures + wayland_clipboard_expect(exact_cap_write.complete == 1
+            && wayland_clipboard_test_text_equal(&exact_cap_text, "tri") == 1
+            && linux_fd_flags(exact_cap_read_fd) < 0,
+            "exact-cap read succeeds only after EOF and closes its fd");
+        wayland_clipboard_text_result_free(&exact_cap_text);
+        wayland_clipboard_text_result_free(&exact_cap_text);
+        failures = failures + wayland_clipboard_expect(exact_cap_text.valid == 0
+            && exact_cap_text.bytes.cap == 0,
+            "text-result cleanup is idempotent");
+    } else { failures = failures + wayland_clipboard_expect(0,
+        "exact-cap pipe is available"); }
+
+    let cap_plus_one_pipe: LinuxFdPair = linux_pipe_cloexec();
+    if (cap_plus_one_pipe.ok == 1) {
+        let cap_plus_one_bytes: LinuxByteBuffer =
+            wayland_clipboard_test_linux_bytes("four");
+        let _cap_plus_one_write: LinuxPipeWriteResult =
+            linux_pipe_write_buffer_all_until(cap_plus_one_pipe.second,
+                &cap_plus_one_bytes, linux_monotonic_ms() + 100);
+        linux_buffer_free(&cap_plus_one_bytes);
+        let _close_cap_plus_one_write: i64 = linux_close(cap_plus_one_pipe.second);
+        let cap_plus_one_read_fd: i64 = cap_plus_one_pipe.first;
+        let cap_plus_one_text: WaylandClipboardTextResult =
+            wayland_clipboard_read_text_fd(cap_plus_one_read_fd, 3,
+                linux_monotonic_ms() + 100);
+        failures = failures + wayland_clipboard_expect(cap_plus_one_text.valid == 0
+            && cap_plus_one_text.error == WaylandClipboardError.TooLarge
+            && cap_plus_one_text.bytes.cap == 0
+            && linux_fd_flags(cap_plus_one_read_fd) < 0,
+            "cap+1 is a typed TooLarge failure with no partial text authority");
+        wayland_clipboard_text_result_free(&cap_plus_one_text);
+    } else { failures = failures + wayland_clipboard_expect(0,
+        "cap+1 pipe is available"); }
+
+    let invalid_utf8_pipe: LinuxFdPair = linux_pipe_cloexec();
+    if (invalid_utf8_pipe.ok == 1) {
+        let invalid_utf8_bytes: LinuxByteBuffer = linux_buffer_new(1);
+        linux_buffer_set_byte(&invalid_utf8_bytes, 0, 255);
+        let _invalid_utf8_write: LinuxPipeWriteResult =
+            linux_pipe_write_buffer_all_until(invalid_utf8_pipe.second,
+                &invalid_utf8_bytes, linux_monotonic_ms() + 100);
+        linux_buffer_free(&invalid_utf8_bytes);
+        let _close_invalid_utf8_write: i64 = linux_close(invalid_utf8_pipe.second);
+        let invalid_utf8_read_fd: i64 = invalid_utf8_pipe.first;
+        let invalid_utf8_text: WaylandClipboardTextResult =
+            wayland_clipboard_read_text_fd(invalid_utf8_read_fd, 3,
+                linux_monotonic_ms() + 100);
+        failures = failures + wayland_clipboard_expect(invalid_utf8_text.valid == 0
+            && invalid_utf8_text.error == WaylandClipboardError.InvalidUtf8
+            && invalid_utf8_text.bytes.cap == 0
+            && linux_fd_flags(invalid_utf8_read_fd) < 0,
+            "invalid UTF-8 is rejected after bounded EOF and closes its fd");
+        wayland_clipboard_text_result_free(&invalid_utf8_text);
+    } else { failures = failures + wayland_clipboard_expect(0,
+        "invalid UTF-8 pipe is available"); }
+
+    let stalled_read_pipe: LinuxFdPair = linux_pipe_cloexec();
+    if (stalled_read_pipe.ok == 1) {
+        let stalled_read_fd: i64 = stalled_read_pipe.first;
+        let stalled_started: i64 = linux_monotonic_ms();
+        let stalled_text: WaylandClipboardTextResult =
+            wayland_clipboard_read_text_fd(stalled_read_fd, 27,
+                stalled_started + 9);
+        let stalled_elapsed: i64 = linux_monotonic_ms() - stalled_started;
+        failures = failures + wayland_clipboard_expect(stalled_text.valid == 0
+            && stalled_text.error == WaylandClipboardError.Timeout
+            && stalled_elapsed < 1000 && linux_fd_flags(stalled_read_fd) < 0,
+            "stalled writer reaches one absolute read deadline without hanging");
+        wayland_clipboard_text_result_free(&stalled_text);
+        let _close_stalled_writer: i64 = linux_close(stalled_read_pipe.second);
+    } else { failures = failures + wayland_clipboard_expect(0,
+        "stalled-read pipe is available"); }
+
+    let negative_limit_pipe: LinuxFdPair = linux_pipe_cloexec();
+    if (negative_limit_pipe.ok == 1) {
+        let negative_limit_fd: i64 = negative_limit_pipe.first;
+        let negative_limit_text: WaylandClipboardTextResult =
+            wayland_clipboard_read_text_fd(negative_limit_fd, 0 - 1,
+                linux_monotonic_ms() + 100);
+        failures = failures + wayland_clipboard_expect(negative_limit_text.valid == 0
+            && negative_limit_text.error == WaylandClipboardError.InvalidArgument
+            && linux_fd_flags(negative_limit_fd) < 0,
+            "negative transfer bound is InvalidArgument rather than InvalidFd");
+        wayland_clipboard_text_result_free(&negative_limit_text);
+        let _close_negative_limit_writer: i64 = linux_close(negative_limit_pipe.second);
+    } else { failures = failures + wayland_clipboard_expect(0,
+        "negative-limit pipe is available"); }
+    let high_limit_pipe: LinuxFdPair = linux_pipe_cloexec();
+    if (high_limit_pipe.ok == 1) {
+        let high_limit_fd: i64 = high_limit_pipe.first;
+        let high_limit_text: WaylandClipboardTextResult =
+            wayland_clipboard_read_text_fd(high_limit_fd,
+                wayland_clipboard_max_transfer_bytes() + 1,
+                linux_monotonic_ms() + 100);
+        failures = failures + wayland_clipboard_expect(high_limit_text.valid == 0
+            && high_limit_text.error == WaylandClipboardError.TooLarge
+            && linux_fd_flags(high_limit_fd) < 0,
+            "bound above the clipboard ceiling is typed TooLarge and consumes its fd");
+        wayland_clipboard_text_result_free(&high_limit_text);
+        let _close_high_limit_writer: i64 = linux_close(high_limit_pipe.second);
+    } else { failures = failures + wayland_clipboard_expect(0,
+        "high-limit pipe is available"); }
+    let wrong_read_pipe: LinuxFdPair = linux_pipe_cloexec();
+    if (wrong_read_pipe.ok == 1) {
+        let wrong_read_fd: i64 = wrong_read_pipe.second;
+        let wrong_read_text: WaylandClipboardTextResult =
+            wayland_clipboard_read_text_fd(wrong_read_fd, 27,
+                linux_monotonic_ms() + 100);
+        failures = failures + wayland_clipboard_expect(wrong_read_text.valid == 0
+            && wrong_read_text.error == WaylandClipboardError.InvalidFd
+            && linux_fd_flags(wrong_read_fd) < 0,
+            "read helper rejects and closes a write-only endpoint");
+        wayland_clipboard_text_result_free(&wrong_read_text);
+        let _close_wrong_read_reader: i64 = linux_close(wrong_read_pipe.first);
+    } else { failures = failures + wayland_clipboard_expect(0,
+        "wrong-direction read pipe is available"); }
+
+    // Deadline-safe writes contain SIGPIPE, restore flags, report partial
+    // timeout truthfully, and close the taken descriptor on every path.
+    let closed_reader_pipe: LinuxFdPair = linux_pipe_cloexec();
+    if (closed_reader_pipe.ok == 1) {
+        let _close_closed_reader: i64 = linux_close(closed_reader_pipe.first);
+        let closed_writer_fd: i64 = closed_reader_pipe.second;
+        let closed_dispatch: WaylandClipboardDispatch = WaylandClipboardDispatch{
+            .kind = WaylandClipboardEventKind.SourceSend,
+            .identity = WaylandClipboardIdentity{
+                .object_id = 801, .generation = 1, .valid = 1 },
+            .replaced = wayland_clipboard_bad_identity(),
+            .transfer_fd = closed_writer_fd, .authoritative = 1,
+            .error = WaylandClipboardError.None, .valid = 1 };
+        let closed_write_error: WaylandClipboardError =
+            wayland_clipboard_dispatch_write_text(&closed_dispatch, "x",
+                linux_monotonic_ms() + 100);
+        let closed_again: i32 = wayland_clipboard_dispatch_close(&closed_dispatch);
+        failures = failures + wayland_clipboard_expect(
+            closed_write_error == WaylandClipboardError.TransferFailed
+            && linux_fd_flags(closed_writer_fd) < 0 && closed_again == 1,
+            "closed reader yields contained TransferFailed and idempotent dispatch cleanup");
+    } else { failures = failures + wayland_clipboard_expect(0,
+        "closed-reader pipe is available"); }
+
+    let wrong_write_pipe: LinuxFdPair = linux_pipe_cloexec();
+    if (wrong_write_pipe.ok == 1) {
+        let wrong_writer_fd: i64 = wrong_write_pipe.first;
+        let wrong_write_dispatch: WaylandClipboardDispatch = WaylandClipboardDispatch{
+            .kind = WaylandClipboardEventKind.SourceSend,
+            .identity = WaylandClipboardIdentity{
+                .object_id = 802, .generation = 1, .valid = 1 },
+            .replaced = wayland_clipboard_bad_identity(),
+            .transfer_fd = wrong_writer_fd, .authoritative = 1,
+            .error = WaylandClipboardError.None, .valid = 1 };
+        let wrong_write_error: WaylandClipboardError =
+            wayland_clipboard_dispatch_write_text(&wrong_write_dispatch, "x",
+                linux_monotonic_ms() + 100);
+        failures = failures + wayland_clipboard_expect(
+            wrong_write_error == WaylandClipboardError.InvalidFd
+            && linux_fd_flags(wrong_writer_fd) < 0,
+            "write helper rejects and closes a read-only endpoint");
+        let _close_wrong_write_writer: i64 = linux_close(wrong_write_pipe.second);
+    } else { failures = failures + wayland_clipboard_expect(0,
+        "wrong-direction write pipe is available"); }
+
+    let stalled_writer_pipe: LinuxFdPair = linux_pipe_cloexec();
+    if (stalled_writer_pipe.ok == 1) {
+        let stalled_payload: ArrayList[u8] = make[u8](
+            wayland_clipboard_max_transfer_bytes() as i32);
+        let stalled_i: i32 = 0;
+        while (stalled_i < wayland_clipboard_max_transfer_bytes() as i32) {
+            push[u8](&stalled_payload, 'x' as u8); stalled_i = stalled_i + 1;
+        }
+        let stalled_writer_fd: i64 = stalled_writer_pipe.second;
+        let stalled_dispatch: WaylandClipboardDispatch = WaylandClipboardDispatch{
+            .kind = WaylandClipboardEventKind.SourceSend,
+            .identity = WaylandClipboardIdentity{
+                .object_id = 803, .generation = 1, .valid = 1 },
+            .replaced = wayland_clipboard_bad_identity(),
+            .transfer_fd = stalled_writer_fd, .authoritative = 1,
+            .error = WaylandClipboardError.None, .valid = 1 };
+        let stalled_write_started: i64 = linux_monotonic_ms();
+        let stalled_write_error: WaylandClipboardError =
+            wayland_clipboard_dispatch_write_text(&stalled_dispatch,
+                stalled_payload.data[0..len[u8](stalled_payload)],
+                stalled_write_started + 9);
+        let stalled_write_elapsed: i64 =
+            linux_monotonic_ms() - stalled_write_started;
+        failures = failures + wayland_clipboard_expect(
+            stalled_write_error == WaylandClipboardError.Timeout
+            && stalled_write_elapsed < 1000 && linux_fd_flags(stalled_writer_fd) < 0,
+            "stalled reader yields bounded partial-write Timeout and closes writer");
+        free[u8](&stalled_payload);
+        let _close_stalled_read_end: i64 = linux_close(stalled_writer_pipe.first);
+    } else { failures = failures + wayland_clipboard_expect(0,
+        "stalled-write pipe is available"); }
+
+    // SourceSend cannot appear before a source has actually been selected, and
+    // an otherwise exact event without its ancillary fd is terminal. Both
+    // paths consume any supplied endpoint and clear all connection authority.
+    let unused_source_state: WaylandClipboardState =
+        wayland_clipboard_state_new(3, 4, 5);
+    let unused_source: WaylandClipboardIdentity =
+        wayland_clipboard_test_ready_source(&unused_source_state, 901, 0);
+    let unused_pipe: LinuxFdPair = linux_pipe_cloexec();
+    if (unused_source.valid == 1 && unused_pipe.ok == 1) {
+        let unused_send_event: WireBuffer = wayland_clipboard_source_send_event(
+            901, wayland_clipboard_text_mime());
+        let unused_write_fd: i64 = unused_pipe.second;
+        let unused_dispatch: WaylandClipboardDispatch =
+            wayland_clipboard_process_frame(&unused_source_state,
+                &unused_send_event, unused_write_fd, 1, 1);
+        failures = failures + wayland_clipboard_expect(unused_dispatch.valid == 0
+            && unused_dispatch.error == WaylandClipboardError.InvalidState
+            && unused_source_state.terminal == 1
+            && unused_source_state.current_source.valid == 0
+            && len[WaylandClipboardSource](unused_source_state.sources) == 0
+            && linux_fd_flags(unused_write_fd) < 0,
+            "source.send before one-shot selection fails closed and closes its fd");
+        wire_free(&unused_send_event);
+        let _close_unused_reader: i64 = linux_close(unused_pipe.first);
+    } else {
+        failures = failures + wayland_clipboard_expect(0,
+            "unused-source fd fixture is available");
+        if (unused_pipe.ok == 1) {
+            let _close_unused_reader: i64 = linux_close(unused_pipe.first);
+            let _close_unused_writer: i64 = linux_close(unused_pipe.second);
+        }
+    }
+    wayland_clipboard_state_free(&unused_source_state);
+
+    let missing_fd_state: WaylandClipboardState =
+        wayland_clipboard_state_new(3, 4, 5);
+    let missing_fd_source: WaylandClipboardIdentity =
+        wayland_clipboard_test_ready_source(&missing_fd_state, 902, 1);
+    let missing_fd_event: WireBuffer = wayland_clipboard_source_send_event(
+        902, wayland_clipboard_text_mime());
+    let missing_fd_frame: WaylandFrame = wayland_decode(&missing_fd_event, 0);
+    let missing_fd_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&missing_fd_state, &missing_fd_event);
+    failures = failures + wayland_clipboard_expect(missing_fd_source.valid == 1
+        && missing_fd_frame.valid == 1 && missing_fd_frame.object_id == 902
+        && missing_fd_frame.opcode == 1 && missing_fd_frame.size == 40
+        && missing_fd_dispatch.valid == 0
+        && missing_fd_dispatch.error == WaylandClipboardError.MissingFd
+        && missing_fd_state.terminal == 1
+        && missing_fd_state.current_source.valid == 0,
+        "source.send without SCM_RIGHTS is a terminal MissingFd with no stale authority");
+    wire_free(&missing_fd_event);
+    wayland_clipboard_state_free(&missing_fd_state);
+
+    // A malicious peer can attach multiple descriptors to one frame. The
+    // runtime retains one descriptor and closes every excess descriptor. The
+    // protocol rejects fd_count=2, closes the retained descriptor, and then
+    // retires the entire connection state.
+    let multi_fd_state: WaylandClipboardState =
+        wayland_clipboard_state_new(3, 4, 5);
+    let multi_fd_source: WaylandClipboardIdentity =
+        wayland_clipboard_test_ready_source(&multi_fd_state, 903, 1);
+    let multi_fd_peer: LinuxFdPair = linux_socketpair_stream();
+    let multi_fd_first: LinuxFdPair = linux_pipe_cloexec();
+    let multi_fd_second: LinuxFdPair = linux_pipe_cloexec();
+    if (multi_fd_source.valid == 1 && multi_fd_peer.ok == 1
+        && multi_fd_first.ok == 1 && multi_fd_second.ok == 1) {
+        let multi_fd_event: WireBuffer = wayland_clipboard_source_send_event(
+            903, wayland_clipboard_text_mime());
+        let multi_fds: ArrayList[i64] = make[i64](2);
+        push[i64](&multi_fds, multi_fd_first.second);
+        push[i64](&multi_fds, multi_fd_second.second);
+        let multi_fd_sent: i64 = wayland_clipboard_test_send_many(
+            multi_fd_peer.second, &multi_fd_event, &multi_fds);
+        let multi_fd_received: LinuxReceiveFdResult =
+            linux_receive_buffer_fd(multi_fd_peer.first, 81);
+        let multi_fd_wire: WireBuffer =
+            wayland_clipboard_test_native_wire(&multi_fd_received.data);
+        linux_buffer_free(&multi_fd_received.data);
+        let multi_fd_retained: i64 = multi_fd_received.received_fd;
+        let multi_fd_dispatch: WaylandClipboardDispatch =
+            wayland_clipboard_process_frame(&multi_fd_state, &multi_fd_wire,
+                multi_fd_received.received_fd, multi_fd_received.fd_count,
+                multi_fd_received.ok);
+        failures = failures + wayland_clipboard_expect(multi_fd_sent == 40
+            && multi_fd_received.ok == 1 && multi_fd_received.has_fd == 1
+            && multi_fd_received.fd_count == 2
+            && multi_fd_received.excess_fd_count == 1
+            && multi_fd_received.received_fd >= 0
+            && multi_fd_received.closed_fd_count == 1
+            && multi_fd_received.last_closed_fd >= 0
+            && linux_fd_flags(multi_fd_received.last_closed_fd) < 0
+            && linux_fd_flags(multi_fd_retained) < 0
+            && multi_fd_dispatch.valid == 0
+            && multi_fd_dispatch.error == WaylandClipboardError.UnexpectedFd
+            && multi_fd_state.terminal == 1
+            && multi_fd_state.current_source.valid == 0,
+            "extra SCM_RIGHTS descriptors are all closed and terminally rejected");
+        free[i64](&multi_fds); wire_free(&multi_fd_wire); wire_free(&multi_fd_event);
+        let _close_multi_first_read: i64 = linux_close(multi_fd_first.first);
+        let _close_multi_first_write: i64 = linux_close(multi_fd_first.second);
+        let _close_multi_second_read: i64 = linux_close(multi_fd_second.first);
+        let _close_multi_second_write: i64 = linux_close(multi_fd_second.second);
+        let _close_multi_peer_first: i64 = linux_close(multi_fd_peer.first);
+        let _close_multi_peer_second: i64 = linux_close(multi_fd_peer.second);
+    } else {
+        failures = failures + wayland_clipboard_expect(0,
+            "multi-FD malicious fixture is available");
+        if (multi_fd_first.ok == 1) {
+            let _close_multi_first_read: i64 = linux_close(multi_fd_first.first);
+            let _close_multi_first_write: i64 = linux_close(multi_fd_first.second);
+        }
+        if (multi_fd_second.ok == 1) {
+            let _close_multi_second_read: i64 = linux_close(multi_fd_second.first);
+            let _close_multi_second_write: i64 = linux_close(multi_fd_second.second);
+        }
+        if (multi_fd_peer.ok == 1) {
+            let _close_multi_peer_first: i64 = linux_close(multi_fd_peer.first);
+            let _close_multi_peer_second: i64 = linux_close(multi_fd_peer.second);
+        }
+    }
+    wayland_clipboard_state_free(&multi_fd_state);
+
+    // A partial frame carrying a valid descriptor must not strand that
+    // descriptor. The malformed wire failure clears source state and the
+    // retained duplicate is observably EBADF afterward.
+    let partial_fd_state: WaylandClipboardState =
+        wayland_clipboard_state_new(3, 4, 5);
+    let partial_fd_source: WaylandClipboardIdentity =
+        wayland_clipboard_test_ready_source(&partial_fd_state, 904, 1);
+    let partial_fd_peer: LinuxFdPair = linux_socketpair_stream();
+    let partial_fd_pipe: LinuxFdPair = linux_pipe_cloexec();
+    if (partial_fd_source.valid == 1 && partial_fd_peer.ok == 1
+        && partial_fd_pipe.ok == 1) {
+        let partial_full_event: WireBuffer = wayland_clipboard_source_send_event(
+            904, wayland_clipboard_text_mime());
+        let partial_event: WireBuffer = wayland_clipboard_test_wire_prefix(
+            &partial_full_event, 16);
+        let partial_sent: i64 = linux_send_wire_fd(partial_fd_peer.second,
+            &partial_event, partial_fd_pipe.second);
+        let partial_received: LinuxReceiveFdResult = linux_receive_buffer_fd(
+            partial_fd_peer.first, 81);
+        let partial_wire: WireBuffer =
+            wayland_clipboard_test_native_wire(&partial_received.data);
+        linux_buffer_free(&partial_received.data);
+        let partial_received_fd: i64 = partial_received.received_fd;
+        let partial_dispatch: WaylandClipboardDispatch =
+            wayland_clipboard_process_frame(&partial_fd_state, &partial_wire,
+                partial_received_fd, partial_received.fd_count, partial_received.ok);
+        failures = failures + wayland_clipboard_expect(partial_sent == 16
+            && partial_received.ok == 1 && partial_received.fd_count == 1
+            && partial_dispatch.valid == 0
+            && partial_dispatch.error == WaylandClipboardError.MalformedFrame
+            && partial_fd_state.terminal == 1
+            && partial_fd_state.current_source.valid == 0
+            && linux_fd_flags(partial_received_fd) < 0,
+            "partial source frame closes its retained fd and clears authority");
+        wire_free(&partial_wire); wire_free(&partial_event);
+        wire_free(&partial_full_event);
+        let _close_partial_original_read: i64 = linux_close(partial_fd_pipe.first);
+        let _close_partial_original_write: i64 = linux_close(partial_fd_pipe.second);
+        let _close_partial_peer_first: i64 = linux_close(partial_fd_peer.first);
+        let _close_partial_peer_second: i64 = linux_close(partial_fd_peer.second);
+    } else {
+        failures = failures + wayland_clipboard_expect(0,
+            "partial-FD malicious fixture is available");
+        if (partial_fd_pipe.ok == 1) {
+            let _close_partial_read: i64 = linux_close(partial_fd_pipe.first);
+            let _close_partial_write: i64 = linux_close(partial_fd_pipe.second);
+        }
+        if (partial_fd_peer.ok == 1) {
+            let _close_partial_peer_first: i64 = linux_close(partial_fd_peer.first);
+            let _close_partial_peer_second: i64 = linux_close(partial_fd_peer.second);
+        }
+    }
+    wayland_clipboard_state_free(&partial_fd_state);
+
+    let extra_frame_state: WaylandClipboardState =
+        wayland_clipboard_state_new(3, 4, 5);
+    let extra_frame_event: WireBuffer = wayland_clipboard_selection_event(4, 0);
+    wire_push_u8(&extra_frame_event, 0);
+    let extra_frame_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&extra_frame_state, &extra_frame_event);
+    failures = failures + wayland_clipboard_expect(extra_frame_dispatch.valid == 0
+        && extra_frame_dispatch.error == WaylandClipboardError.MalformedFrame
+        && extra_frame_state.terminal == 1,
+        "extra bytes beyond the declared Wayland frame fail closed");
+    wire_free(&extra_frame_event);
+    wayland_clipboard_state_free(&extra_frame_state);
+
+    let malformed_offer_state: WaylandClipboardState =
+        wayland_clipboard_state_new(3, 4, 5);
+    let malformed_offer_id: t27 = wayland_clipboard_test_server_id(0);
+    let malformed_offer_intro: WireBuffer =
+        wayland_clipboard_data_offer_event(4, malformed_offer_id);
+    let _malformed_offer_dispatch: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&malformed_offer_state,
+            &malformed_offer_intro);
+    wire_free(&malformed_offer_intro);
+    let malformed_offer_event: WireBuffer =
+        wayland_clipboard_offer_mime_event(malformed_offer_id, "text/plain");
+    let malformed_offer_prefix: WireBuffer = wayland_clipboard_test_wire_prefix(
+        &malformed_offer_event, 12);
+    let malformed_offer_result: WaylandClipboardDispatch =
+        wayland_clipboard_test_process(&malformed_offer_state,
+            &malformed_offer_prefix);
+    failures = failures + wayland_clipboard_expect(malformed_offer_result.valid == 0
+        && malformed_offer_result.error == WaylandClipboardError.MalformedFrame
+        && malformed_offer_state.terminal == 1
+        && malformed_offer_state.pending_offer.valid == 0
+        && len[WaylandClipboardOffer](malformed_offer_state.offers) == 0
+        && len[WaylandClipboardIdentity](malformed_offer_state.retired_offers) == 0,
+        "partial offer MIME frame clears all pending and retirement authority");
+    wire_free(&malformed_offer_prefix); wire_free(&malformed_offer_event);
+    wayland_clipboard_state_free(&malformed_offer_state);
+
+    // Object tables are fixed balanced-ternary bounds. The 28th identity never
+    // allocates or aliases, while an exact destroy commit reopens one slot and
+    // only one slot.
+    let source_cap_state: WaylandClipboardState =
+        wayland_clipboard_state_new(3, 4, 5);
+    let first_cap_source: WaylandClipboardIdentity =
+        wayland_clipboard_bad_identity();
+    let last_cap_source: WaylandClipboardIdentity =
+        wayland_clipboard_bad_identity();
+    let source_cap_i: i32 = 0;
+    while (source_cap_i < wayland_clipboard_max_sources() as i32) {
+        let source_id: t27 = 1100 + source_cap_i as t27;
+        let cap_create: WireBuffer = wayland_clipboard_prepare_source(
+            &source_cap_state, source_id);
+        let cap_identity: WaylandClipboardIdentity =
+            wayland_clipboard_register_source_commit(&source_cap_state,
+                source_id, 1);
+        failures = failures + wayland_clipboard_expect(cap_create.error == 0
+            && cap_identity.valid == 1,
+            "bounded source slot commits successfully");
+        if (source_cap_i == 0) { first_cap_source = cap_identity; }
+        if (source_cap_i + 1 == wayland_clipboard_max_sources() as i32) {
+            last_cap_source = cap_identity;
+        }
+        wire_free(&cap_create); source_cap_i = source_cap_i + 1;
+    }
+    let source_cap_before_overflow: i32 = source_cap_state.sources.cap;
+    let source_overflow: WireBuffer = wayland_clipboard_prepare_source(
+        &source_cap_state, 1200);
+    failures = failures + wayland_clipboard_expect(last_cap_source.valid == 1
+        && source_overflow.error != 0
+        && len[WaylandClipboardSource](source_cap_state.sources) == 27
+        && source_cap_state.sources.cap == source_cap_before_overflow
+        && source_cap_state.prepared_source.valid == 0
+        && first_cap_source.generation != last_cap_source.generation,
+        "27th source succeeds and 28th fails without allocation or identity alias");
+    wire_free(&source_overflow);
+    let source_cap_destroy: WireBuffer = wayland_clipboard_destroy_source(
+        &source_cap_state, first_cap_source);
+    let source_cap_destroyed: i32 = wayland_clipboard_destroy_source_commit(
+        &source_cap_state, first_cap_source, 1);
+    wire_free(&source_cap_destroy);
+    let source_cap_reopen_request: WireBuffer = wayland_clipboard_prepare_source(
+        &source_cap_state, 1200);
+    let source_cap_reopened: WaylandClipboardIdentity =
+        wayland_clipboard_register_source_commit(&source_cap_state, 1200, 1);
+    wire_free(&source_cap_reopen_request);
+    let source_cap_before_refull: i32 = source_cap_state.sources.cap;
+    let source_cap_refull: WireBuffer = wayland_clipboard_prepare_source(
+        &source_cap_state, 1201);
+    failures = failures + wayland_clipboard_expect(source_cap_destroyed == 1
+        && source_cap_reopened.valid == 1 && source_cap_refull.error != 0
+        && source_cap_reopened.generation != first_cap_source.generation
+        && len[WaylandClipboardSource](source_cap_state.sources) == 27
+        && source_cap_state.sources.cap == source_cap_before_refull,
+        "source destroy commit reopens exactly one bounded slot");
+    wire_free(&source_cap_refull);
+    wayland_clipboard_state_free(&source_cap_state);
+
+    let offer_cap_state: WaylandClipboardState =
+        wayland_clipboard_state_new(3, 4, 5);
+    let first_cap_offer: WaylandClipboardIdentity =
+        wayland_clipboard_bad_identity();
+    let last_cap_offer: WaylandClipboardIdentity =
+        wayland_clipboard_bad_identity();
+    let offer_cap_i: i32 = 0;
+    while (offer_cap_i < wayland_clipboard_max_offers() as i32) {
+        let cap_identity: WaylandClipboardIdentity = wayland_clipboard_add_offer(
+            &offer_cap_state,
+            wayland_clipboard_test_server_id(offer_cap_i as t27));
+        failures = failures + wayland_clipboard_expect(cap_identity.valid == 1,
+            "bounded offer slot registers successfully");
+        if (offer_cap_i == 0) { first_cap_offer = cap_identity; }
+        if (offer_cap_i + 1 == wayland_clipboard_max_offers() as i32) {
+            last_cap_offer = cap_identity;
+        }
+        offer_cap_i = offer_cap_i + 1;
+    }
+    let offer_cap_before_overflow: i32 = offer_cap_state.offers.cap;
+    let offer_overflow: WaylandClipboardIdentity = wayland_clipboard_add_offer(
+        &offer_cap_state,
+        wayland_clipboard_test_server_id(wayland_clipboard_max_offers()));
+    failures = failures + wayland_clipboard_expect(last_cap_offer.valid == 1
+        && offer_overflow.valid == 0
+        && len[WaylandClipboardOffer](offer_cap_state.offers) == 27
+        && offer_cap_state.offers.cap == offer_cap_before_overflow
+        && first_cap_offer.generation != last_cap_offer.generation,
+        "27th offer succeeds and 28th fails without allocation or identity alias");
+    let offer_cap_destroy: WireBuffer = wayland_clipboard_destroy_offer(
+        &offer_cap_state, first_cap_offer);
+    let offer_cap_destroyed: i32 = wayland_clipboard_destroy_offer_commit(
+        &offer_cap_state, first_cap_offer, 1);
+    wire_free(&offer_cap_destroy);
+    let offer_cap_reopened: WaylandClipboardIdentity = wayland_clipboard_add_offer(
+        &offer_cap_state,
+        wayland_clipboard_test_server_id(wayland_clipboard_max_offers()));
+    let offer_cap_before_refull: i32 = offer_cap_state.offers.cap;
+    let offer_cap_refull: WaylandClipboardIdentity = wayland_clipboard_add_offer(
+        &offer_cap_state,
+        wayland_clipboard_test_server_id(wayland_clipboard_max_offers() + 1));
+    failures = failures + wayland_clipboard_expect(offer_cap_destroyed == 1
+        && offer_cap_reopened.valid == 1 && offer_cap_refull.valid == 0
+        && offer_cap_reopened.generation != first_cap_offer.generation
+        && len[WaylandClipboardOffer](offer_cap_state.offers) == 27
+        && offer_cap_state.offers.cap == offer_cap_before_refull,
+        "offer destroy commit reopens exactly one bounded slot");
+    wayland_clipboard_state_free(&offer_cap_state);
+
+    // Balanced-ternary generation values wrap without using zero and scan past
+    // a live collision; no binary-sized counter is smuggled into retained state.
+    let wrap_state: WaylandClipboardState = wayland_clipboard_state_new(3, 4, 5);
+    wrap_state.next_generation = flashy_t27_max();
+    let wrap_first_request: WireBuffer = wayland_clipboard_prepare_source(
+        &wrap_state, 1001);
+    let wrap_first: WaylandClipboardIdentity =
+        wayland_clipboard_register_source_commit(&wrap_state, 1001, 1);
+    wire_free(&wrap_first_request);
+    wrap_state.next_generation = flashy_t27_max();
+    let wrap_collision_request: WireBuffer = wayland_clipboard_prepare_source(
+        &wrap_state, 1002);
+    let wrap_collision: WaylandClipboardIdentity =
+        wayland_clipboard_register_source_commit(&wrap_state, 1002, 1);
+    wire_free(&wrap_collision_request);
+    wrap_state.next_generation = flashy_t27_max() - 1;
+    let wrap_max_request: WireBuffer = wayland_clipboard_prepare_source(
+        &wrap_state, 1003);
+    let wrap_max: WaylandClipboardIdentity =
+        wayland_clipboard_register_source_commit(&wrap_state, 1003, 1);
+    wire_free(&wrap_max_request);
+    failures = failures + wayland_clipboard_expect(wrap_first.valid == 1
+        && wrap_first.generation == 1 && wrap_collision.valid == 1
+        && wrap_collision.generation == 2 && wrap_max.valid == 1
+        && wrap_max.generation == flashy_t27_max(),
+        "generation wrap skips zero, scans collisions, and preserves t27 maximum");
+    wayland_clipboard_state_free(&wrap_state);
+    wayland_clipboard_state_free(&wrap_state);
+    failures = failures + wayland_clipboard_expect(wrap_state.valid == 0
+        && wrap_state.sources.cap == 0 && wrap_state.offers.cap == 0
+        && wrap_state.retired_offers.cap == 0,
+        "state cleanup is idempotent after generation wrap records");
+
+    if (failures == 0) { _zag_println("wayland_clipboard_test: ok"); }
+    return failures;
+}

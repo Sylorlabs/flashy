@@ -1,0 +1,80 @@
+// Truthful platform and graphics capability contracts.
+
+enum BackendKind { Auto, Headless, Wayland, X11 }
+enum AccelerationKind { Cpu, HeadlessEmulation, FlashEngineHardware }
+
+struct BackendSelection {
+    requested: BackendKind,
+    active: BackendKind,
+    configured: i32,
+    connected: i32,
+    deterministic: i32,
+    reason: []u8,
+}
+
+struct GraphicsCapabilities {
+    acceleration: AccelerationKind,
+    deterministic: i32,
+    physical_dispatch_proven: i32,
+    rgba8: i32,
+    linear_high_precision: i32,
+    ray_tracing: i32,
+}
+
+fn backend_select(requested: BackendKind) BackendSelection {
+    if (requested == BackendKind.Headless) {
+        return BackendSelection{ .requested = requested, .active = BackendKind.Headless,
+            .configured = 1, .connected = 1, .deterministic = 1, .reason = "explicit deterministic headless" };
+    }
+    if (requested == BackendKind.Wayland) {
+        if (_zag_getenv("WAYLAND_DISPLAY").len > 0) {
+            return BackendSelection{ .requested = requested, .active = BackendKind.Wayland,
+                .configured = 1, .connected = 0, .deterministic = 0, .reason = "Wayland environment found; transport not connected" };
+        }
+        return BackendSelection{ .requested = requested, .active = BackendKind.Wayland,
+            .configured = 0, .connected = 0, .deterministic = 0, .reason = "WAYLAND_DISPLAY is not set" };
+    }
+    if (requested == BackendKind.X11) {
+        if (_zag_getenv("DISPLAY").len > 0) {
+            return BackendSelection{ .requested = requested, .active = BackendKind.X11,
+                .configured = 1, .connected = 0, .deterministic = 0, .reason = "X11 environment found; transport not connected" };
+        }
+        return BackendSelection{ .requested = requested, .active = BackendKind.X11,
+            .configured = 0, .connected = 0, .deterministic = 0, .reason = "DISPLAY is not set" };
+    }
+    if (_zag_getenv("WAYLAND_DISPLAY").len > 0) {
+        return BackendSelection{ .requested = requested, .active = BackendKind.Wayland,
+            .configured = 1, .connected = 0, .deterministic = 0, .reason = "Auto selected Wayland candidate; connection required" };
+    }
+    if (_zag_getenv("DISPLAY").len > 0) {
+        return BackendSelection{ .requested = requested, .active = BackendKind.X11,
+            .configured = 1, .connected = 0, .deterministic = 0, .reason = "Auto selected X11 candidate; connection required" };
+    }
+    return BackendSelection{ .requested = requested, .active = BackendKind.Auto,
+        .configured = 0, .connected = 0, .deterministic = 0, .reason = "Neither Wayland nor X11 is configured; request Headless explicitly" };
+}
+
+fn graphics_capabilities(kind: BackendKind) GraphicsCapabilities {
+    if (kind == BackendKind.Headless) {
+        return GraphicsCapabilities{ .acceleration = AccelerationKind.HeadlessEmulation,
+            .deterministic = 1, .physical_dispatch_proven = 0, .rgba8 = 1,
+            .linear_high_precision = 0, .ray_tracing = 0 };
+    }
+    return GraphicsCapabilities{ .acceleration = AccelerationKind.Cpu,
+        .deterministic = 0, .physical_dispatch_proven = 0, .rgba8 = 1,
+        .linear_high_precision = 0, .ray_tracing = 0 };
+}
+
+pub fn graphics_capabilities_for_selection(selection: BackendSelection) GraphicsCapabilities {
+    let caps: GraphicsCapabilities = graphics_capabilities(selection.active);
+    if (selection.active == BackendKind.Headless) { return caps; }
+    if (selection.configured == 1 && selection.connected == 1) {
+        let proven: GraphicsCapabilities = GraphicsCapabilities{
+            .acceleration = caps.acceleration, .deterministic = caps.deterministic,
+            .physical_dispatch_proven = 1, .rgba8 = caps.rgba8,
+            .linear_high_precision = caps.linear_high_precision, .ray_tracing = caps.ray_tracing
+        };
+        return proven;
+    }
+    return caps;
+}

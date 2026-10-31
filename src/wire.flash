@@ -1,0 +1,115 @@
+// Logical byte codec. u8 exists only at protocol/storage boundaries; numeric
+// protocol fields are manipulated with native balanced-ternary arithmetic.
+
+struct WireBuffer {
+    bytes: ArrayList[u8],
+    error: i32,
+}
+
+fn wire_new(capacity: i32) WireBuffer {
+    if (capacity <= 0) {
+        let error: i32 = 0;
+        if (capacity < 0) { error = 1; }
+        return WireBuffer{ .bytes = ArrayList[u8]{ .data = null as *u8,
+            .len = 0, .cap = 0 }, .error = error };
+    }
+    return WireBuffer{ .bytes = make[u8](capacity), .error = 0 };
+}
+
+fn wire_free(buffer: *WireBuffer) void {
+    free[u8](&buffer.*.bytes);
+    buffer.*.error = 0;
+}
+
+fn wire_push_u8(out: *WireBuffer, value: t27) void {
+    if (value < 0 || value > 255) { out.*.error = 1; return; }
+    push[u8](&out.*.bytes, value as u8);
+}
+
+fn wire_push_u16_le(out: *WireBuffer, value: t27) void {
+    wire_push_u8(out, value % 256);
+    wire_push_u8(out, (value / 256) % 256);
+}
+
+fn wire_push_u32_le(out: *WireBuffer, value: t27) void {
+    wire_push_u8(out, value % 256);
+    wire_push_u8(out, (value / 256) % 256);
+    wire_push_u8(out, (value / 65536) % 256);
+    wire_push_u8(out, (value / 16777216) % 256);
+}
+
+fn wire_push_i32_le(out: *WireBuffer, value: t27) void {
+    if (value < ((0 as t27) - 2147483648) || value > 2147483647) { out.*.error = 1; return; }
+    let encoded: t27 = value;
+    if (encoded < 0) { encoded = encoded + 4294967296; }
+    wire_push_u32_le(out, encoded);
+}
+
+fn wire_push_wayland_fixed(out: *WireBuffer, value: t27) void {
+    if (value < ((0 as t27) - 8388608) || value > 8388607) { out.*.error = 1; return; }
+    wire_push_i32_le(out, value * 256);
+}
+
+fn wire_read_u8(input: *WireBuffer, offset: i32) t27 {
+    if (offset < 0 || offset >= len[u8](input.*.bytes)) { input.*.error = 1; return 0; }
+    return get[u8](input.*.bytes, offset) as t27;
+}
+
+fn wire_read_u16_le(input: *WireBuffer, offset: i32) t27 {
+    return wire_read_u8(input, offset) + wire_read_u8(input, offset + 1) * 256;
+}
+
+fn wire_read_u32_le(input: *WireBuffer, offset: i32) t27 {
+    return wire_read_u8(input, offset) + wire_read_u8(input, offset + 1) * 256
+        + wire_read_u8(input, offset + 2) * 65536 + wire_read_u8(input, offset + 3) * 16777216;
+}
+
+fn wire_read_i32_le(input: *WireBuffer, offset: i32) t27 {
+    if (offset < 0 || offset + 4 > len[u8](input.*.bytes)) { input.*.error = 1; return 0; }
+    let encoded: t27 = wire_read_u32_le(input, offset);
+    if (encoded >= 2147483648) { return encoded - 4294967296; }
+    return encoded;
+}
+
+// Wayland fixed values are signed 24.8 integers at the wire boundary. Flashy's
+// current layout contract uses whole t27 pixels, matching wl_fixed_to_int.
+fn wire_read_wayland_fixed(input: *WireBuffer, offset: i32) t27 {
+    let encoded: t27 = wire_read_i32_le(input, offset);
+    if (input.*.error != 0) { return 0; }
+    return encoded / 256;
+}
+
+fn wire_append(out: *WireBuffer, input: *WireBuffer) void {
+    let i: i32 = 0;
+    while (i < len[u8](input.*.bytes)) { push[u8](&out.*.bytes, get[u8](input.*.bytes, i)); i = i + 1; }
+}
+
+fn wire_pad4(out: *WireBuffer) void {
+    while ((len[u8](out.*.bytes) % 4) != 0) { wire_push_u8(out, 0); }
+}
+
+fn wire_push_string(out: *WireBuffer, value: []u8) void {
+    wire_push_u32_le(out, (value.len + 1) as t27);
+    let i: i32 = 0;
+    while (i < value.len) { wire_push_u8(out, value[i] as t27); i = i + 1; }
+    wire_push_u8(out, 0);
+    wire_pad4(out);
+}
+
+struct WireString {
+    value: []u8,
+    next_offset: i32,
+    valid: i32,
+}
+
+fn wire_read_string(input: *WireBuffer, offset: i32, limit: i32) WireString {
+    let bad: WireString = WireString{ .value = "", .next_offset = offset, .valid = 0 };
+    if (offset < 0 || offset + 4 > limit) { return bad; }
+    let size: t27 = wire_read_u32_le(input, offset);
+    if (size < 1 || size > 2147483647) { return bad; }
+    let count: i32 = size as i32;
+    if (offset + 4 + count > limit || wire_read_u8(input, offset + 4 + count - 1) != 0) { return bad; }
+    let next: i32 = offset + 4 + ((count + 3) / 4) * 4;
+    if (next > limit) { return bad; }
+    return WireString{ .value = input.*.bytes.data[offset + 4..offset + 4 + count - 1], .next_offset = next, .valid = 1 };
+}

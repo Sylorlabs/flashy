@@ -1,0 +1,13 @@
+@import("flashy") as fy
+
+fn main() i32 {
+    let selected: fy.BackendSelection = fy.backend_select(fy.BackendKind.Headless);
+    if (selected.connected != 1 || selected.deterministic != 1) { return 1; }
+    let app: fy.App = fy.app_new(fy.BackendKind.Headless);
+    let window_index: i32 = fy.app_open_window(&app, 7, "Package Window", 96, 72);
+    if (window_index != 0 || fy.app_present_window(&app, window_index, 1) != 1) { return 1; }
+    fy.app_shutdown(&app);
+    if (@strEq(fy.flashy_version(), "0.1.0-foundation") == 0) { return 1; }
+    _zag_println("package_consumer: ok");
+    return 0;
+}

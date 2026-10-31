@@ -1,0 +1,133 @@
+@import("../src/flashy.flash")
+
+fn automation_app_expect(ok: i32, message: []u8) i32 {
+    if (ok == 0) { _zag_print("FAIL "); _zag_println(message); return 1; }
+    return 0;
+}
+
+fn automation_app_build(window: *Window, key: t27, label: []u8,
+    test_id: []u8, action: t9) i32 {
+    ui_begin(&window.*.ui);
+    let button: i32 = ui_button_control(&window.*.ui, key, -1,
+        rect(3, 3, 81, 27), label, action);
+    let node: Node = get[Node](window.*.ui.nodes, button);
+    node.semantics.test_id = test_id;
+    set[Node](&window.*.ui.nodes, button, node);
+    ui_end(&window.*.ui);
+    window.*.needs_present = 0;
+    return button;
+}
+
+fn main() i32 {
+    let failures: i32 = 0;
+    let pid_text: []u8 = _zag_i64_to_str(linux_getpid() as i64);
+    let prefix: []u8 = _zag_str_concat("/tmp/flashy-automation-app-", pid_text);
+    _zag_str_free(pid_text);
+    let path: []u8 = _zag_str_concat(prefix, ".sock");
+    _zag_str_free(prefix);
+    let _stale: LinuxUnixUnlinkResult = linux_unix_unlink_exact(path);
+
+    let app: App = app_new(BackendKind.Headless);
+    let first_index: i32 = app_open_window(&app, 81, "First", 162, 81);
+    let second_index: i32 = app_open_window(&app, 82, "Second", 162, 81);
+    let duplicate_index: i32 = app_open_window(&app, 82, "Duplicate", 81, 81);
+    let first: *Window = app_window(&app, first_index);
+    let second: *Window = app_window(&app, second_index);
+    let first_button: i32 = automation_app_build(
+        first, 810, "Shared", "shared-button", 11);
+    let second_button: i32 = automation_app_build(
+        second, 820, "Shared", "shared-button", 12);
+    let server: AutomationAppServer = automation_app_server_open(path, 82, 2);
+    let runner: AutomationRunner = automation_runner_connect(path);
+    failures = failures + automation_app_expect(first_button >= 0 && second_button >= 0
+        && duplicate_index == -1 && len[Window](app.windows) == 2
+        && @strEq(app.error, "window key is already open") == 1
+        && server.active == 1 && runner.active == 1,
+        "app automation endpoint requires one live window per retained key");
+
+    let click_second: AutomationRequest = automation_request(1,
+        AutomationCommand.Click, automation_locator_test_id("shared-button"),
+        "", Key.Unknown);
+    let click_sent: i32 = automation_runner_send(&runner, click_second);
+    let click_handled: AutomationResponse = automation_app_server_step(
+        &server, &app, 1000);
+    let click_received: AutomationResponse = automation_runner_receive(&runner, 1000);
+    failures = failures + automation_app_expect(click_sent == 1
+        && click_handled.status == AutomationResponseStatus.Ok
+        && click_received.status == AutomationResponseStatus.Ok
+        && action_emission_count(&first.*.ui, 11) == 0
+        && action_emission_count(&second.*.ui, 12) == 1
+        && first.*.needs_present == 0 && second.*.needs_present == 1,
+        "duplicate locators across windows route only through the named target");
+
+    second.*.needs_present = 0;
+    automation_app_server_target(&server, 999);
+    let delayed: AutomationRequest = automation_request(2,
+        AutomationCommand.AssertVisible, automation_locator_test_id("shared-button"),
+        "", Key.Unknown);
+    let delayed_sent: i32 = automation_runner_send(&runner, delayed);
+    let missing_target: AutomationResponse = automation_app_server_step(
+        &server, &app, 0);
+    let missing_target_status: AutomationAppServerStatus = server.status;
+    let pending_before_retarget: i32 = runner.awaiting_response;
+    automation_app_server_target(&server, 81);
+    let retargeted: AutomationResponse = automation_app_server_step(
+        &server, &app, 1000);
+    let delayed_received: AutomationResponse = automation_runner_receive(&runner, 1000);
+    failures = failures + automation_app_expect(delayed_sent == 1
+        && missing_target.valid == 0
+        && missing_target_status == AutomationAppServerStatus.TargetMissing
+        && server.status == AutomationAppServerStatus.Ready
+        && pending_before_retarget == 1
+        && retargeted.status == AutomationResponseStatus.Ok
+        && delayed_received.request_id == 2
+        && first.*.needs_present == 1 && second.*.needs_present == 0,
+        "missing target consumes no request and explicit retarget preserves stream order");
+
+    let frames_before_invalid: t27 = server.connection.received_frames;
+    let invalid_step: AutomationResponse = automation_app_server_step(
+        &server, &app, 0 - 1);
+    failures = failures + automation_app_expect(invalid_step.valid == 0
+        && server.status == AutomationAppServerStatus.Invalid
+        && server.active == 1 && server.connection.active == 1
+        && server.connection.received_frames == frames_before_invalid,
+        "invalid deadlines are fail-atomic and leave the accepted stream reusable");
+
+    first.*.needs_present = 0;
+    let terminal_click: AutomationRequest = automation_request(3,
+        AutomationCommand.Click, automation_locator_test_id("shared-button"),
+        "", Key.Unknown);
+    let terminal_sent: i32 = automation_runner_send(&runner, terminal_click);
+    let runner_fd: i64 = runner.connection.fd;
+    let server_fd: i64 = server.connection.fd;
+    automation_runner_close(&runner);
+    let terminal_handled: AutomationResponse = automation_app_server_step(
+        &server, &app, 1000);
+    let terminal_server_status: AutomationAppServerStatus = server.status;
+    failures = failures + automation_app_expect(terminal_sent == 1
+        && terminal_handled.valid == 1
+        && terminal_handled.status == AutomationResponseStatus.Ok
+        && terminal_server_status == AutomationAppServerStatus.TransportFailed
+        && server.connection.active == 0 && server.handled_requests == 3
+        && action_emission_count(&first.*.ui, 11) == 1
+        && first.*.needs_present == 1
+        && linux_fd_flags(runner_fd) == (0 - 9)
+        && linux_fd_flags(server_fd) == (0 - 9),
+        "peer loss after a complete request reports response transport failure without undoing the local action");
+
+    let server_closed: i32 = automation_app_server_close(&server);
+    failures = failures + automation_app_expect(server_closed == 1
+        && server.active == 0 && server.listener.path_bound == 0
+        && linux_fd_flags(runner_fd) == (0 - 9)
+        && linux_fd_flags(server_fd) == (0 - 9),
+        "app server closes accepted, listener, and exact path ownership");
+
+    app_shutdown(&app);
+    let final_path: LinuxFileStatus = linux_unix_path_status_exact(path);
+    failures = failures + automation_app_expect(final_path.valid == 0
+        && final_path.error_code == (0 - 2),
+        "app automation shutdown leaves no pathname node");
+    _zag_str_free(path);
+    if (failures == 0) { _zag_println("automation_app_test: ok"); }
+    return failures;
+}

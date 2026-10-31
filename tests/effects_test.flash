@@ -1,0 +1,98 @@
+@import("../src/flashy.flash")
+
+fn effects_expect(ok: i32, message: []u8) i32 {
+    if (ok == 0) { _zag_print("FAIL "); _zag_println(message); return 1; }
+    return 0;
+}
+
+fn pixel_offset(surface: *Surface, x: t27, y: t27) i32 {
+    return ((y * surface.*.width + x) * 4) as i32;
+}
+
+fn main() i32 {
+    let failures: i32 = 0;
+
+    let source: Surface = surface_new(9, 9);
+    surface_fill(&source, rect(3, 3, 3, 3), color_rgba(243, 81, 27, 255));
+    let blurred: EffectResult = surface_box_blur(&source, 1);
+    let center: i32 = pixel_offset(&blurred.surface, 4, 4);
+    let neighbor: i32 = pixel_offset(&blurred.surface, 2, 4);
+    failures = failures + effects_expect(blurred.ok == 1
+        && blurred.surface.pixels.data[center + 3] == 255
+        && blurred.surface.pixels.data[neighbor + 3] == 85,
+        "bounded box blur averages premultiplied pixels deterministically");
+    let invalid_blur: EffectResult = surface_box_blur(&source, 28);
+    failures = failures + effects_expect(invalid_blur.ok == 0
+        && invalid_blur.error == EffectError.InvalidRadius,
+        "oversized blur radius returns a typed error");
+
+    let masked: Surface = surface_new(3, 1);
+    surface_fill(&masked, rect(0, 0, 3, 1), color_rgba(243, 81, 27, 255));
+    let mask: Surface = surface_new(3, 1);
+    surface_blend(&mask, 0, 0, color_rgba(255, 255, 255, 255));
+    surface_blend(&mask, 1, 0, color_rgba(255, 255, 255, 128));
+    let mask_error: EffectError = surface_apply_mask(&masked, &mask);
+    failures = failures + effects_expect(mask_error == EffectError.None
+        && masked.pixels.data[3] == 255
+        && masked.pixels.data[7] == 128
+        && masked.pixels.data[11] == 0
+        && masked.pixels.data[4] == 121,
+        "alpha masks preserve premultiplied color and alpha");
+    let wrong_mask: Surface = surface_new(1, 1);
+    failures = failures + effects_expect(surface_apply_mask(&masked, &wrong_mask) == EffectError.DimensionMismatch,
+        "mask dimension mismatch returns a typed error");
+
+    let layer: Surface = surface_new(1, 1);
+    surface_blend(&layer, 0, 0, color_rgba(243, 81, 27, 255));
+    let composed: Surface = surface_new(3, 1);
+    let composite_error: EffectError = surface_composite(&composed, &layer, 1, 0, 128, rect(1, 0, 1, 1));
+    failures = failures + effects_expect(composite_error == EffectError.None
+        && composed.pixels.data[4] == 121
+        && composed.pixels.data[5] == 40
+        && composed.pixels.data[6] == 13
+        && composed.pixels.data[7] == 128
+        && composed.pixels.data[3] == 0 && composed.pixels.data[11] == 0,
+        "layer composition applies opacity, offset, and clipping in premultiplied space");
+    failures = failures + effects_expect(surface_composite(&composed, &layer, 0, 0, 256, rect(0, 0, 3, 1))
+        == EffectError.InvalidOpacity, "invalid layer opacity returns a typed error");
+
+    let shadow: EffectResult = surface_drop_shadow(&source, 1, 1, 1, color_rgba(0, 0, 0, 128));
+    let original_center: i32 = pixel_offset(&shadow.surface, 4, 4);
+    let shadow_edge: i32 = pixel_offset(&shadow.surface, 6, 6);
+    let shadow_checksum: t27 = surface_checksum(&shadow.surface);
+    failures = failures + effects_expect(shadow.ok == 1
+        && shadow.surface.pixels.data[original_center + 3] == 255
+        && shadow.surface.pixels.data[shadow_edge + 3] > 0
+        && shadow_checksum == 264219592,
+        "drop shadow composites behind the unchanged source layer and matches its CPU golden");
+
+    let identity_matrix: ColorMatrix = color_matrix_identity();
+    let identity: EffectResult = surface_color_matrix(&source, &identity_matrix);
+    let identity_center: i32 = pixel_offset(&identity.surface, 4, 4);
+    failures = failures + effects_expect(identity.ok == 1 && identity.surface.pixels.data[identity_center] == 243
+        && identity.surface.pixels.data[identity_center + 1] == 81 && identity.surface.pixels.data[identity_center + 2] == 27,
+        "color matrix identity preserves source pixels");
+
+    let gray_matrix: ColorMatrix = ColorMatrix{
+        .rr = 76, .rg = 151, .rb = 28, .ra = 0, .ro = 0,
+        .gr = 76, .gg = 151, .gb = 28, .ga = 0, .go = 0,
+        .br = 76, .bg = 151, .bb = 28, .ba = 0, .bo = 0,
+        .ar = 0, .ag = 0, .ab = 0, .aa = 255, .ao = 0,
+    };
+    let gray: EffectResult = surface_color_matrix(&source, &gray_matrix);
+    let gray_center: i32 = pixel_offset(&gray.surface, 4, 4);
+    let gray_checksum: t27 = surface_checksum(&gray.surface);
+    failures = failures + effects_expect(gray.ok == 1
+        && gray.surface.pixels.data[gray_center] == 123 && gray.surface.pixels.data[gray_center + 1] == 123
+        && gray.surface.pixels.data[gray_center + 2] == 123 && gray.surface.pixels.data[gray_center + 3] == 255
+        && gray_checksum != shadow_checksum,
+        "color matrix applies deterministic channel transforms");
+
+    surface_free(&source); surface_free(&blurred.surface); surface_free(&masked); surface_free(&mask);
+    surface_free(&wrong_mask); surface_free(&layer); surface_free(&composed); surface_free(&shadow.surface);
+    surface_free(&identity.surface); surface_free(&gray.surface);
+    if (failures != 0) {
+        _zag_print("shadow_checksum="); _zag_println(_zag_i64_to_str(shadow_checksum as i64)); return 1;
+    }
+    _zag_print("effects_test: ok checksum="); _zag_println(_zag_i64_to_str(shadow_checksum as i64)); return 0;
+}
